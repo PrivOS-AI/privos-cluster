@@ -1,0 +1,29 @@
+services:
+  cluster:
+    build: .
+    container_name: privos-cluster
+    ports:
+      - "4000:4000"
+    environment:
+      - NODE_ENV=production
+      - PORT=4000
+      - HOST=0.0.0.0
+    env_file: .env
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - cluster-data:/app/data
+    networks:
+      - default
+      - mcp-apps-network
+    restart: unless-stopped
+
+networks:
+  default:
+    name: privos-network
+    external: true
+  mcp-apps-network:
+    name: mcp-apps-network
+    driver: bridge
+
+volumes:
+  cluster-data:

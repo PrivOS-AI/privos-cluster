@@ -1,0 +1,659 @@
+﻿import { useEffect, useMemo, useState, type ChangeEvent } from 'react';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import {
+	Download,
+	Edit3,
+	Loader2,
+	RefreshCw,
+	Search,
+	ShieldCheck,
+	Tag,
+	Trash2,
+	Hammer,
+} from 'lucide-react';
+import { toast } from 'sonner';
+import { api, errorMessage, getStoredToken } from '@/lib/api';
+import { formatBytes, formatRelativeTime } from '@/lib/utils';
+import { Button } from '@/components/ui/button';
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { Separator } from '@/components/ui/separator';
+import { Textarea } from '@/components/ui/textarea';
+import { BuildTab } from '@/components/image-build/BuildTab';
+
+interface ImageRecord {
+	id: string;
+	dockerImageId: string;
+	repository: string;
+	tag: string;
+	digest: string | null;
+	sizeBytes: number;
+	source: 'pulled' | 'built' | 'registered';
+	builtBy: string | null;
+	description: string | null;
+	labels: Record<string, string>;
+	createdAt: number;
+	updatedAt: number;
+}
+
+type ImageFilter = 'all' | 'pulled' | 'built' | 'registered';
+
+interface PullFormState {
+	repository: string;
+	tag: string;
+	description: string;
+}
+
+interface RegisterFormState {
+	repository: string;
+	tag: string;
+	description: string;
+}
+
+const defaultPullForm: PullFormState = {
+	repository: 'ghcr.io/example/app',
+	tag: 'latest',
+	description: '',
+};
+
+const defaultRegisterForm: RegisterFormState = {
+	repository: 'ghcr.io/example/app',
+	tag: 'latest',
+	description: '',
+};
+
+function sourceLabel(source: ImageRecord['source']) {
+	if (source === 'pulled') return 'pulled';
+	if (source === 'built') return 'built';
+	return 'registered';
+}
+
+type ImageTab = 'manage' | 'build';
+
+export function ImagesPage() {
+	const queryClient = useQueryClient();
+	const [activeTab, setActiveTab] = useState<ImageTab>('manage');
+	const [filter, setFilter] = useState<ImageFilter>('all');
+	const [mineOnly, setMineOnly] = useState(false);
+	const [q, setQ] = useState('');
+	const [selectedId, setSelectedId] = useState<string | null>(null);
+	const [pullForm, setPullForm] = useState<PullFormState>(defaultPullForm);
+	const [registerForm, setRegisterForm] = useState<RegisterFormState>(defaultRegisterForm);
+
+	const imagesQuery = useQuery({
+		queryKey: ['images', filter, mineOnly, q],
+		queryFn: () =>
+			api
+				.get<ImageRecord[]>('/api/v1/images', {
+					params: {
+						source: filter === 'all' ? undefined : filter,
+						mine: mineOnly || undefined,
+						q: q.trim() || undefined,
+					},
+				})
+				.then((r) => r.data),
+		refetchInterval: 10_000,
+	});
+
+	const pullMutation = useMutation({
+		mutationFn: async () => {
+			const response = await fetch('/api/v1/images/pull', {
+				method: 'POST',
+				headers: {
+					'content-type': 'application/json',
+					authorization: `Bearer ${getStoredToken() ?? ''}`,
+				},
+				body: JSON.stringify({
+					repository: pullForm.repository.trim(),
+					tag: pullForm.tag.trim() || 'latest',
+					description: pullForm.description.trim() || undefined,
+				}),
+			});
+
+			if (!response.ok) {
+				let message = `Pull failed (${response.status})`;
+				try {
+					const body = (await response.json()) as { error?: string; reason?: string };
+					message = body.reason ? `${body.error}: ${body.reason}` : body.error ?? message;
+				} catch {
+					// fall back to generic text
+				}
+				throw new Error(message);
+			}
+
+			const text = await response.text();
+			let finalImage: ImageRecord | null = null;
+			for (const block of text.split('\n\n')) {
+				const line = block.trim();
+				if (!line.startsWith('data:')) continue;
+				const payload = line.slice(5).trim();
+				if (!payload) continue;
+				const parsed = JSON.parse(payload) as { error?: string; done?: boolean; image?: ImageRecord };
+				if (parsed.error) throw new Error(parsed.error);
+				if (parsed.done && parsed.image) finalImage = parsed.image;
+			}
+			if (!finalImage) throw new Error('pull completed without returning an image');
+			return finalImage;
+		},
+		onSuccess: (image) => {
+			toast.success(`Pulled ${image.repository}:${image.tag}`);
+			setPullForm(defaultPullForm);
+			void queryClient.invalidateQueries({ queryKey: ['images'] });
+		},
+		onError: (err) => toast.error(errorMessage(err)),
+	});
+
+	const registerMutation = useMutation({
+		mutationFn: async () => {
+			const res = await api.post<ImageRecord>('/api/v1/images/register', {
+				repository: registerForm.repository.trim(),
+				tag: registerForm.tag.trim() || 'latest',
+				description: registerForm.description.trim() || undefined,
+			});
+			return res.data;
+		},
+		onSuccess: (image) => {
+			toast.success(`Registered ${image.repository}:${image.tag}`);
+			setRegisterForm(defaultRegisterForm);
+			void queryClient.invalidateQueries({ queryKey: ['images'] });
+		},
+		onError: (err) => toast.error(errorMessage(err)),
+	});
+
+	const deleteMutation = useMutation({
+		mutationFn: async (image: ImageRecord) => {
+			await api.delete(`/api/v1/images/${image.id}`, { params: { force: true } });
+			return image;
+		},
+		onSuccess: (image) => {
+			toast.success(`Removed ${image.repository}:${image.tag}`);
+			if (selectedId === image.id) {
+				setSelectedId(null);
+			}
+			void queryClient.invalidateQueries({ queryKey: ['images'] });
+		},
+		onError: (err) => toast.error(errorMessage(err)),
+	});
+
+	const pruneMutation = useMutation({
+		mutationFn: async () => api.post('/api/v1/images/prune'),
+		onSuccess: () => {
+			toast.success('Pruned dangling images');
+			void queryClient.invalidateQueries({ queryKey: ['images'] });
+		},
+		onError: (err) => toast.error(errorMessage(err)),
+	});
+
+	const images = imagesQuery.data ?? [];
+	const filteredCount = useMemo(() => images.length, [images.length]);
+	const totalSize = images.reduce((sum, image) => sum + image.sizeBytes, 0);
+	const selectedImage = images.find((image) => image.id === selectedId) ?? images[0] ?? null;
+
+	useEffect(() => {
+		if (!selectedId && images.length > 0) {
+			setSelectedId(images[0].id);
+		}
+	}, [images, selectedId]);
+
+	return (
+		<div className="space-y-6">
+			<div className="flex flex-wrap items-start justify-between gap-4">
+				<div>
+					<h1 className="text-2xl font-semibold tracking-tight">Images</h1>
+					<p className="text-sm text-muted-foreground">
+						Pull, build, register, tag, and prune Docker images used by the cluster.
+					</p>
+				</div>
+				{activeTab === 'manage' && (
+					<div className="flex items-center gap-2">
+						<Button variant="outline" size="sm" onClick={() => imagesQuery.refetch()}>
+							<RefreshCw className="h-4 w-4" />
+							Refresh
+						</Button>
+						<Button
+							variant="outline"
+							size="sm"
+							onClick={() => pruneMutation.mutate()}
+							disabled={pruneMutation.isPending}
+						>
+							<Trash2 className="h-4 w-4" />
+							Prune
+						</Button>
+					</div>
+				)}
+			</div>
+
+			{/* Tab Navigation */}
+			<div className="flex items-center gap-2 rounded-lg border bg-card p-1">
+				<Button
+					variant={activeTab === 'manage' ? 'secondary' : 'ghost'}
+					size="sm"
+					onClick={() => setActiveTab('manage')}
+					className="gap-2"
+				>
+					<ShieldCheck className="h-4 w-4" />
+					Manage Images
+				</Button>
+				<Button
+					variant={activeTab === 'build' ? 'secondary' : 'ghost'}
+					size="sm"
+					onClick={() => setActiveTab('build')}
+					className="gap-2"
+				>
+					<Hammer className="h-4 w-4" />
+					Build Images
+				</Button>
+			</div>
+
+			{activeTab === 'manage' ? (
+				<>
+					<div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+				<MiniStat label="Images" value={String(filteredCount)} />
+				<MiniStat label="Total size" value={formatBytes(totalSize)} />
+				<MiniStat
+					label="Pulled"
+					value={String(images.filter((image) => image.source === 'pulled').length)}
+				/>
+				<MiniStat label="Registered" value={String(images.filter((image) => image.source === 'registered').length)} />
+			</div>
+
+			<div className="flex flex-wrap items-center gap-2">
+				<div className="relative max-w-md flex-1">
+					<Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+					<Input
+						value={q}
+						onChange={(event) => setQ(event.target.value)}
+						placeholder="Search repository or tag"
+						className="pl-9"
+					/>
+				</div>
+				<div className="flex items-center gap-2 rounded-md border bg-card p-1">
+					{(['all', 'pulled', 'built', 'registered'] as const).map((item) => (
+						<Button
+							key={item}
+							variant={filter === item ? 'secondary' : 'ghost'}
+							size="sm"
+							onClick={() => setFilter(item)}
+						>
+							{item}
+						</Button>
+					))}
+				</div>
+				<label className="flex items-center gap-2 text-sm text-muted-foreground">
+					<input
+						type="checkbox"
+						checked={mineOnly}
+						onChange={(event) => setMineOnly(event.target.checked)}
+					/>
+					Mine only
+				</label>
+			</div>
+
+			<div className="grid gap-6 xl:grid-cols-[1.2fr_0.8fr]">
+				<div className="space-y-3">
+					<Card>
+						<CardHeader>
+							<CardTitle>Image library</CardTitle>
+							<CardDescription>
+								Each row reflects a Docker image currently tracked by the cluster.
+							</CardDescription>
+						</CardHeader>
+						<CardContent className="space-y-3">
+							{imagesQuery.isLoading && (
+								<div className="flex items-center gap-2 text-sm text-muted-foreground">
+									<Loader2 className="h-4 w-4 animate-spin" />
+									Loading images...
+								</div>
+							)}
+							{!imagesQuery.isLoading && images.length === 0 && (
+								<div className="rounded-md border border-dashed p-6 text-sm text-muted-foreground">
+									No images match the current filters.
+								</div>
+							)}
+							{images.map((image) => {
+								const selected = image.id === selectedImage?.id;
+								return (
+								<button
+									key={image.id}
+									type="button"
+									onClick={() => setSelectedId(image.id)}
+									className={[
+										'w-full rounded-lg border p-4 text-left transition-colors',
+										selected ? 'border-primary bg-accent/40' : 'hover:bg-accent/40',
+									].join(' ')}
+								>
+									<div className="flex flex-wrap items-start justify-between gap-3">
+										<div className="space-y-1">
+											<div className="flex flex-wrap items-center gap-2">
+												<div className="font-medium">{image.repository}</div>
+												<span className="rounded-full border px-2 py-0.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+													{image.tag}
+												</span>
+												<span className="rounded-full border border-sky-500/30 bg-sky-500/10 px-2 py-0.5 text-[11px] font-medium text-sky-700">
+													{sourceLabel(image.source)}
+												</span>
+											</div>
+												<div className="text-xs text-muted-foreground">
+													{image.builtBy ? `built by ${image.builtBy}` : 'system tracked'}
+													{' · '}
+													updated {formatRelativeTime(image.updatedAt)}
+												</div>
+										</div>
+										<Trash2 className="h-4 w-4 text-muted-foreground" />
+									</div>
+
+									<Separator className="my-4" />
+
+									<div className="grid gap-3 md:grid-cols-2">
+										<MetaChip label="Size" value={formatBytes(image.sizeBytes)} />
+										<MetaChip label="Digest" value={image.digest ?? '—'} />
+										<MetaChip label="Labels" value={String(Object.keys(image.labels).length)} />
+										<MetaChip label="Docker ID" value={image.dockerImageId.slice(0, 18)} />
+									</div>
+
+									{image.description && (
+										<p className="mt-4 text-sm text-muted-foreground">{image.description}</p>
+									)}
+								</button>
+							);
+						})}
+						</CardContent>
+					</Card>
+				</div>
+
+				<div className="space-y-6">
+					<Card>
+						<CardHeader>
+							<CardTitle>Pull image</CardTitle>
+							<CardDescription>
+								Pull from a registry and track the resulting image in the cluster.
+							</CardDescription>
+						</CardHeader>
+						<CardContent className="space-y-4">
+							<Field
+								label="Repository"
+								value={pullForm.repository}
+								onChange={(value) => setPullForm((prev) => ({ ...prev, repository: value }))}
+								placeholder="ghcr.io/org/app"
+							/>
+							<div className="grid gap-4 sm:grid-cols-2">
+								<Field
+									label="Tag"
+									value={pullForm.tag}
+									onChange={(value) => setPullForm((prev) => ({ ...prev, tag: value }))}
+									placeholder="latest"
+								/>
+								<div className="space-y-2">
+									<Label>Description</Label>
+									<Input
+										value={pullForm.description}
+										onChange={(event) =>
+											setPullForm((prev) => ({ ...prev, description: event.target.value }))
+										}
+										placeholder="Optional note"
+									/>
+								</div>
+							</div>
+							<Button className="w-full" onClick={() => pullMutation.mutate()} disabled={pullMutation.isPending}>
+								{pullMutation.isPending && <Loader2 className="h-4 w-4 animate-spin" />}
+								Pull image
+							</Button>
+						</CardContent>
+					</Card>
+
+					{selectedImage && (
+						<ImageDetailPanel
+							image={selectedImage}
+							onDelete={() => {
+								if (
+									window.confirm(
+										`Delete ${selectedImage.repository}:${selectedImage.tag}? This removes the tracked image row and tells Docker to delete the image.`,
+									)
+								) {
+									deleteMutation.mutate(selectedImage);
+								}
+							}}
+						/>
+					)}
+
+					<Card>
+						<CardHeader>
+							<CardTitle>Register image</CardTitle>
+							<CardDescription>
+								Track an image that already exists on the Docker host.
+							</CardDescription>
+						</CardHeader>
+						<CardContent className="space-y-4">
+							<Field
+								label="Repository"
+								value={registerForm.repository}
+								onChange={(value) => setRegisterForm((prev) => ({ ...prev, repository: value }))}
+								placeholder="ghcr.io/org/app"
+							/>
+							<div className="grid gap-4 sm:grid-cols-2">
+								<Field
+									label="Tag"
+									value={registerForm.tag}
+									onChange={(value) => setRegisterForm((prev) => ({ ...prev, tag: value }))}
+									placeholder="latest"
+								/>
+								<div className="space-y-2">
+									<Label>Description</Label>
+									<Input
+										value={registerForm.description}
+										onChange={(event) =>
+											setRegisterForm((prev) => ({ ...prev, description: event.target.value }))
+										}
+										placeholder="Optional note"
+									/>
+								</div>
+							</div>
+							<Button
+								variant="outline"
+								className="w-full"
+								onClick={() => registerMutation.mutate()}
+								disabled={registerMutation.isPending}
+							>
+								<Download className="h-4 w-4" />
+								Register image
+							</Button>
+						</CardContent>
+					</Card>
+				</div>
+			</div>
+		</div>
+	);
+}
+
+function Field({
+	label,
+	value,
+	onChange,
+	placeholder,
+}: {
+	label: string;
+	value: string;
+	onChange: (value: string) => void;
+	placeholder?: string;
+}) {
+	return (
+		<div className="space-y-2">
+			<Label>{label}</Label>
+			<Input value={value} onChange={(event) => onChange(event.target.value)} placeholder={placeholder} />
+		</div>
+	);
+}
+
+function MiniStat({ label, value }: { label: string; value: string }) {
+	return (
+		<Card>
+			<CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+				<CardTitle className="text-sm font-medium text-muted-foreground">{label}</CardTitle>
+				<ShieldCheck className="h-4 w-4 text-muted-foreground" />
+			</CardHeader>
+			<CardContent>
+				<div className="text-2xl font-semibold">{value}</div>
+			</CardContent>
+		</Card>
+	);
+}
+
+function MetaChip({ label, value }: { label: string; value: string }) {
+	return (
+		<div className="rounded-md border bg-muted/30 p-3">
+			<div className="text-xs uppercase tracking-wide text-muted-foreground">{label}</div>
+			<div className="break-all text-sm font-medium">{value}</div>
+		</div>
+	);
+}
+
+interface ImageDetailResponse extends ImageRecord {
+	live?: {
+		dockerImageId: string;
+		repoTag: string;
+		repository: string;
+		tag: string;
+		digest: string | null;
+		sizeBytes: number;
+		labels: Record<string, string>;
+		created: number;
+	};
+	inUse?: number;
+}
+
+function ImageDetailPanel({
+	image,
+	onDelete,
+}: {
+	image: ImageRecord;
+	onDelete: () => void;
+}) {
+	const queryClient = useQueryClient();
+	const detailQuery = useQuery({
+		queryKey: ['image', image.id],
+		queryFn: () => api.get<ImageDetailResponse>(`/api/v1/images/${image.id}`).then((r) => r.data),
+	});
+
+	const current = detailQuery.data ?? image;
+	const [description, setDescription] = useState(current.description ?? '');
+	const [labelsJson, setLabelsJson] = useState(JSON.stringify(current.labels ?? {}, null, 2));
+	const [tagRepo, setTagRepo] = useState(current.repository);
+	const [tagName, setTagName] = useState(`${current.tag}-copy`);
+
+	useEffect(() => {
+		setDescription(current.description ?? '');
+		setLabelsJson(JSON.stringify(current.labels ?? {}, null, 2));
+		setTagRepo(current.repository);
+		setTagName(`${current.tag}-copy`);
+	}, [current.description, current.labels, current.repository, current.tag]);
+
+	const patchMutation = useMutation({
+		mutationFn: async () => {
+			const parsedLabels = labelsJson.trim() ? (JSON.parse(labelsJson) as Record<string, string>) : {};
+			const res = await api.patch<ImageRecord>(`/api/v1/images/${image.id}`, {
+				description: description.trim() || null,
+				labels: parsedLabels,
+			});
+			return res.data;
+		},
+		onSuccess: () => {
+			toast.success('Image metadata updated');
+			void queryClient.invalidateQueries({ queryKey: ['images'] });
+			void queryClient.invalidateQueries({ queryKey: ['image', image.id] });
+		},
+		onError: (err) => toast.error(errorMessage(err)),
+	});
+
+	const tagMutation = useMutation({
+		mutationFn: async () => {
+			const res = await api.post<ImageRecord>(`/api/v1/images/${image.id}/tag`, {
+				repository: tagRepo.trim(),
+				tag: tagName.trim(),
+			});
+			return res.data;
+		},
+		onSuccess: () => {
+			toast.success('Tag created');
+			void queryClient.invalidateQueries({ queryKey: ['images'] });
+		},
+		onError: (err) => toast.error(errorMessage(err)),
+	});
+
+	return (
+		<Card>
+			<CardHeader>
+				<CardTitle className="flex items-center gap-2 text-base">
+					<Tag className="h-4 w-4" />
+					Image detail
+				</CardTitle>
+				<CardDescription className="break-all">
+					{current.repository}:{current.tag}
+				</CardDescription>
+			</CardHeader>
+			<CardContent className="space-y-4">
+				<div className="grid gap-3 md:grid-cols-2">
+					<MetaChip label="Source" value={current.source} />
+					<MetaChip label="In use" value={String(detailQuery.data?.inUse ?? 0)} />
+					<MetaChip label="Digest" value={current.digest ?? '—'} />
+					<MetaChip label="Size" value={formatBytes(current.sizeBytes)} />
+				</div>
+
+				<div className="space-y-2">
+					<Label>Description</Label>
+					<Input value={description} onChange={(e) => setDescription(e.target.value)} />
+				</div>
+
+				<div className="space-y-2">
+					<Label>Labels JSON</Label>
+					<Textarea
+						value={labelsJson}
+						onChange={(e: ChangeEvent<HTMLTextAreaElement>) => setLabelsJson(e.target.value)}
+						className="min-h-[140px] font-mono text-xs"
+					/>
+				</div>
+
+				<div className="flex flex-wrap gap-2">
+					<Button
+						variant="outline"
+						onClick={() => patchMutation.mutate()}
+						disabled={patchMutation.isPending}
+					>
+						<Edit3 className="h-4 w-4" />
+						Save metadata
+					</Button>
+					<Button variant="destructive" onClick={onDelete}>
+						<Trash2 className="h-4 w-4" />
+						Delete image
+					</Button>
+				</div>
+
+				<Separator />
+
+				<div className="space-y-3">
+					<div className="text-sm font-medium">Create another tag</div>
+					<div className="grid gap-4 sm:grid-cols-2">
+						<div className="space-y-2">
+							<Label>Repository</Label>
+							<Input value={tagRepo} onChange={(e) => setTagRepo(e.target.value)} />
+						</div>
+						<div className="space-y-2">
+							<Label>Tag</Label>
+							<Input value={tagName} onChange={(e) => setTagName(e.target.value)} />
+						</div>
+					</div>
+					<Button
+						variant="secondary"
+						onClick={() => tagMutation.mutate()}
+						disabled={tagMutation.isPending}
+					>
+						<Tag className="h-4 w-4" />
+						Create tag
+					</Button>
+				</div>
+			</CardContent>
+		</Card>
+	);
+}
+
+
