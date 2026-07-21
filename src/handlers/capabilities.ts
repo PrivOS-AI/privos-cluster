@@ -50,7 +50,7 @@ const CAPABILITIES: ClusterCapabilities = {
         terminal: true,
         stats: true,
         volumes: true,
-        rolling: true,
+        rolling: false,    // dropped in the stateless-agent model — redeploy is always stop-then-create (immutable labels can't preserve single-identity during a swap)
         secrets: false,    // future
         replicas: false,   // future
         adopt: true,

@@ -4,10 +4,10 @@
  */
 import type { FastifyPluginAsync } from 'fastify';
 import fp from 'fastify-plugin';
-import * as containersRepo from '../db/containers-repo.js';
 import * as imagesRepo from '../db/images-repo.js';
-import * as volumesRepo from '../db/volumes-repo.js';
+import * as dockerState from '../docker/docker-state.js';
 import { containerManager, imageManager } from '../docker/index.js';
+import { getHealth } from '../services/health-monitor.js';
 import { checkResourceRequest } from '../services/resource-check.js';
 import {
     getImageRegistryAllowlist,
@@ -16,11 +16,10 @@ import {
 } from '../services/settings-service.js';
 import {
     deployManagedApp,
-    adoptContainer,
     startContainer,
     stopContainer,
     restartContainer,
-    redeployContainerSmart,
+    redeployContainer,
     deleteContainer,
 } from '../services/lifecycle-service.js';
 import {
@@ -149,7 +148,7 @@ const appsHandler: FastifyPluginAsync = async (fastify) => {
         // 7. Subdomain availability
         if (subdomain) {
             const resolvedDomain = resolveDomain(domain);
-            const existing = containersRepo.findByHost(subdomain, resolvedDomain);
+            const existing = await dockerState.findByHost(subdomain, resolvedDomain);
             if (existing) {
                 checks.push({
                     id: 'subdomain',
@@ -162,7 +161,7 @@ const appsHandler: FastifyPluginAsync = async (fastify) => {
                     id: 'subdomain',
                     label: 'Host availability',
                     status: 'warn',
-                    message: 'subdomain stored but reverse proxy is disabled in /settings',
+                    message: 'subdomain stored but reverse proxy is disabled (set REVERSE_PROXY_ENABLED / PRIVOS_DOMAINS)',
                 });
             } else if (domain && !resolvedDomain) {
                 checks.push({
@@ -227,29 +226,10 @@ const appsHandler: FastifyPluginAsync = async (fastify) => {
         }
     });
 
-    // POST /api/v1/apps/adopt
-    fastify.post('/api/v1/apps/adopt', { preHandler: fastify.authenticate }, async (req, reply) => {
-        const body = req.body as { dockerContainerId?: string; appId?: string };
-        if (!body.dockerContainerId) return reply.code(400).send({ error: 'dockerContainerId required' });
-
-        try {
-            const container = await adoptContainer(body.dockerContainerId, body.appId);
-            return reply.code(201).send(container);
-        } catch (err: any) {
-            fastify.log.error({ err }, 'adopt failed');
-            return reply.code(400).send({ error: err.message });
-        }
-    });
-
     // GET /api/v1/apps
     fastify.get('/api/v1/apps', { preHandler: fastify.authenticate }, async (_req, reply) => {
         try {
-            const containers = containersRepo.findAll();
-            // Attach volumes for each container
-            for (const c of containers) {
-                const volumeRows = volumesRepo.findByContainerId(c.id);
-                c.volumes = volumeRows.map((v) => ({ name: v.name, mountPath: v.mountPath, sizeMb: v.sizeMb }));
-            }
+            const containers = await dockerState.listManaged(getHealth);
             return reply.send(containers);
         } catch (err: any) {
             fastify.log.error({ err }, 'list apps error');
@@ -264,13 +244,10 @@ const appsHandler: FastifyPluginAsync = async (fastify) => {
             if (!params.success) {
                 return reply.code(400).send({ error: 'invalid containerId' });
             }
-            const container = containersRepo.findById(params.data.containerId);
+            const container = await dockerState.getById(params.data.containerId, getHealth);
             if (!container) {
                 return reply.code(404).send({ error: 'not found' });
             }
-            // Attach volumes from the volumes table
-            const volumeRows = volumesRepo.findByContainerId(params.data.containerId);
-            container.volumes = volumeRows.map((v) => ({ name: v.name, mountPath: v.mountPath, sizeMb: v.sizeMb }));
             return reply.send(container);
         } catch (err: any) {
             fastify.log.error({ err }, 'get app error');
@@ -334,7 +311,7 @@ const appsHandler: FastifyPluginAsync = async (fastify) => {
             if (!body.success) {
                 return reply.code(400).send({ error: 'validation_error', details: body.error.issues });
             }
-            const container = await redeployContainerSmart(params.data.containerId, body.data);
+            const container = await redeployContainer(params.data.containerId, body.data);
             return reply.send(container);
         } catch (err: any) {
             fastify.log.error({ err }, 'redeploy error');
@@ -343,15 +320,15 @@ const appsHandler: FastifyPluginAsync = async (fastify) => {
     });
 
     // DELETE /api/v1/apps/:containerId
-    // Optional query param: ?detach=true — unregisters from cluster without stopping/removing the Docker container
+    // Labels are immutable, so delete always stops + removes the Docker container
+    // and its volumes — there is no "detach" (unmanage-only) option anymore.
     fastify.delete('/api/v1/apps/:containerId', { preHandler: fastify.authenticate }, async (req, reply) => {
         try {
             const params = ContainerIdParamSchema.safeParse(req.params);
             if (!params.success) {
                 return reply.code(400).send({ error: 'invalid containerId' });
             }
-            const { detach } = req.query as { detach?: string };
-            await deleteContainer(params.data.containerId, { detach: detach === 'true' });
+            await deleteContainer(params.data.containerId);
             return reply.send({ ok: true });
         } catch (err: any) {
             fastify.log.error({ err }, 'delete container error');
@@ -366,7 +343,7 @@ const appsHandler: FastifyPluginAsync = async (fastify) => {
             if (!params.success) {
                 return reply.code(400).send({ error: 'invalid containerId' });
             }
-            const container = containersRepo.findById(params.data.containerId);
+            const container = await dockerState.getById(params.data.containerId, getHealth);
             if (!container) {
                 return reply.code(404).send({ error: 'not found' });
             }
@@ -421,7 +398,7 @@ const appsHandler: FastifyPluginAsync = async (fastify) => {
                 return reply.code(400).send({ error: 'validation_error', details: body.error.issues });
             }
 
-            const container = containersRepo.findById(params.data.containerId);
+            const container = await dockerState.getById(params.data.containerId);
             if (!container) {
                 return reply.code(404).send({ error: 'not found' });
             }

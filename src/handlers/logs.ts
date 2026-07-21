@@ -4,7 +4,7 @@
  */
 import type { FastifyPluginAsync } from 'fastify';
 import fp from 'fastify-plugin';
-import * as containersRepo from '../db/containers-repo.js';
+import * as dockerState from '../docker/docker-state.js';
 import { containerManager } from '../docker/index.js';
 import { ContainerIdParamSchema, LogsQuerySchema } from '../schemas/app-schemas.js';
 
@@ -21,7 +21,7 @@ const logsHandler: FastifyPluginAsync = async (fastify) => {
                 return reply.code(400).send({ error: 'validation_error', details: query.error.issues });
             }
 
-            const container = containersRepo.findById(params.data.containerId);
+            const container = await dockerState.getById(params.data.containerId);
             if (!container) {
                 return reply.code(404).send({ error: 'not found' });
             }

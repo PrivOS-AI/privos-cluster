@@ -5,7 +5,7 @@
  */
 import type { FastifyPluginAsync } from 'fastify';
 import fp from 'fastify-plugin';
-import * as containersRepo from '../db/containers-repo.js';
+import * as dockerState from '../docker/docker-state.js';
 import { getClusterResources } from '../services/resource-check.js';
 import { getDomains, resolveDomain, isReverseProxyEnabled } from '../services/settings-service.js';
 import { SubdomainLabelSchema } from '../schemas/settings-schemas.js';
@@ -54,7 +54,7 @@ const clusterHandler: FastifyPluginAsync = async (fastify) => {
                 });
             }
             const resolvedDomain = resolveDomain(domain);
-            const existing = containersRepo.findByHost(parsed.data, resolvedDomain);
+            const existing = await dockerState.findByHost(parsed.data, resolvedDomain);
             if (existing) {
                 return reply.send({
                     available: false,

@@ -16,9 +16,25 @@ const ConfigSchema = z.object({
 
 	JWT_SECRET: z.string().min(16, 'JWT_SECRET must be at least 16 chars'),
 
-	PRIVOS_CHAT_WEBHOOK_URL: z.string().url(),
+	// Webhooks are no longer sent for container lifecycle events (labels are the
+	// source of truth now); this stays optional so boot never fails on a missing
+	// value while image/build events (Phase 3 territory) still use it if set.
+	PRIVOS_CHAT_WEBHOOK_URL: z.string().url().optional(),
 
 	HEALTH_CHECK_INTERVAL_MS: z.coerce.number().int().positive().default(30_000),
+
+	// Reverse proxy / hosting — replaces the old settings DB (env is now the
+	// only source of truth for cluster-wide config).
+	PRIVOS_DOMAINS: z.string().default(''), // comma-separated base domains
+	REVERSE_PROXY_ENABLED: z
+		.string()
+		.default('false')
+		.transform((v) => v === 'true' || v === '1'),
+
+	// Default per-container resource allocation when a deploy request omits them.
+	DEFAULT_MEMORY_MB: z.coerce.number().int().positive().default(256),
+	DEFAULT_CPUS: z.coerce.number().positive().default(0.5),
+	DEFAULT_TMP_MB: z.coerce.number().int().positive().default(64),
 
 	// Admin UI auth — used by the web frontend (POST /api/v1/auth/login).
 	// Leave ADMIN_PASSWORD empty in env to disable the admin login flow entirely.

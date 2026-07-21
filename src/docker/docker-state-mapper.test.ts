@@ -28,6 +28,9 @@ function inspect(overrides: any = {}): any {
 				'privos.subdomain': 'todo',
 				'privos.domain': 'apps.example.com',
 				'privos.created-at': '1700000000000',
+				'privos.health.path': '/health',
+				'privos.health.max-fails': '3',
+				'privos.health.restart': 'true',
 			},
 		},
 		NetworkSettings: { Ports: { '3001/tcp': [{ HostPort: '49155' }] } },
@@ -56,6 +59,19 @@ test('mapInspectToContainer maps labels + inspect to the Container view', () => 
 	assert.equal(c.createdAt, 1700000000000);
 	assert.equal(c.stoppedAt, null);
 	assert.deepEqual(c.volumes, [{ name: 'data', mountPath: '/app/data' }]);
+	assert.deepEqual(c.healthPolicy, { path: '/health', maxFails: 3, restart: true });
+});
+
+test('healthPolicy falls back to HEALTH_DEFAULTS when labels are missing, and honors restart=false', () => {
+	const withoutPolicyLabels = mapInspectToContainer(
+		inspect({ Config: { ...inspect().Config, Labels: { ...inspect().Config.Labels, 'privos.health.path': '', 'privos.health.max-fails': '', 'privos.health.restart': undefined as any } } }),
+	);
+	assert.deepEqual(withoutPolicyLabels.healthPolicy, { path: HEALTH_DEFAULTS.path, maxFails: HEALTH_DEFAULTS.maxFails, restart: HEALTH_DEFAULTS.restart });
+
+	const restartDisabled = mapInspectToContainer(
+		inspect({ Config: { ...inspect().Config, Labels: { ...inspect().Config.Labels, 'privos.health.restart': 'false' } } }),
+	);
+	assert.equal(restartDisabled.healthPolicy?.restart, false);
 });
 
 test('empty-string labels map to null (subdomain/domain/appId)', () => {

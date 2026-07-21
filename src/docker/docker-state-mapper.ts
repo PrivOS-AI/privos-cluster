@@ -6,7 +6,8 @@
  * inspect objects. `docker-state.ts` wires these into live docker queries.
  */
 import type Docker from 'dockerode';
-import type { Container, ContainerResources, ContainerState, ContainerVolume, HealthCheck } from '../types/index.js';
+import { HEALTH_DEFAULTS } from './container-manager.js';
+import type { Container, ContainerResources, ContainerState, ContainerVolume, HealthCheck, HealthPolicy } from '../types/index.js';
 
 export const DEFAULT_RESOURCES: ContainerResources = { memoryMb: 256, cpus: 0.5, tmpSizeMb: 64 };
 export const DEFAULT_HEALTH: HealthCheck = { status: 'unknown', failCount: 0, restartCount: 0, lastCheck: null };
@@ -75,6 +76,18 @@ function parseVolumes(info: Docker.ContainerInspectInfo, id: string): ContainerV
 		}));
 }
 
+/** Reconstruct the self-restart health policy from `privos.health.*` labels. */
+function parseHealthPolicy(labels: Record<string, string>): HealthPolicy {
+	const maxFailsRaw = parseInt(labels['privos.health.max-fails'] ?? '', 10);
+	return {
+		path: labels['privos.health.path'] || HEALTH_DEFAULTS.path,
+		maxFails: Number.isFinite(maxFailsRaw) && maxFailsRaw > 0 ? maxFailsRaw : HEALTH_DEFAULTS.maxFails,
+		restart: labels['privos.health.restart'] !== undefined
+			? labels['privos.health.restart'] !== 'false'
+			: HEALTH_DEFAULTS.restart,
+	};
+}
+
 function hostPortFor(info: Docker.ContainerInspectInfo, port: number): number | null {
 	const bindings = info.NetworkSettings?.Ports?.[`${port}/tcp`];
 	if (bindings && bindings.length > 0 && bindings[0].HostPort) {
@@ -123,5 +136,6 @@ export function mapInspectToContainer(info: Docker.ContainerInspectInfo, health:
 		volumes: parseVolumes(info, id),
 		subdomain: labelOrNull(labels, 'privos.subdomain'),
 		domain: labelOrNull(labels, 'privos.domain'),
+		healthPolicy: parseHealthPolicy(labels),
 	};
 }

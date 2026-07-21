@@ -8,7 +8,7 @@
 import type { FastifyPluginAsync } from 'fastify';
 import fp from 'fastify-plugin';
 import { verifyToken } from '../auth/jwt.js';
-import * as containersRepo from '../db/containers-repo.js';
+import * as dockerState from '../docker/docker-state.js';
 import { containerManager } from '../docker/index.js';
 
 const terminalHandler: FastifyPluginAsync = async (fastify) => {
@@ -35,7 +35,7 @@ const terminalHandler: FastifyPluginAsync = async (fastify) => {
             }
 
             // 3. Find container
-            const container = containersRepo.findById(containerId);
+            const container = await dockerState.getById(containerId);
             if (!container) {
                 socket.close(4404, 'not_found');
                 return;

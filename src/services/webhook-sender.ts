@@ -3,13 +3,13 @@ import pino from 'pino';
 import { config } from '../config.js';
 import { signToken } from '../auth/jwt.js';
 import * as webhookQueueRepo from '../db/webhook-queue-repo.js';
-import type {
-    Container,
-    Image,
-    ImageWebhookEvent,
-    WebhookEvent,
-    WebhookEventType,
-} from '../types/index.js';
+import type { Image, ImageWebhookEvent } from '../types/index.js';
+
+// NOTE: container lifecycle webhooks (deployed/started/stopped/...) were
+// removed — Docker labels are the source of truth now and nothing polls this
+// service for container state. Image/build events still flow through here
+// (src/db/images-repo.ts, src/db/builds-repo.ts, and their handlers are
+// untouched pending their own removal), so the queue + delivery worker stay.
 
 const logger = pino({ level: config.LOG_LEVEL }).child({ component: 'webhook' });
 
@@ -27,48 +27,14 @@ let purgeTimer: NodeJS.Timeout | null = null;
 // ---------------------------------------------------------------------------
 
 /**
- * Build a WebhookEvent (minus nonce) from a Container row plus an event type.
- * Optionally merge extra fields (e.g. error).
- */
-export function eventFromContainer(
-    c: Container,
-    event: WebhookEventType,
-    extra: Partial<WebhookEvent> = {},
-): Omit<WebhookEvent, 'nonce'> {
-    return {
-        event,
-        containerId: c.id,
-        dockerContainerId: c.dockerContainerId,
-        appId: c.appId,
-        state: c.state,
-        healthStatus: c.healthCheck.status,
-        internalUrl: c.internalUrl,
-        hostPort: c.hostPort,
-        ts: Date.now(),
-        ...extra,
-    };
-}
-
-/**
- * Enqueue a webhook event for async delivery. Never blocks the caller.
- */
-export function sendEvent(event: Omit<WebhookEvent, 'nonce'>): void {
-    const id = crypto.randomUUID();
-    const fullEvent: WebhookEvent = { ...event, nonce: id };
-    webhookQueueRepo.enqueue({
-        id,
-        event_type: event.event,
-        payload: JSON.stringify(fullEvent),
-        next_attempt_at: Date.now(),
-    });
-    logger.debug({ id, event: event.event, containerId: event.containerId }, 'webhook enqueued');
-}
-
-/**
- * Enqueue an image lifecycle webhook event. Mirrors sendEvent but for image
- * payloads (which have no container fields).
+ * Enqueue an image lifecycle webhook event. Mirrors the removed sendEvent but
+ * for image payloads (which have no container fields).
  */
 export function sendImageEvent(event: Omit<ImageWebhookEvent, 'nonce'>): void {
+    // Pure-polling mode: no webhook target configured (and the delivery worker is
+    // no longer started) → do not enqueue, or the webhook_queue table grows
+    // unbounded with events nothing will ever deliver or purge.
+    if (!config.PRIVOS_CHAT_WEBHOOK_URL) return;
     const id = crypto.randomUUID();
     const fullEvent: ImageWebhookEvent = { ...event, nonce: id };
     webhookQueueRepo.enqueue({
@@ -106,6 +72,12 @@ export function imageEventFromImage(
 // ---------------------------------------------------------------------------
 
 async function processOne(row: webhookQueueRepo.WebhookRow): Promise<void> {
+    if (!config.PRIVOS_CHAT_WEBHOOK_URL) {
+        // No webhook URL configured — leave the row queued rather than mark it
+        // permanently failed, in case the operator sets the env var later.
+        logger.warn({ id: row.id, event: row.event_type }, 'PRIVOS_CHAT_WEBHOOK_URL not set — skipping delivery');
+        return;
+    }
     try {
         const res = await fetch(config.PRIVOS_CHAT_WEBHOOK_URL, {
             method: 'POST',

@@ -9,9 +9,8 @@ import cors from '@fastify/cors';
 
 import { config } from './config.js';
 import { getDb, closeDb } from './db/client.js';
-import { networkManager, reconcileState, reconcileImages } from './docker/index.js';
-import { healthMonitor } from './services/health-monitor.js';
-import { startWorker as startWebhookWorker, stopWorker as stopWebhookWorker } from './services/webhook-sender.js';
+import { networkManager, reconcileImages } from './docker/index.js';
+import { startHealthMonitor, stopHealthMonitor } from './services/health-monitor.js';
 import authPlugin from './plugins/auth.js';
 import capabilitiesHandler from './handlers/capabilities.js';
 import appsHandler from './handlers/apps.js';
@@ -20,7 +19,6 @@ import buildsHandler from './handlers/builds.js';
 import logsHandler from './handlers/logs.js';
 import filesHandler from './handlers/files.js';
 import terminalHandler from './handlers/terminal.js';
-import settingsHandler from './handlers/settings.js';
 import clusterHandler from './handlers/cluster.js';
 import authRoutesHandler from './handlers/auth.js';
 import registriesHandler from './handlers/registries.js';
@@ -56,8 +54,8 @@ async function main(): Promise<void> {
 		await networkManager.ensureNetwork();
 		fastify.log.info({ network: config.DOCKER_NETWORK }, 'docker network ready');
 
-		// 3. Reconcile state (DB ↔ Docker) — containers first, then images
-		await reconcileState();
+		// 3. Reconcile images (DB ↔ Docker). Containers need no reconciliation —
+		//    Docker labels are the source of truth, read live on every request.
 		await reconcileImages();
 		fastify.log.info('state reconciled');
 
@@ -100,7 +98,6 @@ async function main(): Promise<void> {
 		await fastify.register(appsHandler);
 		await fastify.register(imagesHandler);
 		await fastify.register(buildsHandler);
-		await fastify.register(settingsHandler);
 		await fastify.register(clusterHandler);
 		await fastify.register(logsHandler);
 		await fastify.register(filesHandler);
@@ -108,8 +105,7 @@ async function main(): Promise<void> {
 		await fastify.register(registriesHandler);
 
 		// 8. Start background services
-		healthMonitor.start();
-		startWebhookWorker();
+		startHealthMonitor();
 
 		// 9. Listen
 		await fastify.listen({ port: config.PORT, host: config.HOST });
@@ -123,8 +119,7 @@ async function main(): Promise<void> {
 async function shutdown(signal: string): Promise<void> {
 	fastify.log.info({ signal }, 'shutdown initiated');
 	try {
-		healthMonitor.stop();
-		stopWebhookWorker();
+		stopHealthMonitor();
 		await fastify.close();
 		closeDb();
 		fastify.log.info('shutdown complete');

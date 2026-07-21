@@ -2,15 +2,11 @@
  * Cluster-level resource accounting.
  *
  * "Host" = whatever the Docker daemon reports via /info.
- * "Allocated" = sum of memory + cpu limits across containers tracked in our DB
- *               that are in a running/created state (not stopped).
+ * "Allocated" = sum of memory + cpu limits across all Docker-managed containers
+ *               (privos.managed=true label), derived live from Docker — no DB.
  * "Available" = max(host or admin-configured quota) − allocated.
- *
- * Admins can override host capacity via the
- *   quota.max_memory_mb_total / quota.max_cpus_total
- * settings — useful when the cluster shares a host with other workloads.
  */
-import * as containersRepo from '../db/containers-repo.js';
+import * as dockerState from '../docker/docker-state.js';
 import { docker } from '../docker/index.js';
 import { getMaxCpus, getMaxMemoryMb } from './settings-service.js';
 import type { ClusterResources } from '../types/index.js';
@@ -21,28 +17,21 @@ export async function getClusterResources(): Promise<ClusterResources> {
 	const hostMemMb = Math.floor((info.MemTotal ?? 0) / (1024 * 1024));
 	const hostCpus = info.NCPU ?? 0;
 
-	// Sum allocations from containers we track (excluding 'error' rows — those
-	// have no live container reserving anything).
-	const tracked = containersRepo.findAll();
-	let memMb = 0;
-	let cpus = 0;
-	let active = 0;
-	for (const c of tracked) {
-		if (c.state === 'error') continue;
-		memMb += c.resources.memoryMb;
-		cpus += c.resources.cpus;
-		active++;
-	}
+	const allocated = await dockerState.sumAllocatedResources();
 
 	const capMem = getMaxMemoryMb() ?? hostMemMb;
 	const capCpu = getMaxCpus() ?? hostCpus;
 
 	return {
 		host: { totalMemoryMb: hostMemMb, cpuCount: hostCpus },
-		allocated: { memoryMb: memMb, cpus: Math.round(cpus * 100) / 100, containers: active },
+		allocated: {
+			memoryMb: allocated.memoryMb,
+			cpus: Math.round(allocated.cpus * 100) / 100,
+			containers: allocated.containers,
+		},
 		available: {
-			memoryMb: Math.max(0, capMem - memMb),
-			cpus: Math.max(0, Math.round((capCpu - cpus) * 100) / 100),
+			memoryMb: Math.max(0, capMem - allocated.memoryMb),
+			cpus: Math.max(0, Math.round((capCpu - allocated.cpus) * 100) / 100),
 		},
 	};
 }

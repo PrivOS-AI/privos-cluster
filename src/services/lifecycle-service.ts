@@ -2,12 +2,11 @@ import crypto from 'crypto';
 import pino from 'pino';
 import { config } from '../config.js';
 import { containerManager, networkManager } from '../docker/index.js';
-import * as containersRepo from '../db/containers-repo.js';
-import * as volumesRepo from '../db/volumes-repo.js';
+import * as dockerState from '../docker/docker-state.js';
+import { getHealth } from './health-monitor.js';
 import { checkResourceRequest } from './resource-check.js';
 import { getDefaultResources, isReverseProxyEnabled, resolveDomain } from './settings-service.js';
-import { eventFromContainer, sendEvent } from './webhook-sender.js';
-import type { Container, ContainerResources, ContainerVolume, ContainerVolumeRow, DeployRequest, RedeployRequest } from '../types/index.js';
+import type { Container, ContainerResources, ContainerVolume, DeployRequest, RedeployRequest } from '../types/index.js';
 
 const logger = pino({ level: config.LOG_LEVEL }).child({ component: 'lifecycle' });
 
@@ -62,11 +61,6 @@ export function buildContainerName(opts: {
     const suffix = crypto.randomUUID().replace(/-/g, '').slice(0, 6);
     return `${safe}-${suffix}`;
 }
-const DEFAULT_RESOURCES: ContainerResources = {
-    memoryMb: 256,
-    cpus: 0.5,
-    tmpSizeMb: 64,
-};
 
 // ---------------------------------------------------------------------------
 // waitForHealthy
@@ -123,13 +117,27 @@ async function getHostPortWithRetry(
 }
 
 // ---------------------------------------------------------------------------
-// Helper — load container or throw
+// Helper — load container (Docker labels are the source of truth) or 404
 // ---------------------------------------------------------------------------
 
-function requireContainer(containerId: string): Container {
-    const c = containersRepo.findById(containerId);
+async function getContainerOr404(containerId: string): Promise<Container> {
+    const c = await dockerState.getById(containerId, getHealth);
     if (!c) throw new Error(`Container not found: ${containerId}`);
     return c;
+}
+
+/**
+ * Derive the current named-volume mounts for a container from its own Docker
+ * inspect (no volumes table — the container's Mounts array is the record).
+ */
+async function getExistingMounts(
+    dockerContainerId: string,
+): Promise<Array<{ dockerVolumeName: string; mountPath: string }>> {
+    const info: any = await containerManager.inspectContainer(dockerContainerId);
+    const mounts = (info.Mounts ?? []) as Array<{ Type?: string; Name?: string; Destination?: string }>;
+    return mounts
+        .filter((m) => m.Type === 'volume' && m.Name)
+        .map((m) => ({ dockerVolumeName: m.Name as string, mountPath: m.Destination ?? '' }));
 }
 
 /**
@@ -137,13 +145,13 @@ function requireContainer(containerId: string): Container {
  * taken by a different container. Uniqueness is per host, so the same subdomain
  * label can be reused under a different domain.
  */
-function assertHostAvailable(
+async function assertHostAvailable(
     subdomain: string | null | undefined,
     domain: string | null,
     ignoreContainerId?: string,
-): void {
+): Promise<void> {
     if (!subdomain) return;
-    const existing = containersRepo.findByHost(subdomain, domain);
+    const existing = await dockerState.findByHost(subdomain, domain);
     if (existing && existing.id !== ignoreContainerId) {
         const host = domain ? `${subdomain}.${domain}` : subdomain;
         const err: Error & { statusCode?: number } = new Error(
@@ -165,7 +173,7 @@ async function assertResourceBudget(
 ): Promise<void> {
     let req = resources;
     if (ignoreContainerId) {
-        const existing = containersRepo.findById(ignoreContainerId);
+        const existing = await dockerState.getById(ignoreContainerId);
         if (existing) {
             req = {
                 memoryMb: Math.max(0, resources.memoryMb - existing.resources.memoryMb),
@@ -201,7 +209,7 @@ export async function deployManagedApp(req: DeployRequest): Promise<Container> {
     const tag = req.tag ?? DEFAULT_TAG;
     const port = req.port ?? DEFAULT_PORT;
     const resources: ContainerResources = {
-        ...getDefaultResources(), // user-configurable in /settings
+        ...getDefaultResources(), // env-configured cluster defaults
         ...req.resources,
     };
     const envVars = req.envVars ?? {};
@@ -215,37 +223,23 @@ export async function deployManagedApp(req: DeployRequest): Promise<Container> {
         'deploying managed app',
     );
 
-    assertHostAvailable(subdomain, baseDomain);
+    await assertHostAvailable(subdomain, baseDomain);
     await assertResourceBudget(resources);
 
     await containerManager.pullImage(image, tag);
 
     let dockerContainerId: string | null = null;
-    let dockerContainerName: string | null = null;
     const createdDockerVolumes: string[] = [];
 
     try {
         // Create Docker named volumes for each requested volume
-        const volumeRows: ContainerVolumeRow[] = [];
+        const mounts: Array<{ dockerVolumeName: string; mountPath: string }> = [];
         for (const vol of volumeSpecs) {
             const dockerVolumeName = `mcp-vol-${shortId}-${vol.name}`;
             await containerManager.ensureVolume(dockerVolumeName, vol.sizeMb);
             createdDockerVolumes.push(dockerVolumeName);
-            volumeRows.push({
-                id: crypto.randomUUID(),
-                containerId: clusterId,
-                name: vol.name,
-                dockerVolumeName,
-                mountPath: vol.mountPath,
-                sizeMb: vol.sizeMb,
-                createdAt: Date.now(),
-            });
+            mounts.push({ dockerVolumeName, mountPath: vol.mountPath });
         }
-
-        const mounts = volumeRows.map((v) => ({
-            dockerVolumeName: v.dockerVolumeName,
-            mountPath: v.mountPath,
-        }));
 
         const containerName = buildContainerName({
             appId: req.appId,
@@ -268,7 +262,6 @@ export async function deployManagedApp(req: DeployRequest): Promise<Container> {
             createdAt,
         });
         dockerContainerId = created.containerId;
-        dockerContainerName = created.containerName;
 
         await containerManager.startContainer(dockerContainerId);
 
@@ -280,40 +273,13 @@ export async function deployManagedApp(req: DeployRequest): Promise<Container> {
             logger.warn({ clusterId, internalUrl }, 'container did not become healthy within 30s — proceeding anyway');
         }
 
-        const now = Date.now();
-        const container: Container = {
-            id: clusterId,
-            appId: req.appId ?? null,
-            dockerContainerId,
-            dockerContainerName,
-            image,
-            tag,
-            state: 'running',
-            internalUrl,
-            port,
-            hostPort,
-            resources,
-            envVars,
-            healthCheck: {
-                status: healthy ? 'healthy' : 'unknown',
-                failCount: 0,
-                restartCount: 0,
-                lastCheck: now,
-            },
-            createdAt,
-            startedAt: now,
-            stoppedAt: null,
-            volumes: volumeRows.map((v) => ({ name: v.name, mountPath: v.mountPath, sizeMb: v.sizeMb })),
-            subdomain,
-            domain: baseDomain,
-        };
-
-        containersRepo.insert(container);
-        // Persist volume rows after container is inserted (FK constraint)
-        for (const vr of volumeRows) {
-            volumesRepo.insert(vr);
+        // Docker (via the labels just written) is now the source of truth —
+        // read the container back rather than hand-building the response.
+        const container = await dockerState.getById(clusterId, getHealth);
+        if (!container) {
+            throw new Error(`Deployed container ${clusterId} not found immediately after creation`);
         }
-        sendEvent(eventFromContainer(container, 'deployed'));
+
         logger.info({ clusterId, dockerContainerId, internalUrl }, 'deploy complete');
         return container;
     } catch (err: any) {
@@ -347,7 +313,7 @@ export async function deployManagedApp(req: DeployRequest): Promise<Container> {
 // ---------------------------------------------------------------------------
 
 export async function startContainer(containerId: string): Promise<Container> {
-    const c = requireContainer(containerId);
+    const c = await getContainerOr404(containerId);
 
     logger.info({ containerId, dockerContainerId: c.dockerContainerId }, 'starting container');
 
@@ -362,27 +328,8 @@ export async function startContainer(containerId: string): Promise<Container> {
         logger.warn({ containerId, internalUrl }, 'container did not become healthy within 30s');
     }
 
-    const now = Date.now();
-    containersRepo.updateState(containerId, 'running', {
-        startedAt: now,
-        internalUrl,
-        hostPort,
-    });
-
-    const updated: Container = {
-        ...c,
-        state: 'running',
-        internalUrl,
-        hostPort,
-        startedAt: now,
-        healthCheck: {
-            ...c.healthCheck,
-            status: healthy ? 'healthy' : 'unknown',
-            lastCheck: now,
-        },
-    };
-
-    sendEvent(eventFromContainer(updated, 'started'));
+    const updated = await dockerState.getById(containerId, getHealth);
+    if (!updated) throw new Error(`Container not found after start: ${containerId}`);
     return updated;
 }
 
@@ -391,22 +338,14 @@ export async function startContainer(containerId: string): Promise<Container> {
 // ---------------------------------------------------------------------------
 
 export async function stopContainer(containerId: string): Promise<Container> {
-    const c = requireContainer(containerId);
+    const c = await getContainerOr404(containerId);
 
     logger.info({ containerId, dockerContainerId: c.dockerContainerId }, 'stopping container');
 
     await containerManager.stopContainer(c.dockerContainerId, 10);
 
-    const now = Date.now();
-    containersRepo.updateState(containerId, 'stopped', { stoppedAt: now });
-
-    const updated: Container = {
-        ...c,
-        state: 'stopped',
-        stoppedAt: now,
-    };
-
-    sendEvent(eventFromContainer(updated, 'stopped'));
+    const updated = await dockerState.getById(containerId, getHealth);
+    if (!updated) throw new Error(`Container not found after stop: ${containerId}`);
     return updated;
 }
 
@@ -415,7 +354,7 @@ export async function stopContainer(containerId: string): Promise<Container> {
 // ---------------------------------------------------------------------------
 
 export async function restartContainer(containerId: string): Promise<Container> {
-    const c = requireContainer(containerId);
+    const c = await getContainerOr404(containerId);
 
     logger.info({ containerId, dockerContainerId: c.dockerContainerId }, 'restarting container');
 
@@ -430,27 +369,8 @@ export async function restartContainer(containerId: string): Promise<Container> 
         logger.warn({ containerId, internalUrl }, 'container did not become healthy within 30s after restart');
     }
 
-    const now = Date.now();
-    containersRepo.updateState(containerId, 'running', {
-        startedAt: now,
-        internalUrl,
-        hostPort,
-    });
-
-    const updated: Container = {
-        ...c,
-        state: 'running',
-        internalUrl,
-        hostPort,
-        startedAt: now,
-        healthCheck: {
-            ...c.healthCheck,
-            status: healthy ? 'healthy' : 'unknown',
-            lastCheck: now,
-        },
-    };
-
-    sendEvent(eventFromContainer(updated, 'restarted'));
+    const updated = await dockerState.getById(containerId, getHealth);
+    if (!updated) throw new Error(`Container not found after restart: ${containerId}`);
     return updated;
 }
 
@@ -459,10 +379,7 @@ export async function restartContainer(containerId: string): Promise<Container> 
 // ---------------------------------------------------------------------------
 
 export async function redeployContainer(containerId: string, req: RedeployRequest): Promise<Container> {
-    const c = requireContainer(containerId);
-    if (c.adopted) {
-        throw new Error('Cannot redeploy adopted containers — image source unknown. Use start/stop/restart only.');
-    }
+    const c = await getContainerOr404(containerId);
 
     const newImage = req.image ?? c.image;
     const newTag = req.tag ?? c.tag;
@@ -480,24 +397,24 @@ export async function redeployContainer(containerId: string, req: RedeployReques
 
     logger.info({ containerId, newImage, newTag, newSubdomain, baseDomain }, 'redeploying container');
 
-    assertHostAvailable(newSubdomain, baseDomain, containerId);
+    await assertHostAvailable(newSubdomain, baseDomain, containerId);
     await assertResourceBudget(newResources, containerId);
+
+    // Read existing volume mounts from the OLD container's own inspect before
+    // it's removed — there is no volumes table to query anymore.
+    const mounts = await getExistingMounts(c.dockerContainerId);
+
+    // Pull the new image FIRST — it's the most likely failure (bad tag, registry
+    // down/auth) and is non-destructive. Only tear down the old container once we
+    // know the new image is available; otherwise a pull failure would leave the
+    // app with no container carrying its privos.id (gone from GET /apps, no rollback).
+    await containerManager.pullImage(newImage, newTag);
 
     // Stop + remove old Docker container
     await containerManager.stopContainer(c.dockerContainerId, 10);
     await containerManager.removeContainer(c.dockerContainerId, true);
 
-    // Pull new image
-    await containerManager.pullImage(newImage, newTag);
-
-    // Reuse existing volumes — fetch from DB and pass mounts to new container
-    const existingVolumeRows = volumesRepo.findByContainerId(containerId);
-    const mounts = existingVolumeRows.map((v) => ({
-        dockerVolumeName: v.dockerVolumeName,
-        mountPath: v.mountPath,
-    }));
-
-    // Create + start new Docker container (preserve cluster id via appId)
+    // Create + start new Docker container (preserve cluster id via the id label)
     const newContainerName = buildContainerName({
         appId: c.appId,
         subdomain: newSubdomain,
@@ -528,463 +445,56 @@ export async function redeployContainer(containerId: string, req: RedeployReques
         logger.warn({ containerId, internalUrl }, 'container did not become healthy within 30s after redeploy');
     }
 
-    const now = Date.now();
-
-    // Update DB row in-place: preserve cluster id, rotate docker details
-    containersRepo.update(containerId, {
-        dockerContainerId: created.containerId,
-        dockerContainerName: created.containerName,
-        image: newImage,
-        tag: newTag,
-        state: 'running',
-        internalUrl,
-        hostPort,
-        resources: newResources,
-        startedAt: now,
-        stoppedAt: null,
-        subdomain: newSubdomain,
-        domain: baseDomain,
-        healthCheck: {
-            ...c.healthCheck,
-            status: healthy ? 'healthy' : 'unknown',
-            failCount: 0,
-            lastCheck: now,
-        },
-    });
-
-    const updated: Container = {
-        ...c,
-        dockerContainerId: created.containerId,
-        dockerContainerName: created.containerName,
-        image: newImage,
-        tag: newTag,
-        state: 'running',
-        internalUrl,
-        hostPort,
-        resources: newResources,
-        startedAt: now,
-        stoppedAt: null,
-        subdomain: newSubdomain,
-        domain: baseDomain,
-        healthCheck: {
-            ...c.healthCheck,
-            status: healthy ? 'healthy' : 'unknown',
-            failCount: 0,
-            lastCheck: now,
-        },
-        volumes: existingVolumeRows.map((v) => ({ name: v.name, mountPath: v.mountPath, sizeMb: v.sizeMb })),
-    };
-
-    sendEvent(eventFromContainer(updated, 'redeployed'));
+    const updated = await dockerState.getById(containerId, getHealth);
+    if (!updated) throw new Error(`Container not found after redeploy: ${containerId}`);
     logger.info({ containerId, newDockerContainerId: created.containerId, internalUrl }, 'redeploy complete');
     return updated;
-}
-
-// ---------------------------------------------------------------------------
-// rollingRedeployContainer
-// ---------------------------------------------------------------------------
-
-/**
- * Zero-downtime redeploy: create new container in parallel with old, switch traffic
- * atomically when new is healthy, then drain and remove old.
- *
- * Only safe when no persistent volumes — two containers writing to the same volume
- * would cause data corruption. Callers must check before invoking.
- */
-export async function rollingRedeployContainer(containerId: string, req: RedeployRequest): Promise<Container> {
-    const old = requireContainer(containerId);
-    if (old.adopted) {
-        throw new Error('Cannot redeploy adopted containers — image source unknown. Use start/stop/restart only.');
-    }
-
-    if (old.state !== 'running') {
-        throw new Error(`Cannot rolling-redeploy a non-running container (state=${old.state}) — start it first`);
-    }
-
-    const newImage = req.image ?? old.image;
-    const newTag = req.tag ?? old.tag;
-    const newResources: ContainerResources = { ...old.resources, ...req.resources };
-    const port = old.port;
-    const newSubdomain =
-        req.subdomain === undefined ? (old.subdomain ?? null) : req.subdomain;
-    const requestedDomain = req.domain === undefined ? old.domain : req.domain;
-    const baseDomain = isReverseProxyEnabled() ? resolveDomain(requestedDomain) : null;
-
-    logger.info(
-        { containerId, old: `${old.image}:${old.tag}`, new: `${newImage}:${newTag}`, newSubdomain, baseDomain },
-        'rolling redeploy starting',
-    );
-
-    assertHostAvailable(newSubdomain, baseDomain, containerId);
-    await assertResourceBudget(newResources, containerId);
-
-    // 1. Pull new image — old container continues serving traffic
-    await containerManager.pullImage(newImage, newTag);
-
-    // 2. Create new container — buildContainerName already appends a unique
-    //    hash so name collision with the still-running old container is impossible.
-    let newDockerContainerId: string | null = null;
-    let newDockerContainerName: string | null = null;
-
-    try {
-        const newContainerName = buildContainerName({
-            appId: old.appId,
-            subdomain: newSubdomain,
-            image: newImage,
-        });
-        const created = await containerManager.createAppContainer({
-            id: containerId,
-            appId: old.appId ?? containerId.slice(0, 12),
-            containerName: newContainerName,
-            image: newImage,
-            tag: newTag,
-            port,
-            resources: newResources,
-            envVars: old.envVars,
-            mounts: [], // volumes excluded — rolling is only allowed for volume-free containers
-            subdomain: newSubdomain,
-            baseDomain,
-            createdAt: old.createdAt,
-        });
-        newDockerContainerId = created.containerId;
-        newDockerContainerName = created.containerName;
-
-        await containerManager.startContainer(newDockerContainerId);
-        const newHostPort = await getHostPortWithRetry(newDockerContainerId, port);
-        const newInternalUrl = `http://localhost:${newHostPort}`;
-
-        const healthy = await waitForHealthy(newInternalUrl, 30_000);
-        if (!healthy) {
-            throw new Error('New container did not become healthy within 30s — aborting rolling redeploy');
-        }
-
-        // 3. Atomic swap: update DB pointer to new container.
-        //    Subsequent dispatch calls will immediately route to the new container.
-        const now = Date.now();
-        const updatedContainer: Container = {
-            ...old,
-            dockerContainerId: newDockerContainerId,
-            dockerContainerName: newDockerContainerName,
-            image: newImage,
-            tag: newTag,
-            internalUrl: newInternalUrl,
-            hostPort: newHostPort,
-            resources: newResources,
-            state: 'running',
-            startedAt: now,
-            stoppedAt: null,
-            subdomain: newSubdomain,
-            domain: baseDomain,
-            healthCheck: {
-                status: 'healthy',
-                failCount: 0,
-                restartCount: old.healthCheck.restartCount,
-                lastCheck: now,
-            },
-        };
-
-        containersRepo.update(containerId, {
-            dockerContainerId: newDockerContainerId,
-            dockerContainerName: newDockerContainerName,
-            image: newImage,
-            tag: newTag,
-            internalUrl: newInternalUrl,
-            hostPort: newHostPort,
-            resources: newResources,
-            state: 'running',
-            startedAt: now,
-            stoppedAt: null,
-            subdomain: newSubdomain,
-            domain: baseDomain,
-            healthCheck: {
-                status: 'healthy',
-                failCount: 0,
-                restartCount: old.healthCheck.restartCount,
-                lastCheck: now,
-            },
-        });
-        sendEvent(eventFromContainer(updatedContainer, 'redeployed'));
-
-        // 4. Grace period: allow in-flight requests on old container to complete
-        logger.info({ containerId }, 'rolling redeploy: traffic switched, draining old container (5s)');
-        await new Promise<void>((r) => setTimeout(r, 5_000));
-
-        // 5. Stop and remove old container (best-effort — new is already serving)
-        try {
-            await containerManager.stopContainer(old.dockerContainerId, 10);
-            await containerManager.removeContainer(old.dockerContainerId, true);
-            logger.info(
-                { containerId, oldDockerId: old.dockerContainerId },
-                'rolling redeploy: old container removed',
-            );
-        } catch (err: any) {
-            logger.warn(
-                { containerId, err: err.message },
-                'rolling redeploy: old container cleanup failed (best-effort)',
-            );
-        }
-
-        logger.info(
-            { containerId, newDockerContainerId, newInternalUrl },
-            'rolling redeploy complete',
-        );
-        return updatedContainer;
-    } catch (err: any) {
-        logger.error({ containerId, err: err.message }, 'rolling redeploy failed — cleaning up new container');
-        if (newDockerContainerId) {
-            try {
-                await containerManager.stopContainer(newDockerContainerId, 5);
-            } catch {
-                // best-effort
-            }
-            try {
-                await containerManager.removeContainer(newDockerContainerId, true);
-            } catch {
-                // best-effort
-            }
-        }
-        throw err;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// redeployContainerSmart — picks rolling vs stop-then-create
-// ---------------------------------------------------------------------------
-
-/**
- * Smart redeploy dispatcher: prefers zero-downtime rolling when safe, falls back
- * to legacy stop-then-create when rolling is not applicable.
- *
- * Rolling is skipped (with a log) when:
- *   - Caller passes `rolling: false` explicitly
- *   - App has persistent volumes (two writers → corruption risk)
- *   - Container is not currently running
- *
- * If rolling is attempted and fails, the error is thrown — no silent fallback to
- * stop-then-create, since that would cause unexpected downtime.
- */
-export async function redeployContainerSmart(containerId: string, req: RedeployRequest): Promise<Container> {
-    const old = requireContainer(containerId);
-    if (old.adopted) {
-        throw new Error('Cannot redeploy adopted containers — image source unknown. Use start/stop/restart only.');
-    }
-    const volumes = volumesRepo.findByContainerId(containerId);
-    const wantRolling = req.rolling !== false; // default true when req.rolling is undefined
-
-    if (wantRolling && volumes.length === 0 && old.state === 'running') {
-        // Attempt rolling — throw on failure, don't silently fall back to downtime redeploy
-        return rollingRedeployContainer(containerId, req);
-    }
-
-    // Fall back to legacy stop-then-create
-    if (wantRolling) {
-        const reason =
-            volumes.length > 0
-                ? `has ${volumes.length} persistent volume(s)`
-                : `not running (state=${old.state})`;
-        logger.info({ containerId, reason }, 'rolling unavailable, using stop-then-create redeploy');
-    }
-    return redeployContainer(containerId, req);
-}
-
-// ---------------------------------------------------------------------------
-// adoptContainer
-// ---------------------------------------------------------------------------
-
-/**
- * Adopt an externally-created Docker container into the cluster.
- * Container must have label privos.mcp-app=true. Stopped containers are allowed —
- * MCP validation is deferred until the container is started.
- * Adoption is read-only from the image perspective — redeploy is blocked for adopted containers.
- */
-export async function adoptContainer(dockerContainerId: string, appId?: string): Promise<Container> {
-    // 1. Inspect Docker container
-    let info: any;
-    try {
-        info = await containerManager.inspectContainer(dockerContainerId);
-    } catch {
-        throw new Error(`Container ${dockerContainerId} not found`);
-    }
-
-    const isRunning = info.State?.Running === true;
-
-    // 2. Already adopted?
-    const existing = containersRepo.findByDockerContainerId(info.Id);
-    if (existing) {
-        throw new Error(`Container already managed by cluster (id: ${existing.id})`);
-    }
-
-    // 3. Has privos.mcp-app=true label?
-    const labels = info.Config?.Labels ?? {};
-    if (labels['privos.mcp-app'] !== 'true') {
-        throw new Error('Container missing required label privos.mcp-app=true');
-    }
-
-    // 4. Resolve port — priority: label > exposed ports
-    let port: number | null = null;
-    if (labels['privos.mcp-app.port']) {
-        port = parseInt(labels['privos.mcp-app.port'], 10);
-    } else {
-        const exposed = Object.keys(info.Config?.ExposedPorts ?? {});
-        const tcpPort = exposed.find((p) => p.endsWith('/tcp'));
-        if (tcpPort) port = parseInt(tcpPort.split('/')[0], 10);
-    }
-    if (!port || isNaN(port)) {
-        throw new Error('Container has no exposed TCP port and no privos.mcp-app.port label');
-    }
-
-    // 5. Resolve internalUrl + validate MCP — only if running. For stopped: deferred until start.
-    let internalUrl = '';
-    let hostPort: number | null = null;
-    if (isRunning) {
-        try {
-            hostPort = await containerManager.getHostPort(info.Id, port);
-            internalUrl = `http://localhost:${hostPort}`;
-        } catch {
-            const ip = await containerManager.getContainerIp(info.Id);
-            if (!ip) throw new Error('Container has no host port mapping and no IP on mcp-apps-network');
-            internalUrl = `http://${ip}:${port}`;
-        }
-
-        const healthy = await waitForHealthy(internalUrl, 5_000);
-        if (!healthy) {
-            throw new Error(
-                'Container does not respond to MCP HTTP endpoints. ' +
-                'Make sure container runs with MODE=http and exposes /health or /.well-known/mcp/manifest.json',
-            );
-        }
-    }
-
-    // 7. Read minimal env (safe keys only — avoid leaking secrets)
-    const ALLOWED_ENV_KEYS = ['PORT', 'MODE', 'NODE_ENV'];
-    const envArr = (info.Config?.Env ?? []) as string[];
-    const envVars: Record<string, string> = {};
-    for (const e of envArr) {
-        const idx = e.indexOf('=');
-        if (idx === -1) continue;
-        const k = e.slice(0, idx);
-        if (ALLOWED_ENV_KEYS.includes(k)) {
-            envVars[k] = e.slice(idx + 1);
-        }
-    }
-
-    // 8. Read resources from HostConfig
-    const defaults = getDefaultResources();
-    const memoryMb = info.HostConfig?.Memory
-        ? Math.round(info.HostConfig.Memory / 1024 / 1024)
-        : defaults.memoryMb;
-    const cpus = info.HostConfig?.NanoCpus
-        ? info.HostConfig.NanoCpus / 1e9
-        : defaults.cpus;
-
-    // 9. Parse image + tag from Image string
-    const imageStr = info.Config?.Image ?? '';
-    const lastColon = imageStr.lastIndexOf(':');
-    const lastSlash = imageStr.lastIndexOf('/');
-    let image: string, tag: string;
-    if (lastColon > lastSlash && lastColon > -1) {
-        image = imageStr.slice(0, lastColon);
-        tag = imageStr.slice(lastColon + 1);
-    } else {
-        image = imageStr;
-        tag = DEFAULT_TAG;
-    }
-
-    // 10. Build Container record
-    const clusterId = crypto.randomUUID();
-    const now = Date.now();
-    const container: Container = {
-        id: clusterId,
-        appId: appId ?? labels['privos.mcp-app.name'] ?? null,
-        dockerContainerId: info.Id,
-        dockerContainerName: info.Name?.replace(/^\//, '') ?? '',
-        image,
-        tag,
-        state: isRunning ? 'running' : 'stopped',
-        internalUrl,
-        port,
-        hostPort,
-        resources: { memoryMb, cpus, tmpSizeMb: defaults.tmpSizeMb },
-        envVars,
-        healthCheck: {
-            status: isRunning ? 'healthy' : 'unknown',
-            failCount: 0,
-            restartCount: 0,
-            lastCheck: isRunning ? now : null,
-        },
-        createdAt: info.Created ? new Date(info.Created).getTime() : now,
-        startedAt: isRunning && info.State?.StartedAt ? new Date(info.State.StartedAt).getTime() : null,
-        stoppedAt: !isRunning && info.State?.FinishedAt ? new Date(info.State.FinishedAt).getTime() : null,
-        volumes: [],
-        adopted: true,
-    };
-
-    containersRepo.insert(container);
-    sendEvent(eventFromContainer(container, 'deployed'));
-
-    logger.info({ clusterId, dockerContainerId: info.Id, image, tag }, 'container adopted');
-    return container;
 }
 
 // ---------------------------------------------------------------------------
 // deleteContainer
 // ---------------------------------------------------------------------------
 
-export async function deleteContainer(
-    containerId: string,
-    options: { detach?: boolean } = {},
-): Promise<void> {
-    const c = requireContainer(containerId);
+/**
+ * Stop, remove, and clean up a managed container's Docker volumes.
+ * Labels are immutable — there is no "detach" (unmanage-without-removing)
+ * option anymore; delete always stops and removes the Docker container.
+ */
+export async function deleteContainer(containerId: string): Promise<void> {
+    const c = await getContainerOr404(containerId);
 
-    if (!options.detach) {
-        logger.info({ containerId, dockerContainerId: c.dockerContainerId }, 'deleting container');
+    logger.info({ containerId, dockerContainerId: c.dockerContainerId }, 'deleting container');
 
-        try {
-            await containerManager.stopContainer(c.dockerContainerId, 10);
-        } catch (err: any) {
-            logger.warn({ containerId, err: err.message }, 'stop failed during delete — continuing');
-        }
-
-        try {
-            await containerManager.removeContainer(c.dockerContainerId, true);
-        } catch (err: any) {
-            logger.warn({ containerId, err: err.message }, 'remove failed during delete — continuing');
-        }
-
-        // Fetch volumes before deleting container (FK cascade would remove them, but we need names for Docker cleanup)
-        const volumes = volumesRepo.findByContainerId(containerId);
-
-        // Remove Docker named volumes (data loss by design — conservative approach)
-        for (const vol of volumes) {
-            try {
-                await containerManager.removeVolume(vol.dockerVolumeName);
-            } catch (err: any) {
-                logger.warn({ containerId, volumeName: vol.dockerVolumeName, err: err.message }, 'failed to remove volume during delete — continuing');
-            }
-        }
-    } else {
-        logger.info({ containerId }, 'detach mode: keeping Docker container alive');
+    // Derive volume names from the container's own mounts before it's removed
+    // — there is no volumes table to fall back on.
+    let volumeNames: string[] = [];
+    try {
+        const mounts = await getExistingMounts(c.dockerContainerId);
+        volumeNames = mounts.map((m) => m.dockerVolumeName);
+    } catch (err: any) {
+        logger.warn({ containerId, err: err.message }, 'inspect failed before delete — skipping volume cleanup');
     }
 
-    // Always: remove from SQLite + clean up volume rows + send event
-    // Fetch volumes for explicit cleanup (cascade handles FK, but be explicit)
-    const volumes = volumesRepo.findByContainerId(containerId);
-    containersRepo.deleteById(containerId);
-    volumesRepo.deleteByContainerId(containerId);
+    try {
+        await containerManager.stopContainer(c.dockerContainerId, 10);
+    } catch (err: any) {
+        logger.warn({ containerId, err: err.message }, 'stop failed during delete — continuing');
+    }
 
-    // Build event from last known state
-    sendEvent({
-        event: 'deleted',
-        containerId: c.id,
-        dockerContainerId: c.dockerContainerId,
-        appId: c.appId,
-        state: 'stopped',
-        healthStatus: c.healthCheck.status,
-        internalUrl: c.internalUrl,
-        hostPort: c.hostPort,
-        ts: Date.now(),
-        ...(options.detach ? { detached: true } : {}),
-    } as any);
+    try {
+        await containerManager.removeContainer(c.dockerContainerId, true);
+    } catch (err: any) {
+        logger.warn({ containerId, err: err.message }, 'remove failed during delete — continuing');
+    }
 
-    logger.info({ containerId, detach: options.detach ?? false }, 'container deleted');
+    // Remove Docker named volumes (data loss by design — conservative approach)
+    for (const volName of volumeNames) {
+        try {
+            await containerManager.removeVolume(volName);
+        } catch (err: any) {
+            logger.warn({ containerId, volumeName: volName, err: err.message }, 'failed to remove volume during delete — continuing');
+        }
+    }
+
+    logger.info({ containerId }, 'container deleted');
 }

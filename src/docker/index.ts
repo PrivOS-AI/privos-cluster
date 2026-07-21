@@ -3,7 +3,6 @@ import { config } from '../config.js';
 import { ContainerManager } from './container-manager.js';
 import { ImageManager } from './image-manager.js';
 import { NetworkManager } from './network-manager.js';
-import * as containersRepo from '../db/containers-repo.js';
 import * as imagesRepo from '../db/images-repo.js';
 import type { Image } from '../types/index.js';
 
@@ -24,36 +23,6 @@ export const docker = new Docker(buildDockerOptions());
 export const networkManager = new NetworkManager(docker);
 export const containerManager = new ContainerManager(docker);
 export const imageManager = new ImageManager(docker);
-
-export async function reconcileState(): Promise<void> {
-    // On startup, sync DB ↔ Docker:
-    // - For each managed container in DB, check if Docker still has it
-    // - If Docker container gone → mark DB row as 'error'
-    // - If Docker state differs from DB state → update DB
-    const dbContainers = containersRepo.findAll();
-    const dockerList = await containerManager.listMcpContainers();
-    const dockerMap = new Map(dockerList.map((c) => [c.Id, c]));
-
-    for (const dbRow of dbContainers) {
-        const dockerContainer = dockerMap.get(dbRow.dockerContainerId);
-        if (!dockerContainer) {
-            // Container gone from Docker
-            if (dbRow.state !== 'error') {
-                containersRepo.updateState(dbRow.id, 'error');
-            }
-            continue;
-        }
-        // Map Docker state → our state enum
-        const dockerState = dockerContainer.State;
-        const mappedState =
-            dockerState === 'running' ? 'running'
-            : dockerState === 'created' ? 'created'
-            : 'stopped';
-        if (dbRow.state !== mappedState) {
-            containersRepo.updateState(dbRow.id, mappedState);
-        }
-    }
-}
 
 /**
  * Sync the images table with the Docker daemon.
