@@ -1,27 +1,25 @@
 /**
  * Privos Cluster — Fastify entry point.
- * Bootstraps DB, Docker, background services, and HTTP/WebSocket routes.
+ * Stateless Docker agent: bootstraps Docker + background services and
+ * registers HTTP/WebSocket routes. No local database — Docker (container
+ * labels, images) is the only source of truth.
  */
 import Fastify from 'fastify';
 import websocket from '@fastify/websocket';
-import multipart from '@fastify/multipart';
 import cors from '@fastify/cors';
 
 import { config } from './config.js';
-import { getDb, closeDb } from './db/client.js';
-import { networkManager, reconcileImages } from './docker/index.js';
+import { networkManager } from './docker/index.js';
 import { startHealthMonitor, stopHealthMonitor } from './services/health-monitor.js';
 import authPlugin from './plugins/auth.js';
 import capabilitiesHandler from './handlers/capabilities.js';
 import appsHandler from './handlers/apps.js';
 import imagesHandler from './handlers/images.js';
-import buildsHandler from './handlers/builds.js';
 import logsHandler from './handlers/logs.js';
 import filesHandler from './handlers/files.js';
 import terminalHandler from './handlers/terminal.js';
 import clusterHandler from './handlers/cluster.js';
 import authRoutesHandler from './handlers/auth.js';
-import registriesHandler from './handlers/registries.js';
 
 const fastify = Fastify({
 	logger: {
@@ -46,20 +44,13 @@ fastify.get('/api/v1/health', async () => ({
 
 async function main(): Promise<void> {
 	try {
-		// 1. Init DB (fail-fast if disk not writable)
-		getDb();
-		fastify.log.info('database initialized');
-
-		// 2. Ensure Docker network
+		// 1. Ensure Docker network. The cluster is stateless — Docker itself
+		//    (containers, labels, images) is the only source of truth; there is
+		//    no local database to initialize or reconcile.
 		await networkManager.ensureNetwork();
 		fastify.log.info({ network: config.DOCKER_NETWORK }, 'docker network ready');
 
-		// 3. Reconcile images (DB ↔ Docker). Containers need no reconciliation —
-		//    Docker labels are the source of truth, read live on every request.
-		await reconcileImages();
-		fastify.log.info('state reconciled');
-
-		// 4. Register CORS (frontend dev server origin). Skipped if explicitly disabled.
+		// 2. Register CORS (frontend dev server origin). Skipped if explicitly disabled.
 		if (config.CORS_ORIGIN) {
 			const origins =
 				config.CORS_ORIGIN === '*'
@@ -74,35 +65,25 @@ async function main(): Promise<void> {
 			fastify.log.info({ origins }, 'cors enabled');
 		}
 
-		// 5. Register WebSocket plugin (must be before websocket route handlers)
+		// 3. Register WebSocket plugin (must be before websocket route handlers)
 		await fastify.register(websocket, { options: { maxPayload: 1024 * 1024 } });
 
-		// 5b. Register multipart plugin (image tarball uploads up to 2 GB).
-		await fastify.register(multipart, {
-			limits: {
-				fileSize: 2 * 1024 * 1024 * 1024, // 2 GB
-				files: 1,
-			},
-		});
-
-		// 6. Register public handlers (no auth)
+		// 4. Register public handlers (no auth)
 		await fastify.register(capabilitiesHandler);
 
-		// 7. Register auth plugin (decorates fastify.authenticate)
+		// 5. Register auth plugin (decorates fastify.authenticate)
 		await fastify.register(authPlugin);
 
-		// 8. Public-ish auth routes (login is public; /me is protected via preHandler inside)
+		// 6. Auth introspection route (/me; protected via preHandler inside)
 		await fastify.register(authRoutesHandler);
 
-		// 9. Register protected route handlers
+		// 7. Register protected route handlers
 		await fastify.register(appsHandler);
 		await fastify.register(imagesHandler);
-		await fastify.register(buildsHandler);
 		await fastify.register(clusterHandler);
 		await fastify.register(logsHandler);
 		await fastify.register(filesHandler);
 		await fastify.register(terminalHandler);
-		await fastify.register(registriesHandler);
 
 		// 8. Start background services
 		startHealthMonitor();
@@ -121,7 +102,6 @@ async function shutdown(signal: string): Promise<void> {
 	try {
 		stopHealthMonitor();
 		await fastify.close();
-		closeDb();
 		fastify.log.info('shutdown complete');
 		process.exit(0);
 	} catch (err) {

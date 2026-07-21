@@ -12,14 +12,7 @@ const ConfigSchema = z.object({
 	DOCKER_SOCKET: z.string().default('/var/run/docker.sock'),
 	DOCKER_NETWORK: z.string().default('mcp-apps-network'),
 
-	SQLITE_PATH: z.string().default('./data/cluster.db'),
-
 	JWT_SECRET: z.string().min(16, 'JWT_SECRET must be at least 16 chars'),
-
-	// Webhooks are no longer sent for container lifecycle events (labels are the
-	// source of truth now); this stays optional so boot never fails on a missing
-	// value while image/build events (Phase 3 territory) still use it if set.
-	PRIVOS_CHAT_WEBHOOK_URL: z.string().url().optional(),
 
 	HEALTH_CHECK_INTERVAL_MS: z.coerce.number().int().positive().default(30_000),
 
@@ -35,11 +28,6 @@ const ConfigSchema = z.object({
 	DEFAULT_MEMORY_MB: z.coerce.number().int().positive().default(256),
 	DEFAULT_CPUS: z.coerce.number().positive().default(0.5),
 	DEFAULT_TMP_MB: z.coerce.number().int().positive().default(64),
-
-	// Admin UI auth — used by the web frontend (POST /api/v1/auth/login).
-	// Leave ADMIN_PASSWORD empty in env to disable the admin login flow entirely.
-	ADMIN_USERNAME: z.string().min(1).default('admin'),
-	ADMIN_PASSWORD: z.string().default(''),
 
 	// CORS — comma-separated origins, or "*" for any. Empty disables CORS entirely.
 	CORS_ORIGIN: z.string().default('http://localhost:5173'),

@@ -4,7 +4,6 @@
  */
 import type { FastifyPluginAsync } from 'fastify';
 import fp from 'fastify-plugin';
-import * as imagesRepo from '../db/images-repo.js';
 import * as dockerState from '../docker/docker-state.js';
 import { containerManager, imageManager } from '../docker/index.js';
 import { getHealth } from '../services/health-monitor.js';
@@ -92,8 +91,7 @@ const appsHandler: FastifyPluginAsync = async (fastify) => {
             checks.push({ id: 'registry', label: 'Registry allowlist', status: 'ok', message: 'any registry allowed' });
         }
 
-        // 4. Image availability (tracked in cluster? on Docker host? would need pull?)
-        const trackedRow = imagesRepo.findByRepoTag(image, tag);
+        // 4. Image availability — check the Docker host directly (no image DB).
         let imageOnHost = false;
         try {
             const inspected = await imageManager.inspect(`${image}:${tag}`);
@@ -101,10 +99,8 @@ const appsHandler: FastifyPluginAsync = async (fastify) => {
         } catch {
             imageOnHost = false;
         }
-        if (trackedRow && imageOnHost) {
+        if (imageOnHost) {
             checks.push({ id: 'image-available', label: 'Image availability', status: 'ok', message: 'present locally' });
-        } else if (imageOnHost) {
-            checks.push({ id: 'image-available', label: 'Image availability', status: 'ok', message: 'on Docker host (not yet tracked)' });
         } else {
             checks.push({
                 id: 'image-available',

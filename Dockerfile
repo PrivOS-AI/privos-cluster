@@ -1,8 +1,7 @@
 # syntax=docker/dockerfile:1
 
-# Stage 1: Builder — needs python+make for native modules (better-sqlite3)
+# Stage 1: Builder — pure JS/TS build, no native module toolchain needed.
 FROM node:20-alpine AS builder
-RUN apk add --no-cache python3 make g++
 WORKDIR /app
 
 COPY package*.json ./
@@ -23,7 +22,7 @@ COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/dist ./dist
 COPY package.json ./
 
-RUN mkdir -p /app/data && chown -R node:node /app
+RUN chown -R node:node /app
 USER node
 
 EXPOSE 4000

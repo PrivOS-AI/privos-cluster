@@ -22,19 +22,18 @@ declare module '@fastify/jwt' {
 	}
 }
 
-// Accepted token issuers:
-//   - privos-chat:          service-to-service tokens from the chat backend
-//   - privos-cluster-admin: tokens minted by our own /auth/login for the admin UI
-const ALLOWED_ISSUERS = ['privos-chat', 'privos-cluster-admin'] as const;
+// Accepted token issuer — the cluster trusts only service-to-service tokens
+// signed by the privos-chat (hub) backend. There is no local admin auth flow.
+const ALLOWED_ISSUERS = ['privos-chat'] as const;
 
 // ---------------------------------------------------------------------------
 // Plugin
 // ---------------------------------------------------------------------------
 const authPlugin: FastifyPluginAsync = async (fastify) => {
-	// Register @fastify/jwt with shared secret
+	// Register @fastify/jwt with shared secret. Only `verify` is configured —
+	// this service never signs its own tokens (no local login flow).
 	await fastify.register(jwtPlugin, {
 		secret: config.JWT_SECRET,
-		sign: { algorithm: 'HS256', expiresIn: '5m', iss: 'privos-cluster' },
 		verify: { allowedIss: ALLOWED_ISSUERS as unknown as string[] },
 	});
 

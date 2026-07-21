@@ -1,5 +1,4 @@
 import jwt from 'jsonwebtoken';
-import type { SignOptions } from 'jsonwebtoken';
 import { config } from '../config.js';
 
 export interface JwtClaims {
@@ -7,18 +6,6 @@ export interface JwtClaims {
 	sub?: string;
 	iat?: number;
 	exp?: number;
-}
-
-/**
- * Sign a short-lived service token.
- * Default issuer is 'privos-cluster'; privos-chat uses 'privos-chat'.
- */
-export function signToken(iss: string, sub: string = 'service', expiresIn: SignOptions['expiresIn'] = '5m'): string {
-	return jwt.sign({ sub }, config.JWT_SECRET, {
-		algorithm: 'HS256',
-		issuer: iss,
-		expiresIn,
-	});
 }
 
 /**
