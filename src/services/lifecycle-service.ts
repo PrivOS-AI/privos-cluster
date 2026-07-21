@@ -252,7 +252,9 @@ export async function deployManagedApp(req: DeployRequest): Promise<Container> {
             subdomain,
             image,
         });
+        const createdAt = Date.now();
         const created = await containerManager.createAppContainer({
+            id: clusterId,
             appId: req.appId ?? shortId,
             containerName,
             image,
@@ -263,6 +265,7 @@ export async function deployManagedApp(req: DeployRequest): Promise<Container> {
             mounts,
             subdomain,
             baseDomain,
+            createdAt,
         });
         dockerContainerId = created.containerId;
         dockerContainerName = created.containerName;
@@ -297,7 +300,7 @@ export async function deployManagedApp(req: DeployRequest): Promise<Container> {
                 restartCount: 0,
                 lastCheck: now,
             },
-            createdAt: now,
+            createdAt,
             startedAt: now,
             stoppedAt: null,
             volumes: volumeRows.map((v) => ({ name: v.name, mountPath: v.mountPath, sizeMb: v.sizeMb })),
@@ -501,6 +504,7 @@ export async function redeployContainer(containerId: string, req: RedeployReques
         image: newImage,
     });
     const created = await containerManager.createAppContainer({
+        id: containerId,
         appId: c.appId ?? c.id.slice(0, 12),
         containerName: newContainerName,
         image: newImage,
@@ -511,6 +515,7 @@ export async function redeployContainer(containerId: string, req: RedeployReques
         mounts,
         subdomain: newSubdomain,
         baseDomain,
+        createdAt: c.createdAt,
     });
 
     await containerManager.startContainer(created.containerId);
@@ -628,6 +633,7 @@ export async function rollingRedeployContainer(containerId: string, req: Redeplo
             image: newImage,
         });
         const created = await containerManager.createAppContainer({
+            id: containerId,
             appId: old.appId ?? containerId.slice(0, 12),
             containerName: newContainerName,
             image: newImage,
@@ -638,6 +644,7 @@ export async function rollingRedeployContainer(containerId: string, req: Redeplo
             mounts: [], // volumes excluded — rolling is only allowed for volume-free containers
             subdomain: newSubdomain,
             baseDomain,
+            createdAt: old.createdAt,
         });
         newDockerContainerId = created.containerId;
         newDockerContainerName = created.containerName;

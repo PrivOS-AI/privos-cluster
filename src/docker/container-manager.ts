@@ -3,6 +3,7 @@ import { config } from '../config.js';
 import type { ContainerResources } from '../types/index.js';
 
 export interface CreateContainerConfig {
+    id: string;             // cluster-generated uuid — becomes the API container id (label privos.id)
     appId: string;          // metadata label (mcp-app-id); not used for naming anymore
     containerName: string;  // explicit Docker container name (caller computes via buildContainerName)
     image: string;
@@ -13,33 +14,70 @@ export interface CreateContainerConfig {
     mounts?: Array<{ dockerVolumeName: string; mountPath: string }>;  // named volume mounts
     subdomain?: string | null;     // DNS label
     baseDomain?: string | null;    // e.g. 'apps.example.com' — combined with subdomain for Caddy
+    createdBy?: string | null;     // JWT sub of the deployer
+    createdAt?: number;            // epoch ms (defaults to now)
 }
 
+// Default health policy encoded into labels so the (in-memory) health monitor can
+// act on it — and self-heal — without any database.
+export const HEALTH_DEFAULTS = { path: '/health', maxFails: 3, restart: true } as const;
+
+// Sentinel for "no value" in a Docker label (labels can't be null/absent-typed cleanly).
+const LABEL_NONE = '';
+
 /**
- * Build the Docker label map for a container. Includes the cluster's own
- * labels (mcp-app, cluster-managed) plus, when a subdomain+baseDomain is set,
- * the caddy-docker-proxy labels that publish the container behind Caddy.
+ * Build the Docker label map for a container. This is the FULL metadata schema:
+ * Docker labels are the cluster's source of truth (no database), so every field
+ * needed to reconstruct the API `Container` is written here at create time.
+ * Also emits the caddy-docker-proxy labels when a subdomain+baseDomain is set.
  *
- * caddy-docker-proxy reads these labels and reloads its config automatically;
- * we never need to talk to Caddy directly.
+ * NOTE: labels are immutable after create — changing metadata means recreating
+ * the container (already true for memory/port). Secrets/large env are NOT stored
+ * in labels; env is read back from the container's Config.Env instead.
  */
 export function buildContainerLabels(cfg: {
+    id: string;
     appId: string;
+    image: string;
+    tag: string;
     port: number;
+    resources: ContainerResources;
+    envVars?: Record<string, string>;
     subdomain?: string | null;
     baseDomain?: string | null;
+    createdBy?: string | null;
+    createdAt?: number;
 }): Record<string, string> {
     const labels: Record<string, string> = {
+        // Legacy discovery labels (kept for backward compat with existing tooling).
         'mcp-app': 'true',
         'mcp-app-id': cfg.appId,
         'cluster-managed': 'true',
+        // Stateless-agent schema — source of truth for the API.
+        'privos.managed': 'true',
+        'privos.id': cfg.id,
+        'privos.app-id': cfg.appId || LABEL_NONE,
+        'privos.image': cfg.image,
+        'privos.tag': cfg.tag,
+        'privos.port': String(cfg.port),
+        'privos.resources': JSON.stringify(cfg.resources),
+        // Only the USER-supplied env is recorded (matches the DB, which stored
+        // req.envVars). Do NOT reconstruct env from Config.Env — that also
+        // carries image-baked ENV (incl. any secrets) and the injected PORT.
+        'privos.env': JSON.stringify(cfg.envVars ?? {}),
+        'privos.subdomain': cfg.subdomain || LABEL_NONE,
+        'privos.domain': cfg.baseDomain || LABEL_NONE,
+        'privos.created-by': cfg.createdBy || LABEL_NONE,
+        'privos.created-at': String(cfg.createdAt ?? Date.now()),
+        'privos.health.path': HEALTH_DEFAULTS.path,
+        'privos.health.max-fails': String(HEALTH_DEFAULTS.maxFails),
+        'privos.health.restart': String(HEALTH_DEFAULTS.restart),
     };
     if (cfg.subdomain && cfg.baseDomain) {
         const host = `${cfg.subdomain}.${cfg.baseDomain}`;
         labels.caddy = host;
         // `{{upstreams N}}` resolves to the container's network IP:N at runtime.
         labels['caddy.reverse_proxy'] = `{{upstreams ${cfg.port}}}`;
-        labels['privos.subdomain'] = cfg.subdomain;
         labels['privos.public-host'] = host;
     }
     return labels;
@@ -106,10 +144,17 @@ export class ContainerManager {
             Env: env,
             ExposedPorts: { [portKey]: {} },
             Labels: buildContainerLabels({
+                id: cfg.id,
                 appId: cfg.appId,
+                image: cfg.image,
+                tag: cfg.tag,
                 port: cfg.port,
+                resources: cfg.resources,
+                envVars: cfg.envVars,
                 subdomain: cfg.subdomain,
                 baseDomain: cfg.baseDomain,
+                createdBy: cfg.createdBy,
+                createdAt: cfg.createdAt,
             }),
             HostConfig: {
                 NetworkMode: config.DOCKER_NETWORK,

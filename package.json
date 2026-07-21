@@ -9,6 +9,7 @@
   },
   "scripts": {
     "dev": "tsx watch --env-file=.env src/server.ts",
+    "test": "JWT_SECRET=test-secret-0123456789 PRIVOS_CHAT_WEBHOOK_URL=http://localhost/hook node --import tsx --test 'src/**/*.test.ts'",
     "build": "tsc -p tsconfig.json",
     "start": "node --env-file=.env dist/server.js",
     "typecheck": "tsc --noEmit"
@@ -38,6 +39,6 @@
     "@types/ws": "^8.5.10",
     "pino-pretty": "^11.0.0",
     "tsx": "^4.15.0",
-    "typescript": "^5.5.0"
+    "typescript": "^5.9.3"
   }
 }
