@@ -8,7 +8,7 @@
  */
 import type Docker from 'dockerode';
 import { containerManager } from './index.js';
-import { mapInspectToContainer } from './docker-state-mapper.js';
+import { mapInspectToContainer, pickActivePerId } from './docker-state-mapper.js';
 import type { Container, HealthCheck } from '../types/index.js';
 
 const MANAGED_LABEL = 'privos.managed=true';
@@ -16,19 +16,26 @@ const MANAGED_LABEL = 'privos.managed=true';
 /** Optional provider of ephemeral health per container id (in-memory monitor). */
 export type HealthProvider = (id: string) => HealthCheck | undefined;
 
+/**
+ * Inspect every matching managed container and collapse transient duplicate ids
+ * (rolling-redeploy overlap) to one active container per id — prefer running,
+ * then newest by Docker's real creation time (see pickActivePerId).
+ */
 async function inspectManaged(filters: Record<string, string[]>, health?: HealthProvider): Promise<Container[]> {
 	const list = await containerManager.listContainers(filters, true);
-	const out: Container[] = [];
+	const items: Array<{ container: Container; dockerCreatedMs: number }> = [];
 	for (const item of list) {
 		try {
 			const info = await containerManager.inspectContainer(item.Id);
 			const mapped = mapInspectToContainer(info as unknown as Docker.ContainerInspectInfo);
-			out.push(health ? { ...mapped, healthCheck: health(mapped.id) ?? mapped.healthCheck } : mapped);
+			const container = health ? { ...mapped, healthCheck: health(mapped.id) ?? mapped.healthCheck } : mapped;
+			const dockerCreatedMs = Date.parse((info as any).Created ?? '') || 0;
+			items.push({ container, dockerCreatedMs });
 		} catch {
 			// container vanished between list and inspect — skip
 		}
 	}
-	return out;
+	return pickActivePerId(items);
 }
 
 export async function listManaged(health?: HealthProvider): Promise<Container[]> {

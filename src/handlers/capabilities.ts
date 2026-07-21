@@ -50,7 +50,7 @@ const CAPABILITIES: ClusterCapabilities = {
         terminal: true,
         stats: true,
         volumes: true,
-        rolling: false,    // dropped in the stateless-agent model — redeploy is always stop-then-create (immutable labels can't preserve single-identity during a swap)
+        rolling: true,     // zero-downtime redeploy; label duplicates resolved by docker-state.pickActivePerId
         secrets: false,    // future
         replicas: false,   // future
         adopt: true,

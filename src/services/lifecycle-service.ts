@@ -452,6 +452,142 @@ export async function redeployContainer(containerId: string, req: RedeployReques
 }
 
 // ---------------------------------------------------------------------------
+// rollingRedeployContainer — zero-downtime
+// ---------------------------------------------------------------------------
+
+/**
+ * Zero-downtime redeploy: pull + start the new container alongside the old,
+ * wait until it's healthy, then drain and remove the old one.
+ *
+ * Only safe when there are no persistent volumes (two writers to one volume →
+ * corruption). During the brief overlap both containers share the same
+ * `privos.id`/`privos.subdomain` labels; docker-state's pickActivePerId resolves
+ * that to a single active container (prefer running → newest), so the API view
+ * stays single-identity. Caddy has both as upstreams during the window.
+ */
+export async function rollingRedeployContainer(containerId: string, req: RedeployRequest): Promise<Container> {
+    const old = await getContainerOr404(containerId);
+
+    if (old.state !== 'running') {
+        throw new Error(`Cannot rolling-redeploy a non-running container (state=${old.state}) — start it first`);
+    }
+
+    const newImage = req.image ?? old.image;
+    const newTag = req.tag ?? old.tag;
+    const newResources: ContainerResources = { ...old.resources, ...req.resources };
+    const port = old.port;
+    const newSubdomain =
+        req.subdomain === undefined ? (old.subdomain ?? null) : req.subdomain;
+    const requestedDomain = req.domain === undefined ? old.domain : req.domain;
+    const baseDomain = isReverseProxyEnabled() ? resolveDomain(requestedDomain) : null;
+
+    logger.info(
+        { containerId, old: `${old.image}:${old.tag}`, new: `${newImage}:${newTag}`, newSubdomain, baseDomain },
+        'rolling redeploy starting',
+    );
+
+    await assertHostAvailable(newSubdomain, baseDomain, containerId);
+    await assertResourceBudget(newResources, containerId);
+
+    // 1. Pull new image — old container continues serving traffic
+    await containerManager.pullImage(newImage, newTag);
+
+    // 2. Create + start the new container. buildContainerName appends a unique
+    //    hash so it never collides with the still-running old container.
+    let newDockerContainerId: string | null = null;
+    try {
+        const newContainerName = buildContainerName({
+            appId: old.appId,
+            subdomain: newSubdomain,
+            image: newImage,
+        });
+        const created = await containerManager.createAppContainer({
+            id: containerId,
+            appId: old.appId ?? containerId.slice(0, 12),
+            containerName: newContainerName,
+            image: newImage,
+            tag: newTag,
+            port,
+            resources: newResources,
+            envVars: old.envVars,
+            mounts: [], // volumes excluded — rolling is only allowed for volume-free containers
+            subdomain: newSubdomain,
+            baseDomain,
+            createdAt: old.createdAt,
+        });
+        newDockerContainerId = created.containerId;
+
+        await containerManager.startContainer(newDockerContainerId);
+        const newHostPort = await getHostPortWithRetry(newDockerContainerId, port);
+        const newInternalUrl = `http://localhost:${newHostPort}`;
+
+        const healthy = await waitForHealthy(newInternalUrl, 30_000);
+        if (!healthy) {
+            throw new Error('New container did not become healthy within 30s — aborting rolling redeploy');
+        }
+
+        // 3. Grace period: let in-flight requests on the old container complete.
+        logger.info({ containerId }, 'rolling redeploy: new container healthy, draining old (5s)');
+        await new Promise<void>((r) => setTimeout(r, 5_000));
+
+        // 4. Stop + remove the old container (best-effort — new already serves).
+        try {
+            await containerManager.stopContainer(old.dockerContainerId, 10);
+            await containerManager.removeContainer(old.dockerContainerId, true);
+            logger.info({ containerId, oldDockerId: old.dockerContainerId }, 'rolling redeploy: old container removed');
+        } catch (err: any) {
+            logger.warn({ containerId, err: err.message }, 'rolling redeploy: old container cleanup failed (best-effort)');
+        }
+
+        const updated = await dockerState.getById(containerId, getHealth);
+        if (!updated) throw new Error(`Container not found after rolling redeploy: ${containerId}`);
+        logger.info({ containerId, newDockerContainerId, newInternalUrl }, 'rolling redeploy complete');
+        return updated;
+    } catch (err: any) {
+        logger.error({ containerId, err: err.message }, 'rolling redeploy failed — cleaning up new container');
+        if (newDockerContainerId) {
+            try {
+                await containerManager.stopContainer(newDockerContainerId, 5);
+            } catch {
+                // best-effort
+            }
+            try {
+                await containerManager.removeContainer(newDockerContainerId, true);
+            } catch {
+                // best-effort
+            }
+        }
+        throw err;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// redeployContainerSmart — picks rolling vs stop-then-create
+// ---------------------------------------------------------------------------
+
+/**
+ * Prefer zero-downtime rolling; fall back to stop-then-create when rolling is
+ * unsafe/inapplicable: caller passed `rolling:false`, the app has persistent
+ * volumes (two writers → corruption), or the container isn't running. On a
+ * rolling failure the error propagates — no silent downtime fallback.
+ */
+export async function redeployContainerSmart(containerId: string, req: RedeployRequest): Promise<Container> {
+    const old = await getContainerOr404(containerId);
+    const wantRolling = req.rolling !== false;
+
+    if (wantRolling && old.volumes.length === 0 && old.state === 'running') {
+        return rollingRedeployContainer(containerId, req);
+    }
+
+    if (wantRolling) {
+        const reason =
+            old.volumes.length > 0 ? `has ${old.volumes.length} persistent volume(s)` : `not running (state=${old.state})`;
+        logger.info({ containerId, reason }, 'rolling unavailable, using stop-then-create redeploy');
+    }
+    return redeployContainer(containerId, req);
+}
+
+// ---------------------------------------------------------------------------
 // deleteContainer
 // ---------------------------------------------------------------------------
 

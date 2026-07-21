@@ -19,7 +19,7 @@ import {
     startContainer,
     stopContainer,
     restartContainer,
-    redeployContainer,
+    redeployContainerSmart,
     deleteContainer,
 } from '../services/lifecycle-service.js';
 import {
@@ -311,7 +311,7 @@ const appsHandler: FastifyPluginAsync = async (fastify) => {
             if (!body.success) {
                 return reply.code(400).send({ error: 'validation_error', details: body.error.issues });
             }
-            const container = await redeployContainer(params.data.containerId, body.data);
+            const container = await redeployContainerSmart(params.data.containerId, body.data);
             return reply.send(container);
         } catch (err: any) {
             fastify.log.error({ err }, 'redeploy error');

@@ -2,7 +2,18 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { buildContainerLabels, HEALTH_DEFAULTS } from './container-manager.js';
-import { mapInspectToContainer, mapState } from './docker-state-mapper.js';
+import { mapInspectToContainer, mapState, pickActivePerId } from './docker-state-mapper.js';
+import type { Container } from '../types/index.js';
+
+function fakeContainer(id: string, state: Container['state'], dcid = `d-${id}-${state}`): Container {
+	return {
+		id, appId: null, dockerContainerId: dcid, dockerContainerName: id,
+		image: 'nginx', tag: 'latest', state, internalUrl: '', port: 3001, hostPort: null,
+		resources: { memoryMb: 256, cpus: 0.5, tmpSizeMb: 64 }, envVars: {},
+		healthCheck: { status: 'unknown', failCount: 0, restartCount: 0, lastCheck: null },
+		createdAt: 1, startedAt: null, stoppedAt: null, volumes: [], subdomain: null, domain: null,
+	};
+}
 
 // Minimal Docker inspect stub carrying the fields the mapper reads.
 function inspect(overrides: any = {}): any {
@@ -90,6 +101,25 @@ test('stopped container has no internalUrl and derives stoppedAt', () => {
 	assert.equal(c.state, 'stopped');
 	assert.equal(c.internalUrl, '');
 	assert.equal(c.stoppedAt, new Date('2026-07-21T11:00:00.000Z').getTime());
+});
+
+test('pickActivePerId collapses rolling-redeploy duplicates to one active container', () => {
+	// Same id, two containers (rolling window): running old + newer created new → prefer running.
+	const oldRunning = { container: fakeContainer('x', 'running'), dockerCreatedMs: 100 };
+	const newCreated = { container: fakeContainer('x', 'created'), dockerCreatedMs: 200 };
+	const [picked] = pickActivePerId([newCreated, oldRunning]);
+	assert.equal(picked.dockerContainerId, 'd-x-running'); // running wins over newer-but-created
+
+	// Both running (post-switch) → newest wins.
+	const oldR = { container: fakeContainer('x', 'running', 'old'), dockerCreatedMs: 100 };
+	const newR = { container: fakeContainer('x', 'running', 'new'), dockerCreatedMs: 200 };
+	assert.equal(pickActivePerId([oldR, newR])[0].dockerContainerId, 'new');
+	assert.equal(pickActivePerId([oldR, newR]).length, 1);
+
+	// Distinct ids are all kept.
+	const a = { container: fakeContainer('a', 'running'), dockerCreatedMs: 1 };
+	const b = { container: fakeContainer('b', 'running'), dockerCreatedMs: 1 };
+	assert.equal(pickActivePerId([a, b]).length, 2);
 });
 
 test('mapState covers docker statuses', () => {

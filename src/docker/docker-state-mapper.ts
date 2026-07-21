@@ -104,6 +104,32 @@ function toEpoch(value: string | undefined): number | null {
 }
 
 /**
+ * Resolve transient duplicate identities to a single "active" container.
+ *
+ * During a rolling redeploy the old and new Docker containers briefly share the
+ * same `privos.id` (labels are immutable — we can't atomically swap). To keep the
+ * label model's single-identity invariant in the API view, pick ONE container per
+ * id deterministically: prefer a `running` one, then the newest by Docker's real
+ * creation time (the new container). This makes GET /apps / getById / findByHost
+ * stable throughout the swap without mutating labels.
+ */
+export function pickActivePerId(items: Array<{ container: Container; dockerCreatedMs: number }>): Container[] {
+	const best = new Map<string, { container: Container; dockerCreatedMs: number }>();
+	for (const item of items) {
+		const cur = best.get(item.container.id);
+		if (!cur || isMoreActive(item, cur)) best.set(item.container.id, item);
+	}
+	return [...best.values()].map((v) => v.container);
+}
+
+function isMoreActive(a: { container: Container; dockerCreatedMs: number }, b: { container: Container; dockerCreatedMs: number }): boolean {
+	const aRunning = a.container.state === 'running';
+	const bRunning = b.container.state === 'running';
+	if (aRunning !== bRunning) return aRunning; // a running container always wins
+	return a.dockerCreatedMs > b.dockerCreatedMs; // otherwise the newer one
+}
+
+/**
  * PURE mapper: Docker inspect object + labels → API `Container`.
  * `health` overlays the ephemeral in-memory counters (default = unknown/0/0/null).
  */
