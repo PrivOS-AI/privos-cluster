@@ -11,6 +11,7 @@ import cors from '@fastify/cors';
 import { config } from './config.js';
 import { networkManager } from './docker/index.js';
 import { startHealthMonitor, stopHealthMonitor } from './services/health-monitor.js';
+import { startReverseProxy, stopReverseProxy } from './proxy/reverse-proxy-server.js';
 import authPlugin from './plugins/auth.js';
 import capabilitiesHandler from './handlers/capabilities.js';
 import appsHandler from './handlers/apps.js';
@@ -91,6 +92,13 @@ async function main(): Promise<void> {
 		// 9. Listen
 		await fastify.listen({ port: config.PORT, host: config.HOST });
 		fastify.log.info({ port: config.PORT, host: config.HOST }, 'privos-cluster ready');
+
+		// 10. Native reverse proxy (only in `native` mode). cloudflared terminates
+		//     TLS at the edge and forwards `*.<domain> → localhost:<PROXY_PORT>`.
+		if (config.REVERSE_PROXY_MODE === 'native') {
+			await startReverseProxy();
+			fastify.log.info({ proxyPort: config.PROXY_PORT }, 'native reverse proxy started');
+		}
 	} catch (err) {
 		fastify.log.error(err, 'failed to start');
 		process.exit(1);
@@ -101,6 +109,7 @@ async function shutdown(signal: string): Promise<void> {
 	fastify.log.info({ signal }, 'shutdown initiated');
 	try {
 		stopHealthMonitor();
+		await stopReverseProxy();
 		await fastify.close();
 		fastify.log.info('shutdown complete');
 		process.exit(0);

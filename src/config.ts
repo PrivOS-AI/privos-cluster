@@ -24,6 +24,16 @@ const ConfigSchema = z.object({
 		.default('false')
 		.transform((v) => v === 'true' || v === '1'),
 
+	// Which reverse proxy fronts apps:
+	//   off    — no routing (apps get no public host).
+	//   caddy  — emit caddy-docker-proxy labels; an external Caddy routes (legacy).
+	//   native — the cluster's own HTTP proxy routes by Host; TLS is terminated by
+	//            the cloudflared tunnel at the Cloudflare edge (no certs here).
+	REVERSE_PROXY_MODE: z.enum(['off', 'caddy', 'native']).default('caddy'),
+	// Internal HTTP port the native proxy binds (loopback); cloudflared forwards
+	// `*.<domain> → http://localhost:<PROXY_PORT>`. No public 80/443 on the host.
+	PROXY_PORT: z.coerce.number().int().positive().default(8080),
+
 	// Default per-container resource allocation when a deploy request omits them.
 	DEFAULT_MEMORY_MB: z.coerce.number().int().positive().default(256),
 	DEFAULT_CPUS: z.coerce.number().positive().default(0.5),
@@ -31,6 +41,18 @@ const ConfigSchema = z.object({
 
 	// CORS — comma-separated origins, or "*" for any. Empty disables CORS entirely.
 	CORS_ORIGIN: z.string().default('http://localhost:5173'),
+}).superRefine((cfg, ctx) => {
+	// Native routing is useless without at least one base domain to match Host against.
+	if (cfg.REVERSE_PROXY_MODE === 'native') {
+		const hasDomain = cfg.PRIVOS_DOMAINS.split(',').some((d) => d.trim());
+		if (!hasDomain) {
+			ctx.addIssue({
+				code: z.ZodIssueCode.custom,
+				path: ['PRIVOS_DOMAINS'],
+				message: 'REVERSE_PROXY_MODE=native requires PRIVOS_DOMAINS to be set (comma-separated base domains)',
+			});
+		}
+	}
 });
 
 export type Config = z.infer<typeof ConfigSchema>;

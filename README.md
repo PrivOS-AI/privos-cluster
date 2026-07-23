@@ -67,8 +67,46 @@ curl http://localhost:4000/api/v1/health
 ## Configuration
 
 See `.env.example`. Key vars: `JWT_SECRET` (shared with hub), `PRIVOS_DOMAINS`,
-`REVERSE_PROXY_ENABLED`, `DEFAULT_MEMORY_MB/CPUS/TMP_MB`,
-`HEALTH_CHECK_INTERVAL_MS`, `DOCKER_SOCKET`/`DOCKER_NETWORK`.
+`REVERSE_PROXY_MODE` (`off|caddy|native`), `PROXY_PORT`, `REVERSE_PROXY_ENABLED`
+(legacy caddy gate), `DEFAULT_MEMORY_MB/CPUS/TMP_MB`, `HEALTH_CHECK_INTERVAL_MS`,
+`DOCKER_SOCKET`/`DOCKER_NETWORK`.
+
+## Reverse proxy behind cloudflared (native mode)
+
+In `REVERSE_PROXY_MODE=native` the cluster runs its own plain-HTTP reverse proxy
+on `127.0.0.1:<PROXY_PORT>` and routes each request by `Host` to the target
+container. **TLS is terminated by a Cloudflare Tunnel at the edge** — the cluster
+holds no certificates and needs no ACME, no CF API token, no public 80/443.
+
+- **No certs in the cluster.** cloudflared forwards `*.<domain> → localhost:<PROXY_PORT>`;
+  Cloudflare's free Universal SSL covers `*.<domain>` (one subdomain level).
+- **One-level subdomains only.** App hosts must be `<app>.<domain>` (e.g.
+  `whoami.privos.link`). Deeper (`a.b.privos.link`) needs Cloudflare Advanced
+  Certificate Manager (~$10/mo) — out of scope.
+- **Routing.** A single wildcard tunnel ingress reaches the proxy, which dispatches
+  by `Host` (open-relay guard: hosts outside `PRIVOS_DOMAINS` are rejected; only
+  `running` containers are routed, else 502). WebSocket `upgrade` passes through.
+
+Generate `.env` + the exact cloudflared config with the wizard:
+
+```bash
+npm run setup   # prompts, writes .env (0600), prints the ingress + DNS + hub secret
+```
+
+Then, on the cloudflared host, add the printed `ingress` block to the tunnel's
+`config.yml`, run the printed `cloudflared tunnel route dns <tunnel> "*.<domain>"`,
+and set the Cloudflare zone SSL mode to **Full**. Existing `caddy` setups are
+unaffected (`REVERSE_PROXY_MODE=caddy`, the default); `off` disables routing.
+
+### Live cutover runbook
+
+1. `npm run setup` → mode `native`, domains `privos.link`, `PROXY_PORT=8080`; copy
+   the printed cloudflared ingress + DNS command.
+2. Apply the tunnel config (ingress + `route dns`), set zone SSL = **Full**.
+3. Restart the cluster (`native`), deploy `traefik/whoami` (subdomain `whoami`).
+4. Browse `https://whoami.privos.link` → valid Cloudflare cert, proxied to the
+   container. Verify a WS app, 502 for an unknown host, foreign-host rejection.
+5. When happy, make `native` the default and retire the caddy-docker-proxy container.
 
 ## Cutover from the legacy SQLite build
 
@@ -88,8 +126,12 @@ src/
 ├── server.ts        # Fastify entry (no DB init)
 ├── config.ts        # env validation (zod)
 ├── docker/          # dockerode wrappers + docker-state (labels → Container) + mapper
+├── proxy/           # native HTTP reverse proxy (Host → container) + WS passthrough
 ├── services/        # lifecycle, health-monitor (in-memory), settings (env), resource-check
 ├── handlers/        # REST + WebSocket routes
 ├── auth/            # JWT verify
 └── types/           # shared types
+scripts/
+├── setup-wizard.ts        # `npm run setup` — writes .env + prints cloudflared config
+└── cloudflared-ingress.ts # pure ingress/DNS/env-merge renderers (unit tested)
 ```

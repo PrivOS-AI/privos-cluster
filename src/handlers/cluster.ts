@@ -7,7 +7,7 @@ import type { FastifyPluginAsync } from 'fastify';
 import fp from 'fastify-plugin';
 import * as dockerState from '../docker/docker-state.js';
 import { getClusterResources } from '../services/resource-check.js';
-import { getDomains, resolveDomain, isReverseProxyEnabled } from '../services/settings-service.js';
+import { getDomains, resolveDomain, isReverseProxyEnabled, getReverseProxyMode, getProxyPort } from '../services/settings-service.js';
 import { SubdomainLabelSchema } from '../schemas/settings-schemas.js';
 
 const clusterHandler: FastifyPluginAsync = async (fastify) => {
@@ -31,9 +31,13 @@ const clusterHandler: FastifyPluginAsync = async (fastify) => {
         '/api/v1/cluster/domains',
         { preHandler: fastify.authenticate },
         async (_req, reply) => {
+            // mode + proxyPort are non-secret; the hub Add-Cluster TLS guidance
+            // renders an accurate cloudflared ingress snippet from them.
             return reply.send({
                 domains: getDomains(),
                 reverseProxyEnabled: isReverseProxyEnabled(),
+                mode: getReverseProxyMode(),
+                proxyPort: getProxyPort(),
             });
         },
     );

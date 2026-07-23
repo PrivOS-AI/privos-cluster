@@ -26,6 +26,10 @@ RUN chown -R node:node /app
 USER node
 
 EXPOSE 4000
+# Native reverse proxy (REVERSE_PROXY_MODE=native). In v1 the cluster runs on the
+# host and the proxy binds 127.0.0.1 for the local cloudflared tunnel; running
+# native mode inside this container would need a non-loopback bind (out of scope).
+EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD wget -qO- http://localhost:4000/api/v1/health || exit 1

@@ -30,7 +30,26 @@ export function resolveDomain(requested?: string | null): string | null {
 	return match ?? null;
 }
 
+/** Which reverse proxy fronts apps: off | caddy | native. */
+export function getReverseProxyMode(): 'off' | 'caddy' | 'native' {
+	return config.REVERSE_PROXY_MODE;
+}
+
+/** The internal HTTP port the native proxy binds (non-secret; surfaced to hub guidance). */
+export function getProxyPort(): number {
+	return config.PROXY_PORT;
+}
+
+/**
+ * Whether apps should be published under a base domain (resolve baseDomain +
+ * emit routing labels at deploy time). `native` is driven purely by mode +
+ * domains (the config refinement guarantees domains); `caddy` keeps the legacy
+ * REVERSE_PROXY_ENABLED gate; `off` disables routing entirely.
+ */
 export function isReverseProxyEnabled(): boolean {
+	const mode = getReverseProxyMode();
+	if (mode === 'off') return false;
+	if (mode === 'native') return getDomains().length > 0;
 	return config.REVERSE_PROXY_ENABLED && getDomains().length > 0;
 }
 

@@ -6,6 +6,7 @@ import * as dockerState from '../docker/docker-state.js';
 import { getHealth } from './health-monitor.js';
 import { checkResourceRequest } from './resource-check.js';
 import { getDefaultResources, isReverseProxyEnabled, resolveDomain } from './settings-service.js';
+import { refreshRoutes } from '../proxy/proxy-router.js';
 import type { Container, ContainerResources, ContainerVolume, DeployRequest, RedeployRequest } from '../types/index.js';
 
 const logger = pino({ level: config.LOG_LEVEL }).child({ component: 'lifecycle' });
@@ -281,6 +282,7 @@ export async function deployManagedApp(req: DeployRequest): Promise<Container> {
         }
 
         logger.info({ clusterId, dockerContainerId, internalUrl }, 'deploy complete');
+        refreshRoutes(); // new host is now routable in the native proxy
         return container;
     } catch (err: any) {
         logger.error({ clusterId, dockerContainerId, err: err.message }, 'deploy failed — rolling back');
@@ -330,6 +332,7 @@ export async function startContainer(containerId: string): Promise<Container> {
 
     const updated = await dockerState.getById(containerId, getHealth);
     if (!updated) throw new Error(`Container not found after start: ${containerId}`);
+    refreshRoutes(); // running state changed — re-evaluate the health gate
     return updated;
 }
 
@@ -346,6 +349,7 @@ export async function stopContainer(containerId: string): Promise<Container> {
 
     const updated = await dockerState.getById(containerId, getHealth);
     if (!updated) throw new Error(`Container not found after stop: ${containerId}`);
+    refreshRoutes(); // stopped container must stop routing (health gate → 502)
     return updated;
 }
 
@@ -371,6 +375,7 @@ export async function restartContainer(containerId: string): Promise<Container> 
 
     const updated = await dockerState.getById(containerId, getHealth);
     if (!updated) throw new Error(`Container not found after restart: ${containerId}`);
+    refreshRoutes(); // host port may change after restart — drop the stale target
     return updated;
 }
 
@@ -448,6 +453,7 @@ export async function redeployContainer(containerId: string, req: RedeployReques
     const updated = await dockerState.getById(containerId, getHealth);
     if (!updated) throw new Error(`Container not found after redeploy: ${containerId}`);
     logger.info({ containerId, newDockerContainerId: created.containerId, internalUrl }, 'redeploy complete');
+    refreshRoutes(); // new container id / host port — invalidate the cached target
     return updated;
 }
 
@@ -542,6 +548,7 @@ export async function rollingRedeployContainer(containerId: string, req: Redeplo
         const updated = await dockerState.getById(containerId, getHealth);
         if (!updated) throw new Error(`Container not found after rolling redeploy: ${containerId}`);
         logger.info({ containerId, newDockerContainerId, newInternalUrl }, 'rolling redeploy complete');
+        refreshRoutes(); // swap to the new container id / host port
         return updated;
     } catch (err: any) {
         logger.error({ containerId, err: err.message }, 'rolling redeploy failed — cleaning up new container');
@@ -633,4 +640,5 @@ export async function deleteContainer(containerId: string): Promise<void> {
     }
 
     logger.info({ containerId }, 'container deleted');
+    refreshRoutes(); // host no longer resolves — stop routing to the removed container
 }
