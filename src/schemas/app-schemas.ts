@@ -49,7 +49,7 @@ export const DeployRequestSchema = z.object({
                 });
             }
         }
-        if (value.volumes && (value.volumes.length > 1 || value.volumes[0]?.name !== 'data')) {
+        if (value.volumes && (value.volumes.length > 1 || (value.volumes.length === 1 && value.volumes[0]?.name !== 'data'))) {
             ctx.addIssue({
                 code: z.ZodIssueCode.custom,
                 path: ['volumes'],
