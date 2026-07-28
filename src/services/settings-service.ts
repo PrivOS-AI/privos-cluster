@@ -1,9 +1,8 @@
 /**
  * Cluster settings — env/config only, no settings database.
  *
- * Resource caps (getMaxMemoryMb/getMaxCpus) and the image registry allowlist
- * have no env-configurable override in this phase; they return values that
- * preserve prior "no override" behavior (host capacity, any registry).
+ * Resource caps, app network, operator routes and image registry policy are
+ * env-configurable. Fleet mode validates fail-closed policy at process start.
  */
 import { config } from '../config.js';
 
@@ -61,16 +60,25 @@ export function getDefaultResources(): DefaultResources {
 	};
 }
 
-/** No env override for cluster-wide resource caps in this phase — always use host capacity. */
 export function getMaxMemoryMb(): number | null {
-	return null;
+	return config.CLUSTER_MAX_MEMORY_MB ?? null;
 }
 
 export function getMaxCpus(): number | null {
-	return null;
+	return config.CLUSTER_MAX_CPUS ?? null;
 }
 
-/** No env override for the registry allowlist in this phase — any registry is allowed. */
 export function getImageRegistryAllowlist(): string[] {
-	return [];
+	return config.IMAGE_REGISTRY_ALLOWLIST
+		.split(',')
+		.map((host) => host.trim().toLowerCase())
+		.filter(Boolean);
+}
+
+export function getAppNetworkName(): string {
+	return config.APP_NETWORK_NAME?.trim() || config.DOCKER_NETWORK;
+}
+
+export function areOperatorRoutesEnabled(): boolean {
+	return config.CLUSTER_OPERATOR_ROUTES === 'on';
 }

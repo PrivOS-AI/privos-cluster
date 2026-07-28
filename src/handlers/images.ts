@@ -10,6 +10,12 @@ import type { FastifyPluginAsync } from 'fastify';
 import fp from 'fastify-plugin';
 import { imageManager } from '../docker/index.js';
 import { ListImagesQuerySchema, PullImageRequestSchema } from '../schemas/image-schemas.js';
+import { getImageRegistryAllowlist } from '../services/settings-service.js';
+
+function registryHost(repository: string): string {
+    const first = repository.split('/')[0] ?? '';
+    return (first.includes('.') || first.includes(':') ? first : 'docker.io').toLowerCase();
+}
 
 const imagesHandler: FastifyPluginAsync = async (fastify) => {
     // ---------------------------------------------------------------------
@@ -44,6 +50,10 @@ const imagesHandler: FastifyPluginAsync = async (fastify) => {
             return reply.code(400).send({ error: 'validation_error', details: parsed.error.issues });
         }
         const { repository, tag } = parsed.data;
+        const allowlist = getImageRegistryAllowlist();
+        if (allowlist.length > 0 && !allowlist.includes(registryHost(repository))) {
+            return reply.code(403).send({ error: 'registry_not_allowed' });
+        }
 
         // Hijack the reply so we can write SSE frames directly.
         reply.raw.setHeader('Content-Type', 'text/event-stream');

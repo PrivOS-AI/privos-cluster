@@ -21,6 +21,7 @@ import filesHandler from './handlers/files.js';
 import terminalHandler from './handlers/terminal.js';
 import clusterHandler from './handlers/cluster.js';
 import authRoutesHandler from './handlers/auth.js';
+import { areOperatorRoutesEnabled } from './services/settings-service.js';
 
 const fastify = Fastify({
 	logger: {
@@ -83,8 +84,10 @@ async function main(): Promise<void> {
 		await fastify.register(imagesHandler);
 		await fastify.register(clusterHandler);
 		await fastify.register(logsHandler);
-		await fastify.register(filesHandler);
-		await fastify.register(terminalHandler);
+		if (areOperatorRoutesEnabled()) {
+			await fastify.register(filesHandler);
+			await fastify.register(terminalHandler);
+		}
 
 		// 8. Start background services
 		startHealthMonitor();

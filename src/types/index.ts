@@ -84,6 +84,7 @@ export interface ClusterResources {
 export interface DeployRequest {
 	image: string;
 	tag?: string;
+	digest?: string;
 	port?: number;
 	resources?: Partial<ContainerResources>;
 	envVars?: Record<string, string>;
@@ -96,6 +97,7 @@ export interface DeployRequest {
 export interface RedeployRequest {
 	image?: string;
 	tag?: string;
+	digest?: string;
 	resources?: Partial<ContainerResources>;
 	rolling?: boolean; // default true — use rolling (zero-downtime) redeploy when safe
 	subdomain?: string | null;
@@ -112,4 +114,3 @@ export interface ContainerStatus {
 	restarts: number;
 	healthStatus: HealthStatus;
 }
-

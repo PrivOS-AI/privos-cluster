@@ -69,7 +69,16 @@ curl http://localhost:4000/api/v1/health
 See `.env.example`. Key vars: `JWT_SECRET` (shared with hub), `PRIVOS_DOMAINS`,
 `REVERSE_PROXY_MODE` (`off|caddy|native`), `PROXY_PORT`, `REVERSE_PROXY_ENABLED`
 (legacy caddy gate), `DEFAULT_MEMORY_MB/CPUS/TMP_MB`, `HEALTH_CHECK_INTERVAL_MS`,
-`DOCKER_SOCKET`/`DOCKER_NETWORK`.
+`DOCKER_SOCKET`/`DOCKER_NETWORK`. Shared-fleet agents additionally set
+`FLEET_MODE=true`, a non-empty `IMAGE_REGISTRY_ALLOWLIST`, `APP_NETWORK_NAME`,
+resource caps, and `CLUSTER_OPERATOR_ROUTES=off`; fleet mode rejects unpinned
+images and an empty registry policy.
+
+## Branching
+
+Environment-gated hardening shared by development and multi-tenancy lands on
+`develop`. Multi-tenant agent and master work lands on `privos-mt`, cut from
+the hardened `develop` head. Do not land fleet-only behavior on `develop`.
 
 ## Reverse proxy behind cloudflared (native mode)
 

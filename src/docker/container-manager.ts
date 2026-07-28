@@ -1,6 +1,7 @@
 import Docker from 'dockerode';
 import { config } from '../config.js';
 import type { ContainerResources } from '../types/index.js';
+import { getAppNetworkName } from '../services/settings-service.js';
 
 export interface CreateContainerConfig {
     id: string;             // cluster-generated uuid — becomes the API container id (label privos.id)
@@ -8,6 +9,7 @@ export interface CreateContainerConfig {
     containerName: string;  // explicit Docker container name (caller computes via buildContainerName)
     image: string;
     tag: string;
+    digest?: string;
     port: number;
     resources: ContainerResources;
     envVars?: Record<string, string>;
@@ -92,16 +94,20 @@ export class ContainerManager {
     async pullImage(
         image: string,
         tag = 'latest',
+        digest?: string,
         onProgress?: (event: { status: string; progress?: string }) => void,
     ): Promise<void> {
-        const repoTag = `${image}:${tag}`;
+        const repoTag = digest ? `${image}@${digest}` : `${image}:${tag}`;
 
-        // Check if image already exists locally
-        try {
-            await this.docker.getImage(repoTag).inspect();
-            return; // found locally — skip pull
-        } catch {
-            // not found locally, proceed to pull
+        // Digest pulls always contact the registry. This prevents a locally retagged
+        // image from satisfying a marketplace deploy.
+        if (!digest) {
+            try {
+                await this.docker.getImage(repoTag).inspect();
+                return;
+            } catch {
+                // not found locally, proceed to pull
+            }
         }
 
         try {
@@ -139,7 +145,7 @@ export class ContainerManager {
         const portKey = `${cfg.port}/tcp`;
 
         const container = await this.docker.createContainer({
-            Image: `${cfg.image}:${cfg.tag}`,
+            Image: cfg.digest ? `${cfg.image}@${cfg.digest}` : `${cfg.image}:${cfg.tag}`,
             name: containerName,
             Env: env,
             ExposedPorts: { [portKey]: {} },
@@ -157,7 +163,7 @@ export class ContainerManager {
                 createdAt: cfg.createdAt,
             }),
             HostConfig: {
-                NetworkMode: config.DOCKER_NETWORK,
+                NetworkMode: getAppNetworkName(),
                 ReadonlyRootfs: true,
                 Tmpfs: { '/tmp': `size=${cfg.resources.tmpSizeMb}m,mode=1777` },
                 CapDrop: ['ALL'],
@@ -166,9 +172,6 @@ export class ContainerManager {
                 MemorySwap: cfg.resources.memoryMb * 1024 * 1024, // disable swap
                 NanoCpus: Math.round(cfg.resources.cpus * 1e9),
                 PidsLimit: 100,
-                PortBindings: {
-                    [portKey]: [{ HostPort: '0' }], // auto-assign host port
-                },
                 RestartPolicy: { Name: 'no' }, // health monitor handles restarts
                 Mounts: cfg.mounts?.map((m) => ({
                     Type: 'volume' as const,
@@ -199,7 +202,7 @@ export class ContainerManager {
 
     async getContainerIp(
         containerId: string,
-        networkName: string = config.DOCKER_NETWORK,
+        networkName: string = getAppNetworkName(),
     ): Promise<string | null> {
         const info = await this.docker.getContainer(containerId).inspect();
         const networks = info.NetworkSettings?.Networks || {};

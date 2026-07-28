@@ -11,6 +11,15 @@ const ConfigSchema = z.object({
 
 	DOCKER_SOCKET: z.string().default('/var/run/docker.sock'),
 	DOCKER_NETWORK: z.string().default('mcp-apps-network'),
+	FLEET_MODE: z
+		.string()
+		.default('false')
+		.transform((v) => v === 'true' || v === '1'),
+	APP_NETWORK_NAME: z.string().optional(),
+	IMAGE_REGISTRY_ALLOWLIST: z.string().default(''),
+	CLUSTER_MAX_MEMORY_MB: z.coerce.number().int().positive().optional(),
+	CLUSTER_MAX_CPUS: z.coerce.number().positive().optional(),
+	CLUSTER_OPERATOR_ROUTES: z.enum(['on', 'off']).default('off'),
 
 	JWT_SECRET: z.string().min(16, 'JWT_SECRET must be at least 16 chars'),
 
@@ -42,6 +51,14 @@ const ConfigSchema = z.object({
 	// CORS — comma-separated origins, or "*" for any. Empty disables CORS entirely.
 	CORS_ORIGIN: z.string().default('http://localhost:5173'),
 }).superRefine((cfg, ctx) => {
+	if (cfg.FLEET_MODE && !cfg.IMAGE_REGISTRY_ALLOWLIST.split(',').some((host) => host.trim())) {
+		ctx.addIssue({
+			code: z.ZodIssueCode.custom,
+			path: ['IMAGE_REGISTRY_ALLOWLIST'],
+			message: 'FLEET_MODE=true requires a non-empty IMAGE_REGISTRY_ALLOWLIST',
+		});
+	}
+
 	// Native routing is useless without at least one base domain to match Host against.
 	if (cfg.REVERSE_PROXY_MODE === 'native') {
 		const hasDomain = cfg.PRIVOS_DOMAINS.split(',').some((d) => d.trim());

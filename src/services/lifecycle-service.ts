@@ -5,7 +5,12 @@ import { containerManager, networkManager } from '../docker/index.js';
 import * as dockerState from '../docker/docker-state.js';
 import { getHealth } from './health-monitor.js';
 import { checkResourceRequest } from './resource-check.js';
-import { getDefaultResources, isReverseProxyEnabled, resolveDomain } from './settings-service.js';
+import {
+    getDefaultResources,
+    getImageRegistryAllowlist,
+    isReverseProxyEnabled,
+    resolveDomain,
+} from './settings-service.js';
 import { refreshRoutes } from '../proxy/proxy-router.js';
 import type { Container, ContainerResources, ContainerVolume, DeployRequest, RedeployRequest } from '../types/index.js';
 
@@ -95,18 +100,20 @@ async function waitForHealthy(internalUrl: string, timeoutMs = 30_000): Promise<
 }
 
 // ---------------------------------------------------------------------------
-// getHostPortWithRetry — host port assignment can lag start by a few ms
+// App containers are reachable only by their app-network address.
 // ---------------------------------------------------------------------------
 
-async function getHostPortWithRetry(
+async function getInternalUrl(
     dockerContainerId: string,
     port: number,
     maxAttempts = 3,
-): Promise<number> {
+): Promise<string> {
     let lastErr: Error | undefined;
     for (let i = 0; i < maxAttempts; i++) {
         try {
-            return await containerManager.getHostPort(dockerContainerId, port);
+            const ip = await containerManager.getContainerIp(dockerContainerId);
+            if (ip) return `http://${ip}:${port}`;
+            throw new Error('container has no app-network address');
         } catch (err: any) {
             lastErr = err;
             if (i < maxAttempts - 1) {
@@ -115,6 +122,18 @@ async function getHostPortWithRetry(
         }
     }
     throw lastErr;
+}
+
+function assertRegistryAllowed(image: string): void {
+    const allowlist = getImageRegistryAllowlist();
+    if (allowlist.length === 0) return;
+    const first = image.split('/')[0] ?? '';
+    const host = (first.includes('.') || first.includes(':') ? first : 'docker.io').toLowerCase();
+    if (!allowlist.includes(host)) {
+        const err: Error & { statusCode?: number } = new Error(`Registry is not allowed: ${host}`);
+        err.statusCode = 403;
+        throw err;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -208,6 +227,7 @@ export async function deployManagedApp(req: DeployRequest): Promise<Container> {
     const shortId = clusterId.slice(0, 12);
     const image = req.image;
     const tag = req.tag ?? DEFAULT_TAG;
+    const digest = req.digest;
     const port = req.port ?? DEFAULT_PORT;
     const resources: ContainerResources = {
         ...getDefaultResources(), // env-configured cluster defaults
@@ -226,8 +246,9 @@ export async function deployManagedApp(req: DeployRequest): Promise<Container> {
 
     await assertHostAvailable(subdomain, baseDomain);
     await assertResourceBudget(resources);
+    assertRegistryAllowed(image);
 
-    await containerManager.pullImage(image, tag);
+    await containerManager.pullImage(image, tag, digest);
 
     let dockerContainerId: string | null = null;
     const createdDockerVolumes: string[] = [];
@@ -254,6 +275,7 @@ export async function deployManagedApp(req: DeployRequest): Promise<Container> {
             containerName,
             image,
             tag,
+            digest,
             port,
             resources,
             envVars,
@@ -266,8 +288,7 @@ export async function deployManagedApp(req: DeployRequest): Promise<Container> {
 
         await containerManager.startContainer(dockerContainerId);
 
-        const hostPort = await getHostPortWithRetry(dockerContainerId, port);
-        const internalUrl = `http://localhost:${hostPort}`;
+        const internalUrl = await getInternalUrl(dockerContainerId, port);
 
         const healthy = await waitForHealthy(internalUrl, 30_000);
         if (!healthy) {
@@ -322,8 +343,7 @@ export async function startContainer(containerId: string): Promise<Container> {
     await containerManager.startContainer(c.dockerContainerId);
 
     // Port mapping changes after stop/start
-    const hostPort = await getHostPortWithRetry(c.dockerContainerId, c.port);
-    const internalUrl = `http://localhost:${hostPort}`;
+    const internalUrl = await getInternalUrl(c.dockerContainerId, c.port);
 
     const healthy = await waitForHealthy(internalUrl, 30_000);
     if (!healthy) {
@@ -365,8 +385,7 @@ export async function restartContainer(containerId: string): Promise<Container> 
     await containerManager.restartContainer(c.dockerContainerId);
 
     // Port mapping may change after restart
-    const hostPort = await getHostPortWithRetry(c.dockerContainerId, c.port);
-    const internalUrl = `http://localhost:${hostPort}`;
+    const internalUrl = await getInternalUrl(c.dockerContainerId, c.port);
 
     const healthy = await waitForHealthy(internalUrl, 30_000);
     if (!healthy) {
@@ -388,6 +407,7 @@ export async function redeployContainer(containerId: string, req: RedeployReques
 
     const newImage = req.image ?? c.image;
     const newTag = req.tag ?? c.tag;
+    const newDigest = req.digest;
     const newResources: ContainerResources = {
         ...c.resources,
         ...req.resources,
@@ -404,6 +424,7 @@ export async function redeployContainer(containerId: string, req: RedeployReques
 
     await assertHostAvailable(newSubdomain, baseDomain, containerId);
     await assertResourceBudget(newResources, containerId);
+    assertRegistryAllowed(newImage);
 
     // Read existing volume mounts from the OLD container's own inspect before
     // it's removed — there is no volumes table to query anymore.
@@ -413,7 +434,7 @@ export async function redeployContainer(containerId: string, req: RedeployReques
     // down/auth) and is non-destructive. Only tear down the old container once we
     // know the new image is available; otherwise a pull failure would leave the
     // app with no container carrying its privos.id (gone from GET /apps, no rollback).
-    await containerManager.pullImage(newImage, newTag);
+    await containerManager.pullImage(newImage, newTag, newDigest);
 
     // Stop + remove old Docker container
     await containerManager.stopContainer(c.dockerContainerId, 10);
@@ -431,6 +452,7 @@ export async function redeployContainer(containerId: string, req: RedeployReques
         containerName: newContainerName,
         image: newImage,
         tag: newTag,
+        digest: newDigest,
         port: c.port,
         resources: newResources,
         envVars: c.envVars,
@@ -442,8 +464,7 @@ export async function redeployContainer(containerId: string, req: RedeployReques
 
     await containerManager.startContainer(created.containerId);
 
-    const hostPort = await getHostPortWithRetry(created.containerId, c.port);
-    const internalUrl = `http://localhost:${hostPort}`;
+    const internalUrl = await getInternalUrl(created.containerId, c.port);
 
     const healthy = await waitForHealthy(internalUrl, 30_000);
     if (!healthy) {
@@ -480,6 +501,7 @@ export async function rollingRedeployContainer(containerId: string, req: Redeplo
 
     const newImage = req.image ?? old.image;
     const newTag = req.tag ?? old.tag;
+    const newDigest = req.digest;
     const newResources: ContainerResources = { ...old.resources, ...req.resources };
     const port = old.port;
     const newSubdomain =
@@ -494,9 +516,10 @@ export async function rollingRedeployContainer(containerId: string, req: Redeplo
 
     await assertHostAvailable(newSubdomain, baseDomain, containerId);
     await assertResourceBudget(newResources, containerId);
+    assertRegistryAllowed(newImage);
 
     // 1. Pull new image — old container continues serving traffic
-    await containerManager.pullImage(newImage, newTag);
+    await containerManager.pullImage(newImage, newTag, newDigest);
 
     // 2. Create + start the new container. buildContainerName appends a unique
     //    hash so it never collides with the still-running old container.
@@ -513,6 +536,7 @@ export async function rollingRedeployContainer(containerId: string, req: Redeplo
             containerName: newContainerName,
             image: newImage,
             tag: newTag,
+            digest: newDigest,
             port,
             resources: newResources,
             envVars: old.envVars,
@@ -524,8 +548,7 @@ export async function rollingRedeployContainer(containerId: string, req: Redeplo
         newDockerContainerId = created.containerId;
 
         await containerManager.startContainer(newDockerContainerId);
-        const newHostPort = await getHostPortWithRetry(newDockerContainerId, port);
-        const newInternalUrl = `http://localhost:${newHostPort}`;
+        const newInternalUrl = await getInternalUrl(newDockerContainerId, port);
 
         const healthy = await waitForHealthy(newInternalUrl, 30_000);
         if (!healthy) {

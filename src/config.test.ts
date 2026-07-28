@@ -37,3 +37,14 @@ test('caddy and off modes boot without domains', () => {
 	assert.equal(loadConfigWith({ REVERSE_PROXY_MODE: 'caddy', PRIVOS_DOMAINS: '' }), 0);
 	assert.equal(loadConfigWith({ REVERSE_PROXY_MODE: 'off', PRIVOS_DOMAINS: '' }), 0);
 });
+
+test('fleet mode requires a non-empty registry allowlist', () => {
+	assert.equal(loadConfigWith({ FLEET_MODE: 'true', IMAGE_REGISTRY_ALLOWLIST: '' }), 1);
+	assert.equal(
+		loadConfigWith({
+			FLEET_MODE: 'true',
+			IMAGE_REGISTRY_ALLOWLIST: '10.88.0.11:5000',
+		}),
+		0,
+	);
+});
