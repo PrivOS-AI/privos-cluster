@@ -14,6 +14,7 @@ function app(id: string, state: Container['state'], memoryMb: number, cpus: numb
 		dockerContainerName: id,
 		image: 'registry/app',
 		tag: 'v1',
+		imageDigest: `sha256:${'a'.repeat(64)}`,
 		state,
 		internalUrl: '',
 		port: 3000,

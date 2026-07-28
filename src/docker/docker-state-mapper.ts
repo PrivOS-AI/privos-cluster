@@ -168,6 +168,7 @@ export function mapInspectToContainer(info: Docker.ContainerInspectInfo, health:
 		dockerContainerName: (info.Name ?? '').replace(/^\//, ''),
 		image: labels['privos.image'] || (info.Config?.Image ?? '').split(':')[0],
 		tag: labels['privos.tag'] || (info.Config?.Image ?? '').split(':')[1] || 'latest',
+		imageDigest: labelOrNull(labels, 'privos.image.digest'),
 		state,
 		internalUrl,
 		port,

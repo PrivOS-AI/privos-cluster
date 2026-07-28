@@ -10,7 +10,8 @@ function fakeContainer(overrides: Partial<Container> = {}): Container {
 	return {
 		id: 'c1', appId: null, workspaceId: null, listingId: null, versionDigest: null,
 		dockerContainerId: 'd1', dockerContainerName: 'whoami-abc',
-		image: 'traefik/whoami', tag: 'latest', state: 'running', internalUrl: 'http://localhost:49155',
+		image: 'traefik/whoami', tag: 'latest', imageDigest: null,
+		state: 'running', internalUrl: 'http://localhost:49155',
 		port: 3001, hostPort: 49155, resources: { memoryMb: 256, cpus: 0.5, tmpSizeMb: 64 }, envVars: {},
 		healthCheck: { status: 'healthy', failCount: 0, restartCount: 0, lastCheck: null },
 		createdAt: 1, startedAt: null, stoppedAt: null, volumes: [], subdomain: 'whoami', domain: 'privos.link',

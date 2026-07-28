@@ -44,6 +44,7 @@ export interface Container {
 	dockerContainerName: string;
 	image: string;
 	tag: string;
+	imageDigest: string | null;
 	state: ContainerState;
 	internalUrl: string;
 	port: number;

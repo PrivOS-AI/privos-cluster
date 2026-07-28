@@ -1,0 +1,11 @@
+services:
+  apps-master:
+    build:
+      context: .
+      dockerfile: dockerfile-master
+    image: privos-apps-master:mt
+    container_name: privos-apps-master
+    env_file: .env.master
+    ports:
+      - "${MASTER_MESH_BIND}:4200:4200"
+    restart: unless-stopped

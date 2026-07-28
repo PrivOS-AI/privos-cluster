@@ -84,6 +84,21 @@ Environment-gated hardening shared by development and multi-tenancy lands on
 `develop`. Multi-tenant agent and master work lands on `privos-mt`, cut from
 the hardened `develop` head. Do not land fleet-only behavior on `develop`.
 
+## Shared-fleet master
+
+The `privos-mt` branch also builds `dockerfile-master`. The master is a
+mesh-only control-plane service: hubs call
+`/w/{workspaceId}/api/v1/*` with their workspace key; portal calls
+`/admin/v1/*` with `APP_MASTER_SERVICE_KEY`. It schedules onto fleet agents
+using per-node `kid` keys, persists state/lifecycle events in the control-plane
+Mongo replica set, and programs per-app `privos.link` DNS records. It is never
+in the public app UI request path.
+
+```bash
+cp .env.master.example .env.master
+docker compose -f docker-compose.master.yml up -d --build
+```
+
 ## Reverse proxy behind cloudflared (native mode)
 
 In `REVERSE_PROXY_MODE=native` the cluster runs its own plain-HTTP reverse proxy

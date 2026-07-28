@@ -13,16 +13,17 @@
     "test": "JWT_SECRET=test-secret-0123456789 node --import tsx --test --test-force-exit 'src/**/*.test.ts' 'scripts/**/*.test.ts'",
     "build": "tsc -p tsconfig.json",
     "start": "node --env-file=.env dist/server.js",
+    "start:master": "node --env-file=.env.master dist/master/master-entry.js",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@fastify/cors": "^10.1.0",
-    "@fastify/jwt": "^9.0.0",
     "@fastify/websocket": "^11.0.0",
     "dockerode": "^4.0.2",
     "fastify": "^5.0.0",
     "fastify-plugin": "^5.0.0",
     "jsonwebtoken": "^9.0.2",
+    "mongodb": "^6.21.0",
     "pino": "^9.0.0",
     "undici": "^6.0.0",
     "ws": "^8.18.0",

@@ -9,7 +9,7 @@ function fakeContainer(id: string, state: Container['state'], dcid = `d-${id}-${
 	return {
 		id, appId: null, workspaceId: null, listingId: null, versionDigest: null,
 		dockerContainerId: dcid, dockerContainerName: id,
-		image: 'nginx', tag: 'latest', state, internalUrl: '', port: 3001, hostPort: null,
+		image: 'nginx', tag: 'latest', imageDigest: null, state, internalUrl: '', port: 3001, hostPort: null,
 		resources: { memoryMb: 256, cpus: 0.5, tmpSizeMb: 64 }, envVars: {},
 		healthCheck: { status: 'unknown', failCount: 0, restartCount: 0, lastCheck: null },
 		createdAt: 1, startedAt: null, stoppedAt: null, volumes: [], subdomain: null, domain: null,
@@ -37,6 +37,7 @@ function inspect(overrides: any = {}): any {
 				'privos.version.digest': `sha256:${'a'.repeat(64)}`,
 				'privos.image': 'nginx',
 				'privos.tag': '1.27',
+				'privos.image.digest': `sha256:${'b'.repeat(64)}`,
 				'privos.port': '3001',
 				'privos.resources': JSON.stringify({ memoryMb: 512, cpus: 1, tmpSizeMb: 128 }),
 				'privos.env': JSON.stringify({ FOO: 'bar' }),
@@ -65,6 +66,7 @@ test('mapInspectToContainer maps labels + inspect to the Container view', () => 
 	assert.equal(c.dockerContainerName, 'todo-7f3a9b');
 	assert.equal(c.image, 'nginx');
 	assert.equal(c.tag, '1.27');
+	assert.equal(c.imageDigest, `sha256:${'b'.repeat(64)}`);
 	assert.equal(c.port, 3001);
 	assert.equal(c.state, 'running');
 	assert.equal(c.hostPort, 49155);
