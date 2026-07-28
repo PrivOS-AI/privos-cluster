@@ -16,6 +16,9 @@ export const VolumeSchema = z.object({
 
 export const DeployRequestSchema = z.object({
     appId: z.string().optional(),
+    workspaceId: z.string().regex(/^[A-Za-z0-9-]+$/).optional(),
+    listingId: z.string().min(1).max(128).optional(),
+    versionDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/).optional(),
     image: z.string().min(1, 'image is required'),
     tag: z.string().default('latest'),
     digest: z.string().regex(/^sha256:[a-f0-9]{64}$/, 'digest must be sha256:<64 lowercase hex>').optional(),
@@ -36,12 +39,32 @@ export const DeployRequestSchema = z.object({
                 : 'marketplace images must be deployed by digest',
         });
     }
+    if (config.FLEET_MODE) {
+        for (const field of ['workspaceId', 'listingId', 'versionDigest'] as const) {
+            if (!value[field]) {
+                ctx.addIssue({
+                    code: z.ZodIssueCode.custom,
+                    path: [field],
+                    message: `${field} is required in fleet mode`,
+                });
+            }
+        }
+        if (value.volumes && (value.volumes.length > 1 || value.volumes[0]?.name !== 'data')) {
+            ctx.addIssue({
+                code: z.ZodIssueCode.custom,
+                path: ['volumes'],
+                message: 'fleet apps support one optional volume named data',
+            });
+        }
+    }
 });
 
 export const RedeployRequestSchema = z.object({
+    workspaceId: z.string().regex(/^[A-Za-z0-9-]+$/).optional(),
     image: z.string().optional(),
     tag: z.string().optional(),
     digest: z.string().regex(/^sha256:[a-f0-9]{64}$/).optional(),
+    versionDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/).optional(),
     resources: ResourcesSchema.partial().optional(),
     envVars: z.record(z.string(), z.string()).optional(),
     rolling: z.boolean().optional(),
@@ -56,6 +79,13 @@ export const RedeployRequestSchema = z.object({
             message: config.FLEET_MODE
                 ? 'fleet-mode images must be redeployed by digest'
                 : 'marketplace images must be redeployed by digest',
+        });
+    }
+    if (config.FLEET_MODE && !value.workspaceId) {
+        ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ['workspaceId'],
+            message: 'workspaceId is required in fleet mode',
         });
     }
 });

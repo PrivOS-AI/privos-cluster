@@ -60,9 +60,12 @@ const clusterHandler: FastifyPluginAsync = async (fastify) => {
             const resolvedDomain = resolveDomain(domain);
             const existing = await dockerState.findByHost(parsed.data, resolvedDomain);
             if (existing) {
+                const sameWorkspace =
+                    !req.clusterAuth?.workspaceId ||
+                    existing.workspaceId === req.clusterAuth.workspaceId;
                 return reply.send({
                     available: false,
-                    reason: `taken by container ${existing.id}`,
+                    reason: sameWorkspace ? `taken by container ${existing.id}` : 'host is unavailable',
                 });
             }
             return reply.send({

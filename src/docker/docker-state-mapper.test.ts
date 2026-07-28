@@ -7,7 +7,8 @@ import type { Container } from '../types/index.js';
 
 function fakeContainer(id: string, state: Container['state'], dcid = `d-${id}-${state}`): Container {
 	return {
-		id, appId: null, dockerContainerId: dcid, dockerContainerName: id,
+		id, appId: null, workspaceId: null, listingId: null, versionDigest: null,
+		dockerContainerId: dcid, dockerContainerName: id,
 		image: 'nginx', tag: 'latest', state, internalUrl: '', port: 3001, hostPort: null,
 		resources: { memoryMb: 256, cpus: 0.5, tmpSizeMb: 64 }, envVars: {},
 		healthCheck: { status: 'unknown', failCount: 0, restartCount: 0, lastCheck: null },
@@ -31,6 +32,9 @@ function inspect(overrides: any = {}): any {
 				'privos.managed': 'true',
 				'privos.id': '11111111-2222-3333-4444-555555555555',
 				'privos.app-id': 'my-app',
+				'privos.workspace': 'ws-a',
+				'privos.listing': 'listing-a',
+				'privos.version.digest': `sha256:${'a'.repeat(64)}`,
 				'privos.image': 'nginx',
 				'privos.tag': '1.27',
 				'privos.port': '3001',
@@ -38,7 +42,7 @@ function inspect(overrides: any = {}): any {
 				'privos.env': JSON.stringify({ FOO: 'bar' }),
 				'privos.subdomain': 'todo',
 				'privos.domain': 'apps.example.com',
-				'privos.created-at': '1700000000000',
+				'privos.created-at': '2023-11-14T22:13:20.000Z',
 				'privos.health.path': '/health',
 				'privos.health.max-fails': '3',
 				'privos.health.restart': 'true',
@@ -54,6 +58,9 @@ test('mapInspectToContainer maps labels + inspect to the Container view', () => 
 	const c = mapInspectToContainer(inspect());
 	assert.equal(c.id, '11111111-2222-3333-4444-555555555555');
 	assert.equal(c.appId, 'my-app');
+	assert.equal(c.workspaceId, 'ws-a');
+	assert.equal(c.listingId, 'listing-a');
+	assert.equal(c.versionDigest, `sha256:${'a'.repeat(64)}`);
 	assert.equal(c.dockerContainerId, 'docker-abc123');
 	assert.equal(c.dockerContainerName, 'todo-7f3a9b');
 	assert.equal(c.image, 'nginx');
@@ -161,6 +168,9 @@ test('buildContainerLabels writes the full privos.* schema + caddy when routed',
 		appId: 'app1',
 		image: 'nginx',
 		tag: 'latest',
+		workspaceId: 'ws-a',
+		listingId: 'listing-a',
+		versionDigest: `sha256:${'a'.repeat(64)}`,
 		port: 3001,
 		resources: { memoryMb: 256, cpus: 0.5, tmpSizeMb: 64 },
 		envVars: { FOO: 'bar' },
@@ -172,11 +182,14 @@ test('buildContainerLabels writes the full privos.* schema + caddy when routed',
 	assert.equal(labels['privos.managed'], 'true');
 	assert.equal(labels['privos.id'], 'cid');
 	assert.equal(labels['privos.app-id'], 'app1');
+	assert.equal(labels['privos.workspace'], 'ws-a');
+	assert.equal(labels['privos.listing'], 'listing-a');
+	assert.equal(labels['privos.version.digest'], `sha256:${'a'.repeat(64)}`);
 	assert.equal(labels['privos.port'], '3001');
 	assert.equal(labels['privos.resources'], JSON.stringify({ memoryMb: 256, cpus: 0.5, tmpSizeMb: 64 }));
 	assert.equal(labels['privos.subdomain'], 'todo');
 	assert.equal(labels['privos.domain'], 'apps.example.com');
-	assert.equal(labels['privos.created-at'], '42');
+	assert.equal(labels['privos.created-at'], '1970-01-01T00:00:00.042Z');
 	assert.equal(labels['privos.health.max-fails'], String(HEALTH_DEFAULTS.maxFails));
 	assert.equal(labels['privos.health.restart'], 'true');
 	assert.equal(labels.caddy, 'todo.apps.example.com');

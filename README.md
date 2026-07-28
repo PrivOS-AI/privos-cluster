@@ -71,8 +71,12 @@ See `.env.example`. Key vars: `JWT_SECRET` (shared with hub), `PRIVOS_DOMAINS`,
 (legacy caddy gate), `DEFAULT_MEMORY_MB/CPUS/TMP_MB`, `HEALTH_CHECK_INTERVAL_MS`,
 `DOCKER_SOCKET`/`DOCKER_NETWORK`. Shared-fleet agents additionally set
 `FLEET_MODE=true`, a non-empty `IMAGE_REGISTRY_ALLOWLIST`, `APP_NETWORK_NAME`,
-resource caps, and `CLUSTER_OPERATOR_ROUTES=off`; fleet mode rejects unpinned
-images and an empty registry policy.
+resource caps, `FLEET_NODE_ID`/`FLEET_NODE_KEY`, and
+`CLUSTER_OPERATOR_ROUTES=off`; fleet mode rejects unpinned images, an empty
+registry policy, non-WireGuard API binds, hub-issued tokens, and requests whose
+workspace claim does not match the container label. Each workspace is attached
+to `privos-ws-{workspaceId}-apps`; the agent container is connected for native
+proxying, while app containers never share a network across workspaces.
 
 ## Branching
 

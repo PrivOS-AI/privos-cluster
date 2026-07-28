@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { config } from '../config.js';
 
 // Docker repository names: lowercase, may contain digits, dots, dashes, slashes,
 // and a registry host prefix like ghcr.io/. Keep the regex permissive but reject
@@ -22,4 +23,13 @@ export const ListImagesQuerySchema = z.object({
 export const PullImageRequestSchema = z.object({
 	repository: RepositorySchema,
 	tag: TagSchema.default('latest'),
+	digest: z.string().regex(/^sha256:[a-f0-9]{64}$/).optional(),
+}).superRefine((value, ctx) => {
+	if (config.FLEET_MODE && !value.digest) {
+		ctx.addIssue({
+			code: z.ZodIssueCode.custom,
+			path: ['digest'],
+			message: 'fleet-mode image pulls require a digest',
+		});
+	}
 });

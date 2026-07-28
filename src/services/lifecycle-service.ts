@@ -140,9 +140,13 @@ function assertRegistryAllowed(image: string): void {
 // Helper — load container (Docker labels are the source of truth) or 404
 // ---------------------------------------------------------------------------
 
-async function getContainerOr404(containerId: string): Promise<Container> {
-    const c = await dockerState.getById(containerId, getHealth);
-    if (!c) throw new Error(`Container not found: ${containerId}`);
+async function getContainerOr404(containerId: string, workspaceId?: string): Promise<Container> {
+    const c = await dockerState.getById(containerId, getHealth, workspaceId);
+    if (!c) {
+        const err: Error & { statusCode?: number } = new Error(`Container not found: ${containerId}`);
+        err.statusCode = 404;
+        throw err;
+    }
     return c;
 }
 
@@ -219,7 +223,7 @@ async function assertResourceBudget(
 // ---------------------------------------------------------------------------
 
 export async function deployManagedApp(req: DeployRequest): Promise<Container> {
-    await networkManager.ensureNetwork();
+    await networkManager.ensureNetwork(req.workspaceId);
 
     // Cluster always generates its own UUID for container naming (uniqueness).
     // req.appId is stored as metadata only.
@@ -240,7 +244,16 @@ export async function deployManagedApp(req: DeployRequest): Promise<Container> {
     const baseDomain = isReverseProxyEnabled() ? resolveDomain(req.domain) : null;
 
     logger.info(
-        { clusterId, image, tag, port, volumeCount: volumeSpecs.length, subdomain, baseDomain },
+        {
+            clusterId,
+            workspaceId: req.workspaceId,
+            image,
+            tag,
+            port,
+            volumeCount: volumeSpecs.length,
+            subdomain,
+            baseDomain,
+        },
         'deploying managed app',
     );
 
@@ -257,8 +270,13 @@ export async function deployManagedApp(req: DeployRequest): Promise<Container> {
         // Create Docker named volumes for each requested volume
         const mounts: Array<{ dockerVolumeName: string; mountPath: string }> = [];
         for (const vol of volumeSpecs) {
-            const dockerVolumeName = `mcp-vol-${shortId}-${vol.name}`;
-            await containerManager.ensureVolume(dockerVolumeName, vol.sizeMb);
+            const dockerVolumeName = req.workspaceId
+                ? `privos-ws-${req.workspaceId}-app-${clusterId}-data`
+                : `mcp-vol-${shortId}-${vol.name}`;
+            await containerManager.ensureVolume(dockerVolumeName, vol.sizeMb, {
+                'privos.workspace': req.workspaceId ?? '',
+                'privos.app-id': clusterId,
+            });
             createdDockerVolumes.push(dockerVolumeName);
             mounts.push({ dockerVolumeName, mountPath: vol.mountPath });
         }
@@ -276,6 +294,9 @@ export async function deployManagedApp(req: DeployRequest): Promise<Container> {
             image,
             tag,
             digest,
+            workspaceId: req.workspaceId,
+            listingId: req.listingId,
+            versionDigest: req.versionDigest,
             port,
             resources,
             envVars,
@@ -297,7 +318,7 @@ export async function deployManagedApp(req: DeployRequest): Promise<Container> {
 
         // Docker (via the labels just written) is now the source of truth —
         // read the container back rather than hand-building the response.
-        const container = await dockerState.getById(clusterId, getHealth);
+        const container = await dockerState.getById(clusterId, getHealth, req.workspaceId);
         if (!container) {
             throw new Error(`Deployed container ${clusterId} not found immediately after creation`);
         }
@@ -335,8 +356,8 @@ export async function deployManagedApp(req: DeployRequest): Promise<Container> {
 // startContainer
 // ---------------------------------------------------------------------------
 
-export async function startContainer(containerId: string): Promise<Container> {
-    const c = await getContainerOr404(containerId);
+export async function startContainer(containerId: string, workspaceId?: string): Promise<Container> {
+    const c = await getContainerOr404(containerId, workspaceId);
 
     logger.info({ containerId, dockerContainerId: c.dockerContainerId }, 'starting container');
 
@@ -350,7 +371,7 @@ export async function startContainer(containerId: string): Promise<Container> {
         logger.warn({ containerId, internalUrl }, 'container did not become healthy within 30s');
     }
 
-    const updated = await dockerState.getById(containerId, getHealth);
+    const updated = await dockerState.getById(containerId, getHealth, workspaceId);
     if (!updated) throw new Error(`Container not found after start: ${containerId}`);
     refreshRoutes(); // running state changed — re-evaluate the health gate
     return updated;
@@ -360,14 +381,14 @@ export async function startContainer(containerId: string): Promise<Container> {
 // stopContainer
 // ---------------------------------------------------------------------------
 
-export async function stopContainer(containerId: string): Promise<Container> {
-    const c = await getContainerOr404(containerId);
+export async function stopContainer(containerId: string, workspaceId?: string): Promise<Container> {
+    const c = await getContainerOr404(containerId, workspaceId);
 
     logger.info({ containerId, dockerContainerId: c.dockerContainerId }, 'stopping container');
 
     await containerManager.stopContainer(c.dockerContainerId, 10);
 
-    const updated = await dockerState.getById(containerId, getHealth);
+    const updated = await dockerState.getById(containerId, getHealth, workspaceId);
     if (!updated) throw new Error(`Container not found after stop: ${containerId}`);
     refreshRoutes(); // stopped container must stop routing (health gate → 502)
     return updated;
@@ -377,8 +398,8 @@ export async function stopContainer(containerId: string): Promise<Container> {
 // restartContainer
 // ---------------------------------------------------------------------------
 
-export async function restartContainer(containerId: string): Promise<Container> {
-    const c = await getContainerOr404(containerId);
+export async function restartContainer(containerId: string, workspaceId?: string): Promise<Container> {
+    const c = await getContainerOr404(containerId, workspaceId);
 
     logger.info({ containerId, dockerContainerId: c.dockerContainerId }, 'restarting container');
 
@@ -392,7 +413,7 @@ export async function restartContainer(containerId: string): Promise<Container> 
         logger.warn({ containerId, internalUrl }, 'container did not become healthy within 30s after restart');
     }
 
-    const updated = await dockerState.getById(containerId, getHealth);
+    const updated = await dockerState.getById(containerId, getHealth, workspaceId);
     if (!updated) throw new Error(`Container not found after restart: ${containerId}`);
     refreshRoutes(); // host port may change after restart — drop the stale target
     return updated;
@@ -402,8 +423,12 @@ export async function restartContainer(containerId: string): Promise<Container> 
 // redeployContainer
 // ---------------------------------------------------------------------------
 
-export async function redeployContainer(containerId: string, req: RedeployRequest): Promise<Container> {
-    const c = await getContainerOr404(containerId);
+export async function redeployContainer(
+    containerId: string,
+    req: RedeployRequest,
+    workspaceId?: string,
+): Promise<Container> {
+    const c = await getContainerOr404(containerId, workspaceId);
 
     const newImage = req.image ?? c.image;
     const newTag = req.tag ?? c.tag;
@@ -453,6 +478,9 @@ export async function redeployContainer(containerId: string, req: RedeployReques
         image: newImage,
         tag: newTag,
         digest: newDigest,
+        workspaceId: c.workspaceId ?? undefined,
+        listingId: c.listingId ?? undefined,
+        versionDigest: req.versionDigest ?? c.versionDigest ?? undefined,
         port: c.port,
         resources: newResources,
         envVars: c.envVars,
@@ -471,7 +499,7 @@ export async function redeployContainer(containerId: string, req: RedeployReques
         logger.warn({ containerId, internalUrl }, 'container did not become healthy within 30s after redeploy');
     }
 
-    const updated = await dockerState.getById(containerId, getHealth);
+    const updated = await dockerState.getById(containerId, getHealth, workspaceId);
     if (!updated) throw new Error(`Container not found after redeploy: ${containerId}`);
     logger.info({ containerId, newDockerContainerId: created.containerId, internalUrl }, 'redeploy complete');
     refreshRoutes(); // new container id / host port — invalidate the cached target
@@ -492,8 +520,12 @@ export async function redeployContainer(containerId: string, req: RedeployReques
  * that to a single active container (prefer running → newest), so the API view
  * stays single-identity. Caddy has both as upstreams during the window.
  */
-export async function rollingRedeployContainer(containerId: string, req: RedeployRequest): Promise<Container> {
-    const old = await getContainerOr404(containerId);
+export async function rollingRedeployContainer(
+    containerId: string,
+    req: RedeployRequest,
+    workspaceId?: string,
+): Promise<Container> {
+    const old = await getContainerOr404(containerId, workspaceId);
 
     if (old.state !== 'running') {
         throw new Error(`Cannot rolling-redeploy a non-running container (state=${old.state}) — start it first`);
@@ -537,6 +569,9 @@ export async function rollingRedeployContainer(containerId: string, req: Redeplo
             image: newImage,
             tag: newTag,
             digest: newDigest,
+            workspaceId: old.workspaceId ?? undefined,
+            listingId: old.listingId ?? undefined,
+            versionDigest: req.versionDigest ?? old.versionDigest ?? undefined,
             port,
             resources: newResources,
             envVars: old.envVars,
@@ -568,7 +603,7 @@ export async function rollingRedeployContainer(containerId: string, req: Redeplo
             logger.warn({ containerId, err: err.message }, 'rolling redeploy: old container cleanup failed (best-effort)');
         }
 
-        const updated = await dockerState.getById(containerId, getHealth);
+        const updated = await dockerState.getById(containerId, getHealth, workspaceId);
         if (!updated) throw new Error(`Container not found after rolling redeploy: ${containerId}`);
         logger.info({ containerId, newDockerContainerId, newInternalUrl }, 'rolling redeploy complete');
         refreshRoutes(); // swap to the new container id / host port
@@ -601,12 +636,16 @@ export async function rollingRedeployContainer(containerId: string, req: Redeplo
  * volumes (two writers → corruption), or the container isn't running. On a
  * rolling failure the error propagates — no silent downtime fallback.
  */
-export async function redeployContainerSmart(containerId: string, req: RedeployRequest): Promise<Container> {
-    const old = await getContainerOr404(containerId);
+export async function redeployContainerSmart(
+    containerId: string,
+    req: RedeployRequest,
+    workspaceId?: string,
+): Promise<Container> {
+    const old = await getContainerOr404(containerId, workspaceId);
     const wantRolling = req.rolling !== false;
 
     if (wantRolling && old.volumes.length === 0 && old.state === 'running') {
-        return rollingRedeployContainer(containerId, req);
+        return rollingRedeployContainer(containerId, req, workspaceId);
     }
 
     if (wantRolling) {
@@ -614,7 +653,7 @@ export async function redeployContainerSmart(containerId: string, req: RedeployR
             old.volumes.length > 0 ? `has ${old.volumes.length} persistent volume(s)` : `not running (state=${old.state})`;
         logger.info({ containerId, reason }, 'rolling unavailable, using stop-then-create redeploy');
     }
-    return redeployContainer(containerId, req);
+    return redeployContainer(containerId, req, workspaceId);
 }
 
 // ---------------------------------------------------------------------------
@@ -626,8 +665,8 @@ export async function redeployContainerSmart(containerId: string, req: RedeployR
  * Labels are immutable — there is no "detach" (unmanage-without-removing)
  * option anymore; delete always stops and removes the Docker container.
  */
-export async function deleteContainer(containerId: string): Promise<void> {
-    const c = await getContainerOr404(containerId);
+export async function deleteContainer(containerId: string, workspaceId?: string): Promise<void> {
+    const c = await getContainerOr404(containerId, workspaceId);
 
     logger.info({ containerId, dockerContainerId: c.dockerContainerId }, 'deleting container');
 
@@ -654,14 +693,24 @@ export async function deleteContainer(containerId: string): Promise<void> {
     }
 
     // Remove Docker named volumes (data loss by design — conservative approach)
+    const volumeErrors: Error[] = [];
     for (const volName of volumeNames) {
         try {
             await containerManager.removeVolume(volName);
         } catch (err: any) {
-            logger.warn({ containerId, volumeName: volName, err: err.message }, 'failed to remove volume during delete — continuing');
+            logger.error({ containerId, volumeName: volName, err: err.message }, 'failed to remove volume during delete');
+            volumeErrors.push(err instanceof Error ? err : new Error(String(err)));
         }
     }
 
     logger.info({ containerId }, 'container deleted');
     refreshRoutes(); // host no longer resolves — stop routing to the removed container
+    if (volumeErrors.length > 0) {
+        const err: Error & { statusCode?: number; volumes?: string[] } = new Error(
+            `Container removed but ${volumeErrors.length} volume(s) require reconciliation`,
+        );
+        err.statusCode = 500;
+        err.volumes = volumeNames;
+        throw err;
+    }
 }

@@ -1,6 +1,6 @@
 import fp from 'fastify-plugin';
-import jwtPlugin from '@fastify/jwt';
 import type { FastifyPluginAsync, FastifyRequest, FastifyReply } from 'fastify';
+import jwt from 'jsonwebtoken';
 import { config } from '../config.js';
 
 // ---------------------------------------------------------------------------
@@ -11,42 +11,71 @@ declare module 'fastify' {
 		authenticate: (req: FastifyRequest, reply: FastifyReply) => Promise<void>;
 	}
 	interface FastifyRequest {
-		clusterAuth?: { iss: string; sub?: string };
+		clusterAuth?: { iss: string; sub?: string; workspaceId?: string; kid?: string };
 	}
 }
 
-declare module '@fastify/jwt' {
-	interface FastifyJWT {
-		payload: { iss: string; sub: string; scope?: string[] };
-		user: { iss: string; sub: string; scope?: string[] };
-	}
+interface ClusterToken {
+	iss: string;
+	sub?: string;
+	workspaceId?: string;
 }
 
-// Accepted token issuer — the cluster trusts only service-to-service tokens
-// signed by the privos-chat (hub) backend. There is no local admin auth flow.
-const ALLOWED_ISSUERS = ['privos-chat'] as const;
+export interface ClusterAuth {
+	iss: string;
+	sub?: string;
+	workspaceId?: string;
+	kid?: string;
+}
+
+export function verifyClusterToken(
+	token: string,
+	options: {
+		fleetMode: boolean;
+		secret: string;
+		nodeId?: string;
+	},
+): ClusterAuth {
+	const decoded = jwt.decode(token, { complete: true });
+	if (!decoded || typeof decoded === 'string') throw new Error('invalid token');
+	const expectedIssuer = options.fleetMode ? 'privos-apps-master' : 'privos-chat';
+	if (options.fleetMode && decoded.header.kid !== options.nodeId) {
+		throw new Error('token kid does not match this node');
+	}
+	const payload = jwt.verify(token, options.secret, {
+		algorithms: ['HS256'],
+		issuer: expectedIssuer,
+	}) as ClusterToken;
+	if (options.fleetMode && !payload.workspaceId) {
+		throw new Error('workspaceId claim is required');
+	}
+	return {
+		iss: payload.iss,
+		sub: payload.sub,
+		workspaceId: payload.workspaceId,
+		kid: decoded.header.kid,
+	};
+}
 
 // ---------------------------------------------------------------------------
 // Plugin
 // ---------------------------------------------------------------------------
 const authPlugin: FastifyPluginAsync = async (fastify) => {
-	// Register @fastify/jwt with shared secret. Only `verify` is configured —
-	// this service never signs its own tokens (no local login flow).
-	await fastify.register(jwtPlugin, {
-		secret: config.JWT_SECRET,
-		verify: { allowedIss: ALLOWED_ISSUERS as unknown as string[] },
-	});
-
 	// Reusable preHandler that verifies inbound Bearer tokens.
 	fastify.decorate(
 		'authenticate',
 		async (req: FastifyRequest, reply: FastifyReply): Promise<void> => {
 			try {
-				await req.jwtVerify();
-				if (!ALLOWED_ISSUERS.includes(req.user.iss as (typeof ALLOWED_ISSUERS)[number])) {
-					throw new Error('bad issuer');
-				}
-				req.clusterAuth = { iss: req.user.iss, sub: req.user.sub };
+				const authorization = req.headers.authorization;
+				if (!authorization?.startsWith('Bearer ')) throw new Error('missing bearer token');
+				const token = authorization.slice('Bearer '.length);
+				const secret = config.FLEET_MODE ? config.FLEET_NODE_KEY : config.JWT_SECRET;
+				if (!secret) throw new Error('authentication key is not configured');
+				req.clusterAuth = verifyClusterToken(token, {
+					fleetMode: config.FLEET_MODE,
+					secret,
+					nodeId: config.FLEET_NODE_ID,
+				});
 			} catch (err: unknown) {
 				const message = err instanceof Error ? err.message : 'unknown error';
 				return reply.code(401).send({ error: 'unauthorized', reason: message });

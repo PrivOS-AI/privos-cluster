@@ -16,6 +16,7 @@ function loadConfigWith(env: Record<string, string>): number {
 			env: {
 				...process.env,
 				JWT_SECRET: 'test-secret-0123456789',
+				FLEET_MODE: 'false',
 				PRIVOS_DOMAINS: '',
 				REVERSE_PROXY_MODE: 'caddy',
 				...env,
@@ -39,12 +40,33 @@ test('caddy and off modes boot without domains', () => {
 });
 
 test('fleet mode requires a non-empty registry allowlist', () => {
-	assert.equal(loadConfigWith({ FLEET_MODE: 'true', IMAGE_REGISTRY_ALLOWLIST: '' }), 1);
+	const fleet = {
+		FLEET_MODE: 'true',
+		HOST: '10.88.0.99',
+		FLEET_NODE_ID: 'apps-eu-01',
+		FLEET_NODE_KEY: 'fleet-node-key-0123456789-0123456789',
+	};
+	assert.equal(loadConfigWith({ ...fleet, IMAGE_REGISTRY_ALLOWLIST: '' }), 1);
 	assert.equal(
 		loadConfigWith({
-			FLEET_MODE: 'true',
+			...fleet,
 			IMAGE_REGISTRY_ALLOWLIST: '10.88.0.11:5000',
 		}),
 		0,
 	);
+});
+
+test('fleet mode requires a per-node key and WireGuard bind', () => {
+	assert.equal(loadConfigWith({
+		FLEET_MODE: 'true',
+		HOST: '0.0.0.0',
+		IMAGE_REGISTRY_ALLOWLIST: '10.88.0.11:5000',
+	}), 1);
+	assert.equal(loadConfigWith({
+		FLEET_MODE: 'true',
+		HOST: '10.88.0.99',
+		FLEET_NODE_ID: 'apps-eu-01',
+		FLEET_NODE_KEY: 'fleet-node-key-0123456789-0123456789',
+		IMAGE_REGISTRY_ALLOWLIST: '10.88.0.11:5000',
+	}), 0);
 });

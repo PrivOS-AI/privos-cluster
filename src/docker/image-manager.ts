@@ -109,10 +109,11 @@ export class ImageManager {
 	async pull(
 		repository: string,
 		tag: string,
+		digest: string | undefined,
 		onProgress: (ev: PullProgressEvent) => void = () => {},
 		signal?: AbortSignal,
 	): Promise<InspectedImage> {
-		const repoTag = `${repository}:${tag}`;
+		const repoTag = digest ? `${repository}@${digest}` : `${repository}:${tag}`;
 		if (signal?.aborted) throw new Error('Pull cancelled');
 
 		let stream: NodeJS.ReadableStream;

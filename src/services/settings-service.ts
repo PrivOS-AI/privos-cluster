@@ -75,7 +75,11 @@ export function getImageRegistryAllowlist(): string[] {
 		.filter(Boolean);
 }
 
-export function getAppNetworkName(): string {
+export function getAppNetworkName(workspaceId?: string): string {
+	if (config.FLEET_MODE) {
+		if (!workspaceId) throw new Error('workspaceId is required for a fleet app network');
+		return `privos-ws-${workspaceId}-apps`;
+	}
 	return config.APP_NETWORK_NAME?.trim() || config.DOCKER_NETWORK;
 }
 

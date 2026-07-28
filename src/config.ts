@@ -21,7 +21,10 @@ const ConfigSchema = z.object({
 	CLUSTER_MAX_CPUS: z.coerce.number().positive().optional(),
 	CLUSTER_OPERATOR_ROUTES: z.enum(['on', 'off']).default('off'),
 
-	JWT_SECRET: z.string().min(16, 'JWT_SECRET must be at least 16 chars'),
+	JWT_SECRET: z.string().min(16, 'JWT_SECRET must be at least 16 chars').optional(),
+	FLEET_NODE_ID: z.string().regex(/^[A-Za-z0-9-]+$/).optional(),
+	FLEET_NODE_KEY: z.string().min(32, 'FLEET_NODE_KEY must be at least 32 chars').optional(),
+	FLEET_AGENT_CONTAINER: z.string().default('privos-cluster'),
 
 	HEALTH_CHECK_INTERVAL_MS: z.coerce.number().int().positive().default(30_000),
 
@@ -51,6 +54,30 @@ const ConfigSchema = z.object({
 	// CORS — comma-separated origins, or "*" for any. Empty disables CORS entirely.
 	CORS_ORIGIN: z.string().default('http://localhost:5173'),
 }).superRefine((cfg, ctx) => {
+	if (!cfg.FLEET_MODE && !cfg.JWT_SECRET) {
+		ctx.addIssue({
+			code: z.ZodIssueCode.custom,
+			path: ['JWT_SECRET'],
+			message: 'JWT_SECRET is required outside fleet mode',
+		});
+	}
+
+	if (cfg.FLEET_MODE && (!cfg.FLEET_NODE_ID || !cfg.FLEET_NODE_KEY)) {
+		ctx.addIssue({
+			code: z.ZodIssueCode.custom,
+			path: ['FLEET_NODE_KEY'],
+			message: 'FLEET_MODE=true requires FLEET_NODE_ID and FLEET_NODE_KEY',
+		});
+	}
+
+	if (cfg.FLEET_MODE && !/^10\.88\.\d{1,3}\.\d{1,3}$/.test(cfg.HOST)) {
+		ctx.addIssue({
+			code: z.ZodIssueCode.custom,
+			path: ['HOST'],
+			message: 'FLEET_MODE=true requires HOST to be a WireGuard 10.88.0.0/16 address',
+		});
+	}
+
 	if (cfg.FLEET_MODE && !cfg.IMAGE_REGISTRY_ALLOWLIST.split(',').some((host) => host.trim())) {
 		ctx.addIssue({
 			code: z.ZodIssueCode.custom,

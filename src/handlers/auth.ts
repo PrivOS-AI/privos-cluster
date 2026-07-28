@@ -14,6 +14,8 @@ const authHandler: FastifyPluginAsync = async (fastify) => {
         return reply.send({
             iss: req.clusterAuth?.iss,
             sub: req.clusterAuth?.sub,
+            workspaceId: req.clusterAuth?.workspaceId,
+            kid: req.clusterAuth?.kid,
         });
     });
 };

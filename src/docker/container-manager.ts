@@ -10,6 +10,9 @@ export interface CreateContainerConfig {
     image: string;
     tag: string;
     digest?: string;
+    workspaceId?: string;
+    listingId?: string;
+    versionDigest?: string;
     port: number;
     resources: ContainerResources;
     envVars?: Record<string, string>;
@@ -42,6 +45,10 @@ export function buildContainerLabels(cfg: {
     appId: string;
     image: string;
     tag: string;
+    digest?: string;
+    workspaceId?: string;
+    listingId?: string;
+    versionDigest?: string;
     port: number;
     resources: ContainerResources;
     envVars?: Record<string, string>;
@@ -61,6 +68,10 @@ export function buildContainerLabels(cfg: {
         'privos.app-id': cfg.appId || LABEL_NONE,
         'privos.image': cfg.image,
         'privos.tag': cfg.tag,
+        'privos.image.digest': cfg.digest || LABEL_NONE,
+        'privos.workspace': cfg.workspaceId || LABEL_NONE,
+        'privos.listing': cfg.listingId || LABEL_NONE,
+        'privos.version.digest': cfg.versionDigest || LABEL_NONE,
         'privos.port': String(cfg.port),
         'privos.resources': JSON.stringify(cfg.resources),
         // Only the USER-supplied env is recorded (matches the DB, which stored
@@ -70,7 +81,7 @@ export function buildContainerLabels(cfg: {
         'privos.subdomain': cfg.subdomain || LABEL_NONE,
         'privos.domain': cfg.baseDomain || LABEL_NONE,
         'privos.created-by': cfg.createdBy || LABEL_NONE,
-        'privos.created-at': String(cfg.createdAt ?? Date.now()),
+        'privos.created-at': new Date(cfg.createdAt ?? Date.now()).toISOString(),
         'privos.health.path': HEALTH_DEFAULTS.path,
         'privos.health.max-fails': String(HEALTH_DEFAULTS.maxFails),
         'privos.health.restart': String(HEALTH_DEFAULTS.restart),
@@ -154,6 +165,10 @@ export class ContainerManager {
                 appId: cfg.appId,
                 image: cfg.image,
                 tag: cfg.tag,
+                digest: cfg.digest,
+                workspaceId: cfg.workspaceId,
+                listingId: cfg.listingId,
+                versionDigest: cfg.versionDigest,
                 port: cfg.port,
                 resources: cfg.resources,
                 envVars: cfg.envVars,
@@ -163,7 +178,7 @@ export class ContainerManager {
                 createdAt: cfg.createdAt,
             }),
             HostConfig: {
-                NetworkMode: getAppNetworkName(),
+                NetworkMode: getAppNetworkName(cfg.workspaceId),
                 ReadonlyRootfs: true,
                 Tmpfs: { '/tmp': `size=${cfg.resources.tmpSizeMb}m,mode=1777` },
                 CapDrop: ['ALL'],
@@ -202,11 +217,13 @@ export class ContainerManager {
 
     async getContainerIp(
         containerId: string,
-        networkName: string = getAppNetworkName(),
+        networkName?: string,
     ): Promise<string | null> {
         const info = await this.docker.getContainer(containerId).inspect();
         const networks = info.NetworkSettings?.Networks || {};
-        return networks[networkName]?.IPAddress || null;
+        if (networkName) return networks[networkName]?.IPAddress || null;
+        const preferred = Object.entries(networks).find(([name]) => name.startsWith('privos-ws-'));
+        return preferred?.[1]?.IPAddress || Object.values(networks)[0]?.IPAddress || null;
     }
 
     async startContainer(containerId: string): Promise<void> {
@@ -355,11 +372,15 @@ export class ContainerManager {
     /**
      * Ensure a named Docker volume exists. Swallows 409 if already exists.
      */
-    async ensureVolume(name: string, _sizeMb?: number): Promise<void> {
+    async ensureVolume(
+        name: string,
+        _sizeMb?: number,
+        labels: Record<string, string> = {},
+    ): Promise<void> {
         try {
             await this.docker.createVolume({
                 Name: name,
-                Labels: { 'mcp-app': 'true' },
+                Labels: { 'mcp-app': 'true', ...labels },
             });
         } catch (err: any) {
             if (err.statusCode === 409) return; // already exists — idempotent
@@ -387,5 +408,11 @@ export class ContainerManager {
             filters: { label: ['mcp-app=true'] },
         });
         return result.Volumes ?? [];
+    }
+
+    async getVolumeSizeBytes(name: string): Promise<number> {
+        const usage = await this.docker.df();
+        const volume = usage.Volumes?.find((item: any) => item.Name === name);
+        return Math.max(0, Number(volume?.UsageData?.Size ?? 0));
     }
 }

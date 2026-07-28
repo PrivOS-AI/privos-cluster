@@ -49,7 +49,7 @@ const imagesHandler: FastifyPluginAsync = async (fastify) => {
         if (!parsed.success) {
             return reply.code(400).send({ error: 'validation_error', details: parsed.error.issues });
         }
-        const { repository, tag } = parsed.data;
+        const { repository, tag, digest } = parsed.data;
         const allowlist = getImageRegistryAllowlist();
         if (allowlist.length > 0 && !allowlist.includes(registryHost(repository))) {
             return reply.code(403).send({ error: 'registry_not_allowed' });
@@ -77,7 +77,13 @@ const imagesHandler: FastifyPluginAsync = async (fastify) => {
         });
 
         try {
-            const inspected = await imageManager.pull(repository, tag, (ev) => send(ev), controller.signal);
+            const inspected = await imageManager.pull(
+                repository,
+                tag,
+                digest,
+                (ev) => send(ev),
+                controller.signal,
+            );
             send({ done: true, image: inspected });
         } catch (err: any) {
             if (controller.signal.aborted) {

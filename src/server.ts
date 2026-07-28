@@ -21,6 +21,7 @@ import filesHandler from './handlers/files.js';
 import terminalHandler from './handlers/terminal.js';
 import clusterHandler from './handlers/cluster.js';
 import authRoutesHandler from './handlers/auth.js';
+import usageHandler from './handlers/usage.js';
 import { areOperatorRoutesEnabled } from './services/settings-service.js';
 
 const fastify = Fastify({
@@ -50,7 +51,9 @@ async function main(): Promise<void> {
 		//    (containers, labels, images) is the only source of truth; there is
 		//    no local database to initialize or reconcile.
 		await networkManager.ensureNetwork();
-		fastify.log.info({ network: config.DOCKER_NETWORK }, 'docker network ready');
+		if (!config.FLEET_MODE) {
+			fastify.log.info({ network: config.DOCKER_NETWORK }, 'docker network ready');
+		}
 
 		// 2. Register CORS (frontend dev server origin). Skipped if explicitly disabled.
 		if (config.CORS_ORIGIN) {
@@ -84,6 +87,7 @@ async function main(): Promise<void> {
 		await fastify.register(imagesHandler);
 		await fastify.register(clusterHandler);
 		await fastify.register(logsHandler);
+		await fastify.register(usageHandler);
 		if (areOperatorRoutesEnabled()) {
 			await fastify.register(filesHandler);
 			await fastify.register(terminalHandler);

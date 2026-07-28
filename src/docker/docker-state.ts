@@ -38,13 +38,21 @@ async function inspectManaged(filters: Record<string, string[]>, health?: Health
 	return pickActivePerId(items);
 }
 
-export async function listManaged(health?: HealthProvider): Promise<Container[]> {
-	const all = await inspectManaged({ label: [MANAGED_LABEL] }, health);
+export async function listManaged(health?: HealthProvider, workspaceId?: string): Promise<Container[]> {
+	const labels = [MANAGED_LABEL];
+	if (workspaceId) labels.push(`privos.workspace=${workspaceId}`);
+	const all = await inspectManaged({ label: labels }, health);
 	return all.sort((a, b) => b.createdAt - a.createdAt);
 }
 
-export async function getById(id: string, health?: HealthProvider): Promise<Container | null> {
-	const found = await inspectManaged({ label: [MANAGED_LABEL, `privos.id=${id}`] }, health);
+export async function getById(
+	id: string,
+	health?: HealthProvider,
+	workspaceId?: string,
+): Promise<Container | null> {
+	const labels = [MANAGED_LABEL, `privos.id=${id}`];
+	if (workspaceId) labels.push(`privos.workspace=${workspaceId}`);
+	const found = await inspectManaged({ label: labels }, health);
 	return found[0] ?? null;
 }
 

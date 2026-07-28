@@ -4,6 +4,7 @@
  */
 import type { FastifyPluginAsync } from 'fastify';
 import fp from 'fastify-plugin';
+import { config } from '../config.js';
 import * as dockerState from '../docker/docker-state.js';
 import { containerManager, imageManager } from '../docker/index.js';
 import { getHealth } from '../services/health-monitor.js';
@@ -40,6 +41,20 @@ function inferRegistryHost(repository: string): string {
     return first.includes('.') || first.includes(':') ? first : 'docker.io';
 }
 
+function authorizedWorkspaceId(req: { clusterAuth?: { workspaceId?: string } }): string | undefined {
+    return req.clusterAuth?.workspaceId;
+}
+
+function workspaceMatches(
+    bodyWorkspaceId: string | undefined,
+    authorizedWorkspace: string | undefined,
+): boolean {
+    return !config.FLEET_MODE || (
+        Boolean(authorizedWorkspace) &&
+        bodyWorkspaceId === authorizedWorkspace
+    );
+}
+
 const appsHandler: FastifyPluginAsync = async (fastify) => {
     // POST /api/v1/apps/deploy/validate — dry-run preflight checks
     // Returns { ok, checks: [{ id, label, status, message? }] }
@@ -59,6 +74,9 @@ const appsHandler: FastifyPluginAsync = async (fastify) => {
                 message: `${path}: ${firstError?.message ?? 'invalid'}`,
             });
             return reply.send({ ok: false, checks });
+        }
+        if (!workspaceMatches(parsed.data.workspaceId, authorizedWorkspaceId(req))) {
+            return reply.code(403).send({ error: 'workspace_scope_mismatch' });
         }
         checks.push({ id: 'schema', label: 'Request shape', status: 'ok' });
 
@@ -214,6 +232,10 @@ const appsHandler: FastifyPluginAsync = async (fastify) => {
             if (!parsed.success) {
                 return reply.code(400).send({ error: 'validation_error', details: parsed.error.issues });
             }
+            const workspaceId = authorizedWorkspaceId(req);
+            if (!workspaceMatches(parsed.data.workspaceId, workspaceId)) {
+                return reply.code(403).send({ error: 'workspace_scope_mismatch' });
+            }
             const container = await deployManagedApp(parsed.data);
             return reply.code(201).send(container);
         } catch (err: any) {
@@ -223,9 +245,9 @@ const appsHandler: FastifyPluginAsync = async (fastify) => {
     });
 
     // GET /api/v1/apps
-    fastify.get('/api/v1/apps', { preHandler: fastify.authenticate }, async (_req, reply) => {
+    fastify.get('/api/v1/apps', { preHandler: fastify.authenticate }, async (req, reply) => {
         try {
-            const containers = await dockerState.listManaged(getHealth);
+            const containers = await dockerState.listManaged(getHealth, authorizedWorkspaceId(req));
             return reply.send(containers);
         } catch (err: any) {
             fastify.log.error({ err }, 'list apps error');
@@ -240,7 +262,11 @@ const appsHandler: FastifyPluginAsync = async (fastify) => {
             if (!params.success) {
                 return reply.code(400).send({ error: 'invalid containerId' });
             }
-            const container = await dockerState.getById(params.data.containerId, getHealth);
+            const container = await dockerState.getById(
+                params.data.containerId,
+                getHealth,
+                authorizedWorkspaceId(req),
+            );
             if (!container) {
                 return reply.code(404).send({ error: 'not found' });
             }
@@ -258,7 +284,7 @@ const appsHandler: FastifyPluginAsync = async (fastify) => {
             if (!params.success) {
                 return reply.code(400).send({ error: 'invalid containerId' });
             }
-            const container = await startContainer(params.data.containerId);
+            const container = await startContainer(params.data.containerId, authorizedWorkspaceId(req));
             return reply.send(container);
         } catch (err: any) {
             fastify.log.error({ err }, 'start container error');
@@ -273,7 +299,7 @@ const appsHandler: FastifyPluginAsync = async (fastify) => {
             if (!params.success) {
                 return reply.code(400).send({ error: 'invalid containerId' });
             }
-            const container = await stopContainer(params.data.containerId);
+            const container = await stopContainer(params.data.containerId, authorizedWorkspaceId(req));
             return reply.send(container);
         } catch (err: any) {
             fastify.log.error({ err }, 'stop container error');
@@ -288,7 +314,7 @@ const appsHandler: FastifyPluginAsync = async (fastify) => {
             if (!params.success) {
                 return reply.code(400).send({ error: 'invalid containerId' });
             }
-            const container = await restartContainer(params.data.containerId);
+            const container = await restartContainer(params.data.containerId, authorizedWorkspaceId(req));
             return reply.send(container);
         } catch (err: any) {
             fastify.log.error({ err }, 'restart container error');
@@ -307,7 +333,15 @@ const appsHandler: FastifyPluginAsync = async (fastify) => {
             if (!body.success) {
                 return reply.code(400).send({ error: 'validation_error', details: body.error.issues });
             }
-            const container = await redeployContainerSmart(params.data.containerId, body.data);
+            const workspaceId = authorizedWorkspaceId(req);
+            if (!workspaceMatches(body.data.workspaceId, workspaceId)) {
+                return reply.code(403).send({ error: 'workspace_scope_mismatch' });
+            }
+            const container = await redeployContainerSmart(
+                params.data.containerId,
+                body.data,
+                workspaceId,
+            );
             return reply.send(container);
         } catch (err: any) {
             fastify.log.error({ err }, 'redeploy error');
@@ -324,7 +358,7 @@ const appsHandler: FastifyPluginAsync = async (fastify) => {
             if (!params.success) {
                 return reply.code(400).send({ error: 'invalid containerId' });
             }
-            await deleteContainer(params.data.containerId);
+            await deleteContainer(params.data.containerId, authorizedWorkspaceId(req));
             return reply.send({ ok: true });
         } catch (err: any) {
             fastify.log.error({ err }, 'delete container error');
@@ -339,7 +373,11 @@ const appsHandler: FastifyPluginAsync = async (fastify) => {
             if (!params.success) {
                 return reply.code(400).send({ error: 'invalid containerId' });
             }
-            const container = await dockerState.getById(params.data.containerId, getHealth);
+            const container = await dockerState.getById(
+                params.data.containerId,
+                getHealth,
+                authorizedWorkspaceId(req),
+            );
             if (!container) {
                 return reply.code(404).send({ error: 'not found' });
             }
@@ -394,7 +432,11 @@ const appsHandler: FastifyPluginAsync = async (fastify) => {
                 return reply.code(400).send({ error: 'validation_error', details: body.error.issues });
             }
 
-            const container = await dockerState.getById(params.data.containerId);
+            const container = await dockerState.getById(
+                params.data.containerId,
+                undefined,
+                authorizedWorkspaceId(req),
+            );
             if (!container) {
                 return reply.code(404).send({ error: 'not found' });
             }

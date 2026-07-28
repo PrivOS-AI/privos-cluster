@@ -96,6 +96,12 @@ function hostPortFor(info: Docker.ContainerInspectInfo, port: number): number | 
 	return null;
 }
 
+function networkIpFor(info: Docker.ContainerInspectInfo): string | null {
+	const networks = info.NetworkSettings?.Networks ?? {};
+	const preferred = Object.entries(networks).find(([name]) => name.startsWith('privos-ws-'));
+	return preferred?.[1]?.IPAddress || Object.values(networks)[0]?.IPAddress || null;
+}
+
 function toEpoch(value: string | undefined): number | null {
 	if (!value) return null;
 	const t = new Date(value).getTime();
@@ -139,12 +145,25 @@ export function mapInspectToContainer(info: Docker.ContainerInspectInfo, health:
 	const port = parseInt(labels['privos.port'] ?? '0', 10) || 0;
 	const state = mapState(info.State?.Status);
 	const hostPort = hostPortFor(info, port);
-	const internalUrl = state === 'running' && hostPort ? `http://localhost:${hostPort}` : '';
-	const createdAtLabel = parseInt(labels['privos.created-at'] ?? '', 10);
+	const networkIp = networkIpFor(info);
+	const internalUrl = state === 'running'
+		? networkIp
+			? `http://${networkIp}:${port}`
+			: hostPort
+				? `http://localhost:${hostPort}`
+				: ''
+		: '';
+	const createdAtRaw = labels['privos.created-at'];
+	const createdAtLabel = createdAtRaw && /^\d+$/.test(createdAtRaw)
+		? Number(createdAtRaw)
+		: Date.parse(createdAtRaw ?? '');
 
 	return {
 		id,
 		appId: labelOrNull(labels, 'privos.app-id'),
+		workspaceId: labelOrNull(labels, 'privos.workspace'),
+		listingId: labelOrNull(labels, 'privos.listing'),
+		versionDigest: labelOrNull(labels, 'privos.version.digest'),
 		dockerContainerId: info.Id,
 		dockerContainerName: (info.Name ?? '').replace(/^\//, ''),
 		image: labels['privos.image'] || (info.Config?.Image ?? '').split(':')[0],

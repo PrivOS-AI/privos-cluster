@@ -21,7 +21,11 @@ const logsHandler: FastifyPluginAsync = async (fastify) => {
                 return reply.code(400).send({ error: 'validation_error', details: query.error.issues });
             }
 
-            const container = await dockerState.getById(params.data.containerId);
+            const container = await dockerState.getById(
+                params.data.containerId,
+                undefined,
+                req.clusterAuth?.workspaceId,
+            );
             if (!container) {
                 return reply.code(404).send({ error: 'not found' });
             }
