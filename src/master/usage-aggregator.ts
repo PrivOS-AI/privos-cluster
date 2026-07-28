@@ -25,9 +25,11 @@ export function aggregateWorkspaceDay(
 	date: Date,
 	events: AppLifecycleEvent[],
 	apps: MasterApp[],
+	asOf = new Date(utcDay(date).getTime() + DAY_MS),
 ): AppUsageDaily {
 	const start = utcDay(date);
 	const end = new Date(start.getTime() + DAY_MS);
+	const accountingEnd = Math.min(end.getTime(), Math.max(start.getTime(), asOf.getTime()));
 	const perApp = new Map<string, { appId: string; ramGbHours: number; cpuHours: number; storageGbDay: number }>();
 	const running = new Map<string, { appId: string; resources: AppLifecycleEvent['resources']; since: number }>();
 	const appUsage = (appId: string) => {
@@ -43,7 +45,7 @@ export function aggregateWorkspaceDay(
 		addCompute(appUsage(interval.appId), interval.resources, Math.max(0, until - interval.since));
 	};
 
-	for (const event of [...events].filter((item) => item.at < end).sort((a, b) => a.at.getTime() - b.at.getTime())) {
+	for (const event of [...events].filter((item) => item.at.getTime() < accountingEnd).sort((a, b) => a.at.getTime() - b.at.getTime())) {
 		const key = `${event.appId}:${event.replicaId}`;
 		const at = Math.max(start.getTime(), event.at.getTime());
 		if (event.type === 'STARTED') {
@@ -59,7 +61,7 @@ export function aggregateWorkspaceDay(
 			running.delete(key);
 		}
 	}
-	for (const key of running.keys()) integrate(key, end.getTime());
+	for (const key of running.keys()) integrate(key, accountingEnd);
 
 	const removedAt = new Map<string, number>();
 	for (const event of events) {
@@ -70,7 +72,7 @@ export function aggregateWorkspaceDay(
 	}
 	for (const app of apps) {
 		const storageStart = Math.max(start.getTime(), app.createdAt.getTime());
-		const storageEnd = Math.min(end.getTime(), removedAt.get(app.appId) ?? end.getTime());
+		const storageEnd = Math.min(accountingEnd, removedAt.get(app.appId) ?? accountingEnd);
 		if (storageEnd > storageStart && app.storageBytes > 0) {
 			appUsage(app.appId).storageGbDay += (app.storageBytes / GIB) * ((storageEnd - storageStart) / DAY_MS);
 		}
@@ -91,7 +93,7 @@ export function aggregateWorkspaceDay(
 export class UsageAggregator {
 	constructor(private readonly repositories: MasterRepositories) {}
 
-	async rollup(date: Date): Promise<{ workspaces: number }> {
+	async rollup(date: Date, asOf = new Date()): Promise<{ workspaces: number }> {
 		const start = utcDay(date);
 		const end = new Date(start.getTime() + DAY_MS);
 		const [events, apps] = await Promise.all([
@@ -105,6 +107,7 @@ export class UsageAggregator {
 				start,
 				events.filter((event) => event.workspaceId === workspaceId),
 				apps.filter((app) => app.workspaceId === workspaceId),
+				asOf,
 			);
 			await this.repositories.usageDaily.updateOne(
 				{ workspaceId, date: start },

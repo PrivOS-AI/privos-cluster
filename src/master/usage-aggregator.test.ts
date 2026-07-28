@@ -64,3 +64,16 @@ test('HA bills each replica compute while counting shared stateless storage once
 	assert.equal(usage.cpuHours, 24);
 	assert.equal(usage.storageGbDay, 2);
 });
+
+test('an in-progress UTC day is metered only through the rollup timestamp', () => {
+	const usage = aggregateWorkspaceDay(
+		'ws-1',
+		day,
+		[event('replica-1', 'STARTED', atHour(20))],
+		[app({ createdAt: atHour(20) })],
+		atHour(21),
+	);
+	assert.equal(usage.ramGbHours, 0.5);
+	assert.equal(usage.cpuHours, 0.5);
+	assert.equal(usage.storageGbDay, 2 / 24);
+});
