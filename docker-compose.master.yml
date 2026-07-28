@@ -8,4 +8,12 @@ services:
     env_file: .env.master
     ports:
       - "${MASTER_MESH_BIND}:4200:4200"
+    healthcheck:
+      # Alpine resolves localhost to ::1 first while the master intentionally
+      # binds IPv4 only; use the explicit loopback address.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:4200/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
     restart: unless-stopped
