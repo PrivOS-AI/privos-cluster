@@ -2,6 +2,16 @@ import Docker from 'dockerode';
 import { config } from '../config.js';
 import { getAppNetworkName } from '../services/settings-service.js';
 
+/**
+ * Docker rejects network.connect for containers that share the host or another
+ * container's network namespace. The production fleet agent intentionally uses
+ * host networking so its loopback native proxy can reach every workspace bridge
+ * by container IP; attaching that agent is both unnecessary and invalid.
+ */
+export function canAttachAgentToWorkspaceNetwork(networkMode: string | undefined): boolean {
+    return networkMode !== 'host' && !networkMode?.startsWith('container:');
+}
+
 export class NetworkManager {
     constructor(private docker: Docker) {}
 
@@ -21,6 +31,9 @@ export class NetworkManager {
         }
 
         if (!config.FLEET_MODE) return;
+        const agentInfo = await this.docker.getContainer(config.FLEET_AGENT_CONTAINER).inspect();
+        if (!canAttachAgentToWorkspaceNetwork(agentInfo.HostConfig?.NetworkMode)) return;
+
         const network = this.docker.getNetwork(networkName);
         const info = await network.inspect();
         const connected = Object.values(info.Containers ?? {}).some(
