@@ -5,6 +5,8 @@ import type { WorkspaceClusterService } from './workspace-cluster-service.js';
 import type { NodeRegistry } from './node-registry.js';
 import type { MasterRepositories } from './repositories.js';
 import type { AppLifecycleService } from './app-lifecycle-service.js';
+import type { UsageAggregator } from './usage-aggregator.js';
+import { utcDay } from './usage-aggregator.js';
 
 const QuotaSchema = z.object({
 	maxMemoryMb: z.number().int().positive(),
@@ -40,6 +42,7 @@ export function portalAdminRoutes(deps: {
 	nodes: NodeRegistry;
 	repositories: MasterRepositories;
 	lifecycle: AppLifecycleService;
+	usage: UsageAggregator;
 }): FastifyPluginAsync {
 	return async (fastify) => {
 		const authenticate = async (req: FastifyRequest, reply: FastifyReply) => {
@@ -95,6 +98,22 @@ export function portalAdminRoutes(deps: {
 			await deps.workspaces.revoke(workspaceId);
 			req.log.info({ workspaceId }, 'apps master workspace revoked');
 			return { ok: true };
+		});
+		fastify.get(`${root}/apps`, { preHandler: authenticate }, async () =>
+			deps.repositories.apps.find({}, { projection: { envVars: 0 } }).toArray());
+		fastify.post(`${root}/usage/rollup`, { preHandler: authenticate }, async (req) => {
+			const { date } = z.object({ date: z.string().date() }).parse(req.body);
+			return deps.usage.rollup(utcDay(date));
+		});
+		fastify.get(`${root}/usage`, { preHandler: authenticate }, async (req) => {
+			const query = z.object({
+				date: z.string().date(),
+				workspaceId: z.string().optional(),
+			}).parse(req.query);
+			return deps.repositories.usageDaily.find({
+				date: utcDay(query.date),
+				...(query.workspaceId ? { workspaceId: query.workspaceId } : {}),
+			}).toArray();
 		});
 		fastify.post(`${root}/nodes`, { preHandler: authenticate }, async (req, reply) => {
 			const input = NodeSchema.parse(req.body);

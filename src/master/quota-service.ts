@@ -38,4 +38,25 @@ export class QuotaService {
 			throw new QuotaError('CPU_QUOTA_EXCEEDED', 'workspace reserved CPU quota exceeded');
 		}
 	}
+
+	async assertAdditionalReplicaAllowed(workspaceId: string, resources: ContainerResources): Promise<void> {
+		const [workspace, apps] = await Promise.all([
+			this.repositories.workspaces.findOne({ workspaceId, status: 'ACTIVE' }),
+			this.repositories.apps.find({ workspaceId, state: 'RUNNING' }).toArray(),
+		]);
+		if (!workspace) throw new QuotaError('WORKSPACE_NOT_FOUND', 'workspace not found');
+		const used = apps.reduce(
+			(total, app) => ({
+				memoryMb: total.memoryMb + app.resources.memoryMb * app.replicas.length,
+				cpus: total.cpus + app.resources.cpus * app.replicas.length,
+			}),
+			{ memoryMb: 0, cpus: 0 },
+		);
+		if (used.memoryMb + resources.memoryMb > workspace.quota.maxMemoryMb) {
+			throw new QuotaError('MEMORY_QUOTA_EXCEEDED', 'workspace reserved memory quota exceeded');
+		}
+		if (used.cpus + resources.cpus > workspace.quota.maxCpus) {
+			throw new QuotaError('CPU_QUOTA_EXCEEDED', 'workspace reserved CPU quota exceeded');
+		}
+	}
 }

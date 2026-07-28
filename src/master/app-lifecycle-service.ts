@@ -59,6 +59,63 @@ export class AppLifecycleService {
 		return this.get(workspaceId, appId);
 	}
 
+	async redeploy(
+		workspaceId: string,
+		appId: string,
+		input: {
+			image?: string;
+			digest?: string;
+			versionDigest?: string;
+			resources?: { memoryMb?: number; cpus?: number; tmpSizeMb?: number };
+		},
+	): Promise<unknown> {
+		const app = await this.load(workspaceId, appId);
+		const nodes = await this.loadNodes(app.replicas.map((replica) => replica.nodeId));
+		const body = {
+			workspaceId,
+			image: input.image ?? app.image,
+			digest: input.digest ?? app.imageDigest,
+			versionDigest: input.versionDigest ?? app.versionDigest,
+			resources: input.resources ?? app.resources,
+			rolling: app.stateless,
+		};
+		const responses = await Promise.all(app.replicas.map((replica) =>
+			this.deps.agentClient.request(
+				nodes.get(replica.nodeId)!,
+				workspaceId,
+				'POST',
+				`/api/v1/apps/${replica.containerId}/redeploy`,
+				body,
+			),
+		));
+		this.assertResponses(responses);
+		const now = new Date();
+		await this.deps.repositories.apps.updateOne(
+			{ appId, workspaceId },
+			{
+				$set: {
+					image: body.image,
+					imageDigest: body.digest,
+					versionDigest: body.versionDigest,
+					resources: { ...app.resources, ...input.resources },
+					state: 'RUNNING',
+					updatedAt: now,
+					'replicas.$[].state': 'running',
+				},
+			},
+		);
+		await this.deps.repositories.lifecycleEvents.insertMany(app.replicas.map((replica) => ({
+			eventId: crypto.randomUUID(),
+			workspaceId,
+			appId,
+			replicaId: replica.replicaId,
+			type: 'REDEPLOYED' as const,
+			resources: { ...app.resources, ...input.resources },
+			at: now,
+		})));
+		return this.get(workspaceId, appId);
+	}
+
 	async proxy(
 		workspaceId: string,
 		appId: string,

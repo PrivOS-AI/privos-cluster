@@ -1,6 +1,7 @@
 import { MongoClient, type Collection, type Db } from 'mongodb';
 import type {
 	AppLifecycleEvent,
+	AppUsageDaily,
 	MasterApp,
 	MasterNode,
 	MasterWorkspace,
@@ -11,12 +12,14 @@ export class MasterRepositories {
 	readonly nodes: Collection<MasterNode>;
 	readonly apps: Collection<MasterApp>;
 	readonly lifecycleEvents: Collection<AppLifecycleEvent>;
+	readonly usageDaily: Collection<AppUsageDaily>;
 
 	constructor(readonly db: Db) {
 		this.workspaces = db.collection('apps_master_workspaces');
 		this.nodes = db.collection('apps_master_nodes');
 		this.apps = db.collection('apps_master_apps');
 		this.lifecycleEvents = db.collection('apps_master_lifecycle_events');
+		this.usageDaily = db.collection('apps_master_usage_daily');
 	}
 
 	async ensureIndexes(): Promise<void> {
@@ -28,6 +31,7 @@ export class MasterRepositories {
 			this.apps.createIndex({ subdomain: 1 }, { unique: true }),
 			this.lifecycleEvents.createIndex({ eventId: 1 }, { unique: true }),
 			this.lifecycleEvents.createIndex({ workspaceId: 1, at: 1 }),
+			this.usageDaily.createIndex({ workspaceId: 1, date: 1 }, { unique: true }),
 		]);
 	}
 }

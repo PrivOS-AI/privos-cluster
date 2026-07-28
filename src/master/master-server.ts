@@ -14,6 +14,7 @@ import { DeploymentService } from './deployment-service.js';
 import { AppLifecycleService } from './app-lifecycle-service.js';
 import { hubFacingRoutes } from './hub-facing-routes.js';
 import { portalAdminRoutes } from './portal-admin-routes.js';
+import { UsageAggregator } from './usage-aggregator.js';
 
 export function buildMasterServer(config: MasterConfig, repositories: MasterRepositories) {
 	const fastify = Fastify({ logger: { level: config.MASTER_LOG_LEVEL }, trustProxy: true });
@@ -26,6 +27,7 @@ export function buildMasterServer(config: MasterConfig, repositories: MasterRepo
 		baseDomain: config.APPS_BASE_DOMAIN,
 	});
 	const lifecycle = new AppLifecycleService({ repositories, agentClient, ingress });
+	const usage = new UsageAggregator(repositories);
 	const deployment = new DeploymentService({
 		repositories,
 		agentClient,
@@ -54,6 +56,7 @@ export function buildMasterServer(config: MasterConfig, repositories: MasterRepo
 		nodes: new NodeRegistry(repositories, cipher),
 		repositories,
 		lifecycle,
+		usage,
 	}));
 	fastify.setErrorHandler((error, req, reply) => {
 		req.log.error({ err: error }, 'apps master request failed');

@@ -48,8 +48,8 @@ export class DeploymentService {
 		return this.deps.locks.run(workspaceId, async () => {
 			if (input.appId) {
 				const existing = await this.deps.repositories.apps.findOne({
-					appId: input.appId,
 					workspaceId,
+					$or: [{ appId: input.appId }, { listingId: input.listingId }],
 					state: { $ne: 'REMOVED' },
 				});
 				if (existing) return existing;
@@ -91,6 +91,7 @@ export class DeploymentService {
 		nodes: MasterNode[],
 	): Promise<MasterApp> {
 		const appId = input.appId ?? crypto.randomUUID();
+		const storageBytes = (input.volumes[0]?.sizeMb ?? 0) * 1024 * 1024;
 		const subdomain = await this.deps.subdomains.allocate(input.listingId);
 		const replicas = [];
 		try {
@@ -139,6 +140,10 @@ export class DeploymentService {
 			image: input.image,
 			imageDigest: input.digest,
 			resources: input.resources,
+			port: input.port,
+			envVars: input.envVars,
+			volumes: input.volumes,
+			storageBytes,
 			availabilityTier: input.availabilityTier as AvailabilityTier,
 			stateless: input.stateless,
 			subdomain,
@@ -156,9 +161,118 @@ export class DeploymentService {
 			replicaId: replica.replicaId,
 			type: 'STARTED' as const,
 			resources: input.resources,
+			storageBytes,
 			at: now,
 		})));
 		return app;
+	}
+
+	async changeAvailabilityTier(workspaceId: string, appId: string, availabilityTier: AvailabilityTier): Promise<MasterApp> {
+		return this.deps.locks.run(workspaceId, async () => {
+			const app = await this.deps.repositories.apps.findOne({ workspaceId, appId, state: { $ne: 'REMOVED' } });
+			if (!app) {
+				const error: Error & { statusCode?: number } = new Error('app not found');
+				error.statusCode = 404;
+				throw error;
+			}
+			if (app.availabilityTier === availabilityTier) return app;
+			if (app.state !== 'RUNNING') {
+				const error: Error & { code?: string } = new Error('app must be running before changing availability tier');
+				error.code = 'APP_NOT_RUNNING';
+				throw error;
+			}
+			if (availabilityTier === 'ha') {
+				if (!app.stateless) {
+					const error: Error & { code?: string } = new Error('stateful apps cannot run in HA');
+					error.code = 'HA_REQUIRES_STATELESS_APP';
+					throw error;
+				}
+				await this.deps.quota.assertAdditionalReplicaAllowed(workspaceId, app.resources);
+				const [nodes, runningApps] = await Promise.all([
+					this.deps.repositories.nodes.find({ status: 'ACTIVE' }).toArray(),
+					this.deps.repositories.apps.find({ state: 'RUNNING' }).toArray(),
+				]);
+				const occupiedNodes = new Set(app.replicas.map((replica) => replica.nodeId));
+				const occupiedDomains = new Set(
+					nodes.filter((node) => occupiedNodes.has(node.nodeId)).map((node) => node.failureDomain),
+				);
+				const reservations: NodeReservation[] = runningApps.flatMap((candidate) =>
+					candidate.replicas.map((replica) => ({
+						nodeId: replica.nodeId,
+						memoryMb: candidate.resources.memoryMb,
+						cpus: candidate.resources.cpus,
+						diskBytes: 0,
+					})),
+				);
+				let node: MasterNode;
+				try {
+					[node] = selectNodes({
+						nodes: nodes.filter((candidate) => !occupiedNodes.has(candidate.nodeId) && !occupiedDomains.has(candidate.failureDomain)),
+						reservations,
+						resources: app.resources,
+						storageBytes: 0,
+						replicas: 1,
+					});
+				} catch {
+					const error: Error & { code?: string } = new Error('HA requires a second active app node in a distinct failure domain with capacity');
+					error.code = 'HA_CAPACITY_UNAVAILABLE';
+					throw error;
+				}
+				const response = await this.deps.agentClient.request(node, workspaceId, 'POST', '/api/v1/apps/deploy', {
+					appId,
+					listingId: app.listingId,
+					versionDigest: app.versionDigest,
+					image: app.image,
+					digest: app.imageDigest,
+					port: app.port ?? 3001,
+					resources: app.resources,
+					envVars: app.envVars ?? {},
+					volumes: [],
+					workspaceId,
+					subdomain: app.subdomain,
+					domain: this.deps.baseDomain,
+				});
+				if (response.status >= 300) throw new Error(`agent deploy failed: ${JSON.stringify(response.body)}`);
+				const container = response.body as { id: string; state: string };
+				const replica = { replicaId: crypto.randomUUID(), nodeId: node.nodeId, containerId: container.id, state: container.state };
+				const now = new Date();
+				await this.deps.ingress.upsert(app.subdomain, [
+					...nodes.filter((candidate) => occupiedNodes.has(candidate.nodeId)),
+					node,
+				]);
+				await this.deps.repositories.apps.updateOne(
+					{ workspaceId, appId },
+					{ $set: { availabilityTier: 'ha', updatedAt: now }, $push: { replicas: replica } },
+				);
+				await this.deps.repositories.lifecycleEvents.insertOne({
+					eventId: crypto.randomUUID(), workspaceId, appId, replicaId: replica.replicaId,
+					type: 'STARTED', resources: app.resources, at: now,
+				});
+			} else {
+				const [keep, ...remove] = app.replicas;
+				if (!keep) throw new Error('app has no replicas');
+				const nodes = await this.deps.repositories.nodes.find({ nodeId: { $in: app.replicas.map((replica) => replica.nodeId) } }).toArray();
+				for (const replica of remove) {
+					const node = nodes.find((candidate) => candidate.nodeId === replica.nodeId);
+					if (!node) throw new Error(`node not found: ${replica.nodeId}`);
+					const response = await this.deps.agentClient.request(node, workspaceId, 'DELETE', `/api/v1/apps/${replica.containerId}`);
+					if (response.status >= 300 && response.status !== 404) throw new Error(`agent remove failed: ${JSON.stringify(response.body)}`);
+				}
+				const now = new Date();
+				await this.deps.ingress.upsert(app.subdomain, nodes.filter((node) => node.nodeId === keep.nodeId));
+				await this.deps.repositories.apps.updateOne(
+					{ workspaceId, appId },
+					{ $set: { availabilityTier: 'single', replicas: [keep], updatedAt: now } },
+				);
+				if (remove.length) {
+					await this.deps.repositories.lifecycleEvents.insertMany(remove.map((replica) => ({
+						eventId: crypto.randomUUID(), workspaceId, appId, replicaId: replica.replicaId,
+						type: 'REMOVED' as const, resources: app.resources, at: now,
+					})));
+				}
+			}
+			return this.deps.repositories.apps.findOne({ workspaceId, appId }) as Promise<MasterApp>;
+		});
 	}
 }
 

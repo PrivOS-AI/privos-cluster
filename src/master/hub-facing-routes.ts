@@ -120,14 +120,22 @@ export function hubFacingRoutes(deps: {
 				reply,
 				await deps.lifecycle.proxy(workspaceId(req), appId(req), 'POST', '/dispatch', req.body),
 			));
-		fastify.post(`${root}/apps/:appId/redeploy`, { preHandler: authenticate }, async (req, reply) =>
-			sendAgent(
-				reply,
-				await deps.lifecycle.proxy(workspaceId(req), appId(req), 'POST', '/redeploy', {
-					...(req.body as object),
-					workspaceId: workspaceId(req),
-				}),
-			));
+		fastify.post(`${root}/apps/:appId/redeploy`, { preHandler: authenticate }, async (req) =>
+			deps.lifecycle.redeploy(workspaceId(req), appId(req), req.body as {
+				image?: string;
+				digest?: string;
+				versionDigest?: string;
+				resources?: { memoryMb?: number; cpus?: number; tmpSizeMb?: number };
+			}));
+		fastify.post(`${root}/apps/:appId/availability-tier`, { preHandler: authenticate }, async (req) => {
+			const availabilityTier = (req.body as { availabilityTier?: string })?.availabilityTier;
+			if (availabilityTier !== 'single' && availabilityTier !== 'ha') {
+				const error: Error & { statusCode?: number } = new Error('availabilityTier must be single or ha');
+				error.statusCode = 400;
+				throw error;
+			}
+			return deps.deployment.changeAvailabilityTier(workspaceId(req), appId(req), availabilityTier);
+		});
 		fastify.delete(`${root}/apps/:appId`, { preHandler: authenticate }, async (req) => {
 			await deps.lifecycle.remove(workspaceId(req), appId(req));
 			return { ok: true };

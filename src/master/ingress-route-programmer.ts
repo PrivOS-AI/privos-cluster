@@ -6,6 +6,12 @@ interface CloudflareEnvelope<T> {
 	errors?: Array<{ message: string }>;
 }
 
+export function resolveIngressTunnelId(nodes: MasterNode[], haTunnelId?: string): string | undefined {
+	if (haTunnelId) return haTunnelId;
+	const nodeTunnelIds = [...new Set(nodes.map((node) => node.tunnelId).filter((value): value is string => Boolean(value)))];
+	return nodeTunnelIds.length === 1 ? nodeTunnelIds[0] : undefined;
+}
+
 export class IngressRouteProgrammer {
 	constructor(private readonly options: {
 		enabled: boolean;
@@ -16,7 +22,7 @@ export class IngressRouteProgrammer {
 
 	async upsert(subdomain: string, nodes: MasterNode[], haTunnelId?: string): Promise<void> {
 		if (!this.options.enabled) return;
-		const tunnelId = haTunnelId ?? (nodes.length === 1 ? nodes[0]?.tunnelId : undefined);
+		const tunnelId = resolveIngressTunnelId(nodes, haTunnelId);
 		if (!tunnelId) {
 			const error: Error & { code?: string } = new Error(
 				nodes.length > 1

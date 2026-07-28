@@ -57,6 +57,10 @@ export interface MasterApp {
 	image: string;
 	imageDigest: string;
 	resources: ContainerResources;
+	port: number;
+	envVars: Record<string, string>;
+	volumes: Array<{ name: 'data'; mountPath: string; sizeMb?: number }>;
+	storageBytes: number;
 	availabilityTier: AvailabilityTier;
 	stateless: boolean;
 	subdomain: string;
@@ -76,5 +80,21 @@ export interface AppLifecycleEvent {
 	replicaId: string;
 	type: LifecycleEventType;
 	resources: ContainerResources;
+	storageBytes?: number;
 	at: Date;
+}
+
+export interface AppUsageDaily {
+	workspaceId: string;
+	date: Date;
+	ramGbHours: number;
+	cpuHours: number;
+	storageGbDay: number;
+	perApp: Array<{
+		appId: string;
+		ramGbHours: number;
+		cpuHours: number;
+		storageGbDay: number;
+	}>;
+	computedAt: Date;
 }

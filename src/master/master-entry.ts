@@ -4,6 +4,7 @@ import { buildMasterServer } from './master-server.js';
 import { KeyCipher } from './key-crypto.js';
 import { AgentClient } from './agent-client.js';
 import { ReconcileService } from './reconcile-service.js';
+import { UsageAggregator, utcDay } from './usage-aggregator.js';
 
 const config = loadMasterConfig();
 const { client, repositories } = await connectMasterRepositories(
@@ -20,9 +21,19 @@ const reconcile = new ReconcileService({
 });
 const reconcileResult = await reconcile.run();
 server.log.info(reconcileResult, 'apps master boot reconcile complete');
+const usage = new UsageAggregator(repositories);
+await Promise.all([
+	usage.rollup(utcDay(new Date(Date.now() - 86_400_000))),
+	usage.rollup(utcDay(new Date())),
+]);
+const usageTimer = setInterval(() => {
+	void usage.rollup(utcDay(new Date())).catch((error) => server.log.error({ err: error }, 'apps usage rollup failed'));
+}, 60 * 60 * 1000);
+usageTimer.unref();
 
 async function shutdown(signal: string): Promise<void> {
 	server.log.info({ signal }, 'apps master shutdown');
+	clearInterval(usageTimer);
 	await server.close();
 	await client.close();
 }
