@@ -1,8 +1,6 @@
 import crypto from 'node:crypto';
 import pino from 'pino';
 
-import { config } from '../config.js';
-
 export type ClusterMcpOutcome = 'allowed' | 'denied' | 'changed' | 'observed';
 export type ClusterMcpMetric = Readonly<{
 	event: string;
@@ -12,7 +10,13 @@ export type ClusterMcpMetric = Readonly<{
 	count: number;
 }>;
 
-const logger = pino({ level: config.LOG_LEVEL }).child({ component: 'mcp-security' });
+// This module is shared by the fleet agent and the independently configured
+// master. Reading the agent config here would make a master process validate
+// unrelated agent-only requirements during module import.
+const LOG_LEVELS = new Set(['fatal', 'error', 'warn', 'info', 'debug', 'trace']);
+const requestedLogLevel = process.env.LOG_LEVEL ?? 'info';
+const logger = pino({ level: LOG_LEVELS.has(requestedLogLevel) ? requestedLogLevel : 'info' })
+	.child({ component: 'mcp-security' });
 const counters = new Map<string, number>();
 const SAFE_CODE = /^[a-z][a-z0-9_]{0,63}$/;
 
