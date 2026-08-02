@@ -1,4 +1,6 @@
 import Docker from 'dockerode';
+
+import { resolveImmutableImageReference } from './image-reference.js';
 import { config } from '../config.js';
 import type { ContainerResources } from '../types/index.js';
 import { getAppNetworkName } from '../services/settings-service.js';
@@ -108,7 +110,7 @@ export class ContainerManager {
         digest?: string,
         onProgress?: (event: { status: string; progress?: string }) => void,
     ): Promise<void> {
-        const repoTag = digest ? `${image}@${digest}` : `${image}:${tag}`;
+        const repoTag = resolveImmutableImageReference(image, tag, digest);
 
         // Digest pulls always contact the registry. This prevents a locally retagged
         // image from satisfying a marketplace deploy.
@@ -156,7 +158,7 @@ export class ContainerManager {
         const portKey = `${cfg.port}/tcp`;
 
         const container = await this.docker.createContainer({
-            Image: cfg.digest ? `${cfg.image}@${cfg.digest}` : `${cfg.image}:${cfg.tag}`,
+            Image: resolveImmutableImageReference(cfg.image, cfg.tag, cfg.digest),
             name: containerName,
             Env: env,
             ExposedPorts: { [portKey]: {} },
