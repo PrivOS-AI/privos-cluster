@@ -25,6 +25,9 @@ const ConfigSchema = z.object({
 	FLEET_NODE_ID: z.string().regex(/^[A-Za-z0-9-]+$/).optional(),
 	FLEET_NODE_KEY: z.string().min(32, 'FLEET_NODE_KEY must be at least 32 chars').optional(),
 	FLEET_AGENT_CONTAINER: z.string().default('privos-cluster'),
+	FLEET_CLUSTER_ID: z.string().regex(/^[A-Za-z0-9-]+$/).default('privos-app-cluster'),
+	MCP_NODE_IDENTITY_KEY_PATH: z.string().startsWith('/').default('/var/lib/privos/node-identity.json'),
+	MCP_BROKER_ROOT: z.string().startsWith('/').default('/run/privos/mcp-broker'),
 
 	HEALTH_CHECK_INTERVAL_MS: z.coerce.number().int().positive().default(30_000),
 

@@ -77,6 +77,22 @@ function send502(res: http.ServerResponse): void {
 	res.end('502 Bad Gateway');
 }
 
+export function isPublicMcpPathBlocked(target: ResolvedTarget, rawUrl: string | undefined): boolean {
+	if (!target.mcpV2) return false;
+	let pathname: string;
+	try {
+		pathname = new URL(rawUrl || '/', 'http://privos-app.invalid').pathname;
+	} catch {
+		return true;
+	}
+	return /^(?:\/mcp(?:\/|$)|\/bootstrap(?:\/|$)|\/identity(?:\/|$)|\/\.well-known\/privos\/(?:bootstrap|identity)(?:\/|$)|\/api\/v1\/mcp-workload(?:\/|$))/i.test(pathname);
+}
+
+function send404(res: http.ServerResponse): void {
+	res.writeHead(404, { 'content-type': 'text/plain', 'cache-control': 'no-store' });
+	res.end('404 Not Found');
+}
+
 async function handleRequest(r: Router, req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
 	let target: ResolvedTarget | null;
 	try {
@@ -86,6 +102,7 @@ async function handleRequest(r: Router, req: http.IncomingMessage, res: http.Ser
 		return send502(res);
 	}
 	if (!target) return send502(res);
+	if (isPublicMcpPathBlocked(target, req.url)) return send404(res);
 
 	const method = req.method ?? 'GET';
 	const hasBody = method !== 'GET' && method !== 'HEAD';
@@ -122,7 +139,7 @@ function handleUpgrade(r: Router, req: http.IncomingMessage, clientSocket: net.S
 	void r
 		.resolve(req.headers.host)
 		.then((target) => {
-			if (!target) {
+			if (!target || isPublicMcpPathBlocked(target, req.url)) {
 				clientSocket.destroy();
 				return;
 			}

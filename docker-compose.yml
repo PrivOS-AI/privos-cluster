@@ -14,11 +14,12 @@ services:
       - PORT=4000
       - HOST=0.0.0.0
     env_file: .env
-    # Stateless agent — no local database, so no data volume. The only mount is
-    # the Docker socket it manages containers through. All state lives in Docker
-    # (container labels) and in privos-hub.
+    # The fleet agent keeps only its node signing identity on durable host
+    # storage. Per-replica Unix sockets are runtime-only and live below /run.
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      - /var/lib/privos:/var/lib/privos
+      - /run/privos/mcp-broker:/run/privos/mcp-broker
     networks:
       - default
       - mcp-apps-network

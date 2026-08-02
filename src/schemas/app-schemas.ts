@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import type { JsonWebKey } from 'node:crypto';
 import { config } from '../config.js';
 import { SubdomainLabelSchema } from './settings-schemas.js';
 
@@ -14,7 +15,7 @@ export const VolumeSchema = z.object({
     sizeMb: z.number().int().min(1).max(10240).optional(),
 });
 
-export const DeployRequestSchema = z.object({
+const DeployRequestObject = z.object({
     appId: z.string().optional(),
     workspaceId: z.string().regex(/^[A-Za-z0-9-]+$/).optional(),
     listingId: z.string().min(1).max(128).optional(),
@@ -28,7 +29,9 @@ export const DeployRequestSchema = z.object({
     volumes: z.array(VolumeSchema).max(10).optional(),
     subdomain: SubdomainLabelSchema.nullable().optional(),
     domain: z.string().trim().max(253).nullable().optional(), // base domain to publish under
-}).superRefine((value, ctx) => {
+});
+
+function validateDeployRequest(value: z.infer<typeof DeployRequestObject>, ctx: z.RefinementCtx): void {
     const requiresDigest = config.FLEET_MODE || value.image.split('/').includes('marketplace');
     if (requiresDigest && !value.digest) {
         ctx.addIssue({
@@ -57,7 +60,56 @@ export const DeployRequestSchema = z.object({
             });
         }
     }
-});
+}
+
+export const DeployRequestSchema = DeployRequestObject.superRefine(validateDeployRequest);
+
+const PublicP256JwkSchema = z.object({
+	kty: z.literal('EC'),
+	crv: z.literal('P-256'),
+	x: z.string().min(1),
+	y: z.string().min(1),
+	kid: z.string().optional(),
+	use: z.string().optional(),
+	key_ops: z.array(z.string()).optional(),
+	alg: z.string().optional(),
+}).strict().transform((value) => value as JsonWebKey);
+
+export const McpRuntimeBindingSchema = z.object({
+	clusterId: z.string().regex(/^[A-Za-z0-9-]+$/),
+	nodeId: z.string().regex(/^[A-Za-z0-9-]+$/),
+	workspaceId: z.string().regex(/^[A-Za-z0-9-]+$/),
+	installationId: z.string().min(1).max(128),
+	mcpAppId: z.string().min(1).max(128),
+	replicaId: z.string().uuid(),
+	imageDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+	manifestDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+	receiptHash: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+	grantEpoch: z.number().int().positive(),
+	deploymentGrantHash: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+	hubOrigin: z.string().url().refine((value) => new URL(value).protocol === 'https:', 'hubOrigin must use HTTPS'),
+	hubKid: z.string().min(20).max(128),
+	hubPublicJwk: PublicP256JwkSchema,
+}).strict();
+
+export const McpDeployRequestSchema = DeployRequestObject.extend({ mcpBinding: McpRuntimeBindingSchema }).superRefine((value, ctx) => {
+		validateDeployRequest(value, ctx);
+		for (const key of Object.keys(value.envVars ?? {})) {
+			if (key.toUpperCase().startsWith('PRIVOS_')) {
+				ctx.addIssue({
+					code: z.ZodIssueCode.custom,
+					path: ['envVars', key],
+					message: 'PRIVOS_* environment names are reserved for the platform',
+				});
+			}
+		}
+		if (value.workspaceId !== value.mcpBinding.workspaceId) {
+			ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['workspaceId'], message: 'workspace binding mismatch' });
+		}
+		if (value.digest !== value.mcpBinding.imageDigest) {
+			ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['digest'], message: 'image digest binding mismatch' });
+		}
+	});
 
 export const RedeployRequestSchema = z.object({
     workspaceId: z.string().regex(/^[A-Za-z0-9-]+$/).optional(),
@@ -116,3 +168,8 @@ export const DispatchBodySchema = z.object({
     params: z.unknown().optional(),
     id: z.union([z.string(), z.number()]).optional(),
 });
+
+export const McpDispatchBodySchema = z.object({
+	assertion: z.string().min(1),
+	rpc: DispatchBodySchema,
+}).strict();

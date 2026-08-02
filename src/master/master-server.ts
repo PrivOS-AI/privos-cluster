@@ -1,4 +1,5 @@
 import Fastify from 'fastify';
+import type { JsonWebKey } from 'node:crypto';
 import type { MasterConfig } from './config.js';
 import type { MasterRepositories } from './repositories.js';
 import { KeyCipher } from './key-crypto.js';
@@ -15,6 +16,7 @@ import { AppLifecycleService } from './app-lifecycle-service.js';
 import { hubFacingRoutes } from './hub-facing-routes.js';
 import { portalAdminRoutes } from './portal-admin-routes.js';
 import { UsageAggregator } from './usage-aggregator.js';
+import { McpSecurityVerifier } from './mcp-security.js';
 
 export function buildMasterServer(config: MasterConfig, repositories: MasterRepositories) {
 	const fastify = Fastify({ logger: { level: config.MASTER_LOG_LEVEL }, trustProxy: true });
@@ -37,6 +39,9 @@ export function buildMasterServer(config: MasterConfig, repositories: MasterRepo
 		locks: new WorkspaceLock(),
 		baseDomain: config.APPS_BASE_DOMAIN,
 	});
+	const mcpSecurity = config.APP_CLUSTER_MCP_INSTALL_V2 === 'on'
+		? new McpSecurityVerifier(repositories, config.APP_MASTER_CLUSTER_ID)
+		: undefined;
 	fastify.get('/health', async () => ({
 		status: 'ok',
 		service: 'privos-apps-master',
@@ -49,6 +54,8 @@ export function buildMasterServer(config: MasterConfig, repositories: MasterRepo
 		repositories,
 		agentClient,
 		baseDomain: config.APPS_BASE_DOMAIN,
+		mcpSecurity,
+		mcpReleaseAuthorityJwks: (JSON.parse(config.MCP_RELEASE_AUTHORITY_JWKS_JSON) as { keys: JsonWebKey[] }).keys,
 	}));
 	fastify.register(portalAdminRoutes({
 		serviceKey: config.APP_MASTER_SERVICE_KEY,

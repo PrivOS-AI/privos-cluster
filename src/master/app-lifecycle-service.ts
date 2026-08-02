@@ -70,6 +70,14 @@ export class AppLifecycleService {
 		},
 	): Promise<unknown> {
 		const app = await this.load(workspaceId, appId);
+		if (app.kind === 'mcp-v2') {
+			const error: Error & { code?: string; statusCode?: number } = new Error(
+				'MCP redeployments require a new signed deployment grant',
+			);
+			error.code = 'MCP_SIGNED_REDEPLOYMENT_REQUIRED';
+			error.statusCode = 409;
+			throw error;
+		}
 		const nodes = await this.loadNodes(app.replicas.map((replica) => replica.nodeId));
 		const body = {
 			workspaceId,

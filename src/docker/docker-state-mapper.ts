@@ -183,5 +183,6 @@ export function mapInspectToContainer(info: Docker.ContainerInspectInfo, health:
 		subdomain: labelOrNull(labels, 'privos.subdomain'),
 		domain: labelOrNull(labels, 'privos.domain'),
 		healthPolicy: parseHealthPolicy(labels),
+		mcpV2: labels['privos.mcp.schema'] === '2',
 	};
 }

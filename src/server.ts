@@ -22,7 +22,9 @@ import terminalHandler from './handlers/terminal.js';
 import clusterHandler from './handlers/cluster.js';
 import authRoutesHandler from './handlers/auth.js';
 import usageHandler from './handlers/usage.js';
+import mcpHandler from './handlers/mcp.js';
 import { areOperatorRoutesEnabled } from './services/settings-service.js';
+import { mcpBrokerManager, rebindMcpBrokers } from './services/mcp-broker.js';
 
 const fastify = Fastify({
 	logger: {
@@ -51,6 +53,8 @@ async function main(): Promise<void> {
 		//    (containers, labels, images) is the only source of truth; there is
 		//    no local database to initialize or reconcile.
 		await networkManager.ensureNetwork();
+		const brokerRebind = await rebindMcpBrokers();
+		fastify.log.info(brokerRebind, 'MCP identity brokers rebound');
 		if (!config.FLEET_MODE) {
 			fastify.log.info({ network: config.DOCKER_NETWORK }, 'docker network ready');
 		}
@@ -88,6 +92,7 @@ async function main(): Promise<void> {
 		await fastify.register(clusterHandler);
 		await fastify.register(logsHandler);
 		await fastify.register(usageHandler);
+		await fastify.register(mcpHandler);
 		if (areOperatorRoutesEnabled()) {
 			await fastify.register(filesHandler);
 			await fastify.register(terminalHandler);
@@ -116,6 +121,7 @@ async function shutdown(signal: string): Promise<void> {
 	fastify.log.info({ signal }, 'shutdown initiated');
 	try {
 		stopHealthMonitor();
+		await mcpBrokerManager.closeAll();
 		await stopReverseProxy();
 		await fastify.close();
 		fastify.log.info('shutdown complete');

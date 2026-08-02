@@ -26,6 +26,8 @@ export interface ResolvedTarget {
 	url: string;
 	/** The cluster container id this host resolved to (for logging/metrics). */
 	containerId: string;
+	/** Public proxy must block MCP/bootstrap/identity surfaces for v2 workloads. */
+	mcpV2: boolean;
 }
 
 const DEFAULT_TTL_MS = 5_000;
@@ -113,7 +115,7 @@ export function createRouter(deps: RouterDeps): Router {
 		const url = targetForContainer(container, ip);
 		if (!url) return null;
 
-		const target: ResolvedTarget = { url, containerId: container.id };
+		const target: ResolvedTarget = { url, containerId: container.id, mcpV2: container.mcpV2 === true };
 		cache.set(key, { target, expires: now() + ttl });
 		return target;
 	}

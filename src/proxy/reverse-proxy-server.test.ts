@@ -4,7 +4,7 @@ import http from 'node:http';
 import net from 'node:net';
 import { once } from 'node:events';
 
-import { createProxyServer } from './reverse-proxy-server.js';
+import { createProxyServer, isPublicMcpPathBlocked } from './reverse-proxy-server.js';
 import type { Router, ResolvedTarget } from './proxy-router.js';
 
 async function listen(server: http.Server): Promise<number> {
@@ -17,13 +17,22 @@ function fixedRouter(target: ResolvedTarget | null): Router {
 	return { resolve: async () => target, refreshRoutes() {} };
 }
 
+test('v2 public ingress blocks MCP, bootstrap, and identity paths while retaining UI', () => {
+	const target = { url: 'http://127.0.0.1:3001', containerId: 'mcp-1', mcpV2: true };
+	for (const path of ['/mcp', '/mcp/tools', '/bootstrap', '/identity', '/.well-known/privos/identity', '/api/v1/mcp-workload/token']) {
+		assert.equal(isPublicMcpPathBlocked(target, path), true, path);
+	}
+	assert.equal(isPublicMcpPathBlocked(target, '/ui'), false);
+	assert.equal(isPublicMcpPathBlocked({ ...target, mcpV2: false }, '/mcp'), false);
+});
+
 test('proxy streams an HTTP response and injects X-Forwarded-Proto=https', async () => {
 	const upstream = http.createServer((req, res) => {
 		res.writeHead(200, { 'content-type': 'text/plain' });
 		res.end(`ok proto=${req.headers['x-forwarded-proto']} path=${req.url}`);
 	});
 	const uport = await listen(upstream);
-	const proxy = createProxyServer(fixedRouter({ url: `http://127.0.0.1:${uport}`, containerId: 'c' }));
+	const proxy = createProxyServer(fixedRouter({ url: `http://127.0.0.1:${uport}`, containerId: 'c', mcpV2: false }));
 	const pport = await listen(proxy);
 
 	const res = await fetch(`http://127.0.0.1:${pport}/hello?x=1`);
@@ -51,7 +60,7 @@ test('proxy passes a websocket upgrade through bidirectionally', async () => {
 		socket.on('data', (d) => socket.write(d)); // echo
 	});
 	const uport = await listen(upstream);
-	const proxy = createProxyServer(fixedRouter({ url: `http://127.0.0.1:${uport}`, containerId: 'c' }));
+	const proxy = createProxyServer(fixedRouter({ url: `http://127.0.0.1:${uport}`, containerId: 'c', mcpV2: false }));
 	const pport = await listen(proxy);
 
 	const client = net.connect(pport, '127.0.0.1');

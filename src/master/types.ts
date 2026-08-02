@@ -1,4 +1,5 @@
 import type { ContainerResources } from '../types/index.js';
+import type { JsonWebKey } from 'node:crypto';
 
 export type AvailabilityTier = 'single' | 'ha';
 export type NodeStatus = 'ACTIVE' | 'DRAINING' | 'RETIRED';
@@ -13,6 +14,9 @@ export interface MasterWorkspace {
 	workspaceId: string;
 	keyHash: string;
 	encryptedKey: string;
+	mcpHubIdentityKid?: string;
+	mcpHubIdentityPublicJwk?: JsonWebKey;
+	mcpHubIdentityEnrolledAt?: Date;
 	quota: WorkspaceQuota;
 	defaultAvailabilityTier: AvailabilityTier;
 	status: 'ACTIVE' | 'REVOKED';
@@ -40,6 +44,8 @@ export interface MasterNode {
 	lastHealth?: Date;
 	createdAt: Date;
 	updatedAt: Date;
+	mcpIdentityKid?: string;
+	mcpIdentityPublicJwk?: JsonWebKey;
 }
 
 export interface AppReplica {
@@ -47,6 +53,7 @@ export interface AppReplica {
 	nodeId: string;
 	containerId: string;
 	state: string;
+	mcpNodeIdentity?: { kid: string; publicJwk: JsonWebKey };
 }
 
 export interface MasterApp {
@@ -69,6 +76,21 @@ export interface MasterApp {
 	state: string;
 	createdAt: Date;
 	updatedAt: Date;
+	kind?: 'raw' | 'mcp-v2';
+	mcpInstallationId?: string;
+	mcpAppId?: string;
+	manifestDigest?: string;
+	receiptHash?: string;
+	grantEpoch?: number;
+}
+
+export interface McpArtifactUse {
+	_id: string;
+	kind: 'deployment-grant' | 'dispatch-assertion';
+	workspaceId: string;
+	installationId: string;
+	expiresAt: Date;
+	createdAt: Date;
 }
 
 export type LifecycleEventType = 'STARTED' | 'STOPPED' | 'REDEPLOYED' | 'REMOVED';

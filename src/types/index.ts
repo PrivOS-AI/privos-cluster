@@ -1,3 +1,5 @@
+import type { JsonWebKey } from 'node:crypto';
+
 export type ContainerState = 'created' | 'running' | 'stopped' | 'error';
 export type HealthStatus = 'healthy' | 'unhealthy' | 'unknown';
 
@@ -60,6 +62,7 @@ export interface Container {
 	subdomain?: string | null; // DNS label routed to this container via Caddy
 	domain?: string | null;    // base domain the subdomain is published under
 	healthPolicy?: HealthPolicy; // self-restart policy read from labels (in-memory health monitor)
+	mcpV2?: boolean; // v2 workloads expose UI only; MCP/bootstrap/identity stay private
 }
 
 export interface Setting<T = unknown> {
@@ -99,6 +102,24 @@ export interface DeployRequest {
 	volumes?: ContainerVolume[];
 	subdomain?: string | null;
 	domain?: string | null;
+	mcpBinding?: McpRuntimeBinding;
+}
+
+export interface McpRuntimeBinding {
+	clusterId: string;
+	nodeId: string;
+	workspaceId: string;
+	installationId: string;
+	mcpAppId: string;
+	replicaId: string;
+	imageDigest: string;
+	manifestDigest: string;
+	receiptHash: string;
+	grantEpoch: number;
+	deploymentGrantHash: string;
+	hubOrigin: string;
+	hubKid: string;
+	hubPublicJwk: JsonWebKey;
 }
 
 export interface RedeployRequest {

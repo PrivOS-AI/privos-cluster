@@ -5,6 +5,7 @@ import type {
 	MasterApp,
 	MasterNode,
 	MasterWorkspace,
+	McpArtifactUse,
 } from './types.js';
 
 export class MasterRepositories {
@@ -13,6 +14,7 @@ export class MasterRepositories {
 	readonly apps: Collection<MasterApp>;
 	readonly lifecycleEvents: Collection<AppLifecycleEvent>;
 	readonly usageDaily: Collection<AppUsageDaily>;
+	readonly mcpArtifactUses: Collection<McpArtifactUse>;
 
 	constructor(readonly db: Db) {
 		this.workspaces = db.collection('apps_master_workspaces');
@@ -20,6 +22,7 @@ export class MasterRepositories {
 		this.apps = db.collection('apps_master_apps');
 		this.lifecycleEvents = db.collection('apps_master_lifecycle_events');
 		this.usageDaily = db.collection('apps_master_usage_daily');
+		this.mcpArtifactUses = db.collection('apps_master_mcp_artifact_uses');
 	}
 
 	async ensureIndexes(): Promise<void> {
@@ -32,6 +35,8 @@ export class MasterRepositories {
 			this.lifecycleEvents.createIndex({ eventId: 1 }, { unique: true }),
 			this.lifecycleEvents.createIndex({ workspaceId: 1, at: 1 }),
 			this.usageDaily.createIndex({ workspaceId: 1, date: 1 }, { unique: true }),
+			this.mcpArtifactUses.createIndex({ _id: 1 }, { unique: true }),
+			this.mcpArtifactUses.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
 		]);
 	}
 }

@@ -80,6 +80,16 @@ test('mapInspectToContainer maps labels + inspect to the Container view', () => 
 	assert.equal(c.stoppedAt, null);
 	assert.deepEqual(c.volumes, [{ name: 'data', mountPath: '/app/data' }]);
 	assert.deepEqual(c.healthPolicy, { path: '/health', maxFails: 3, restart: true });
+	assert.equal(c.mcpV2, false);
+});
+
+test('mapInspectToContainer marks v2 MCP workloads for public-ingress filtering', () => {
+	const base = inspect();
+	const c = mapInspectToContainer({
+		...base,
+		Config: { ...base.Config, Labels: { ...base.Config.Labels, 'privos.mcp.schema': '2' } },
+	});
+	assert.equal(c.mcpV2, true);
 });
 
 test('healthPolicy falls back to HEALTH_DEFAULTS when labels are missing, and honors restart=false', () => {
@@ -211,4 +221,41 @@ test('buildContainerLabels without subdomain emits no caddy/public-host and empt
 	assert.equal(labels['privos.public-host'], undefined);
 	assert.equal(labels['privos.subdomain'], '');
 	assert.equal(labels['privos.app-id'], '');
+});
+
+test('v2 MCP labels never create an unfiltered legacy Caddy ingress', () => {
+	const labels = buildContainerLabels({
+		id: 'cid',
+		appId: 'app1',
+		image: 'registry.example/app',
+		tag: 'latest',
+		digest: `sha256:${'a'.repeat(64)}`,
+		workspaceId: 'workspace-1',
+		listingId: 'listing-1',
+		versionDigest: `sha256:${'b'.repeat(64)}`,
+		port: 3001,
+		resources: { memoryMb: 256, cpus: 0.5, tmpSizeMb: 64 },
+		subdomain: 'secure-app',
+		baseDomain: 'apps.example.com',
+		mcpBinding: {
+			clusterId: 'cluster-1',
+			nodeId: 'node-1',
+			workspaceId: 'workspace-1',
+			installationId: 'installation-1',
+			mcpAppId: 'mcp-app-1',
+			replicaId: '11111111-1111-4111-8111-111111111111',
+			imageDigest: `sha256:${'a'.repeat(64)}`,
+			manifestDigest: `sha256:${'c'.repeat(64)}`,
+			receiptHash: `sha256:${'d'.repeat(64)}`,
+			grantEpoch: 1,
+			deploymentGrantHash: `sha256:${'e'.repeat(64)}`,
+			hubOrigin: 'https://hub.example.com',
+			hubKid: 'hub-kid',
+			hubPublicJwk: { kty: 'EC', crv: 'P-256', x: 'x', y: 'y' },
+		},
+	});
+	assert.equal(labels['privos.mcp.schema'], '2');
+	assert.equal(labels.caddy, undefined);
+	assert.equal(labels['caddy.reverse_proxy'], undefined);
+	assert.equal(labels['privos.public-host'], undefined);
 });

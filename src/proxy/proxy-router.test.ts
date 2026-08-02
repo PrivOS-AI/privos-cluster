@@ -49,7 +49,7 @@ test('router resolves a running host to its container IP', async () => {
 		getContainerIp: async () => '172.18.0.5',
 		getDomains: () => DOMAINS,
 	});
-	assert.deepEqual(await router.resolve('whoami.privos.link'), { url: 'http://172.18.0.5:3001', containerId: 'c1' });
+	assert.deepEqual(await router.resolve('whoami.privos.link'), { url: 'http://172.18.0.5:3001', containerId: 'c1', mcpV2: false });
 });
 
 test('router returns null for foreign host, missing container, and non-running (health gate)', async () => {
@@ -68,7 +68,7 @@ test('router falls back to host port when the container IP is unavailable', asyn
 		getContainerIp: async () => { throw new Error('no network'); },
 		getDomains: () => DOMAINS,
 	});
-	assert.deepEqual(await router.resolve('whoami.privos.link'), { url: 'http://localhost:49155', containerId: 'c1' });
+	assert.deepEqual(await router.resolve('whoami.privos.link'), { url: 'http://localhost:49155', containerId: 'c1', mcpV2: false });
 });
 
 test('router caches within TTL and refreshRoutes invalidates', async () => {

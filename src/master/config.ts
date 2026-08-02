@@ -1,5 +1,4 @@
 import { z } from 'zod';
-
 const MasterConfigSchema = z.object({
 	MASTER_PORT: z.coerce.number().int().positive().default(4200),
 	MASTER_HOST: z.string().default('127.0.0.1'),
@@ -15,6 +14,9 @@ const MasterConfigSchema = z.object({
 		.transform((value) => value === 'true' || value === '1'),
 	CF_APPS_ZONE_ID: z.string().optional(),
 	CF_APPS_API_TOKEN: z.string().optional(),
+	APP_MASTER_CLUSTER_ID: z.string().regex(/^[A-Za-z0-9-]+$/).default('privos-app-cluster'),
+	APP_CLUSTER_MCP_INSTALL_V2: z.enum(['on', 'off']).default('off'),
+	MCP_RELEASE_AUTHORITY_JWKS_JSON: z.string().default('{"keys":[]}'),
 }).superRefine((config, ctx) => {
 	let key: Buffer | null = null;
 	try {
@@ -35,6 +37,18 @@ const MasterConfigSchema = z.object({
 			path: ['CF_APPS_API_TOKEN'],
 			message: 'ingress requires CF_APPS_ZONE_ID and CF_APPS_API_TOKEN',
 		});
+	}
+	if (config.APP_CLUSTER_MCP_INSTALL_V2 === 'on') {
+		try {
+			const trust = JSON.parse(config.MCP_RELEASE_AUTHORITY_JWKS_JSON) as { keys?: Array<Record<string, unknown>> };
+			if (!Array.isArray(trust.keys) || trust.keys.length < 1 || trust.keys.some((key) => key.d)) throw new Error('invalid trust set');
+		} catch {
+			ctx.addIssue({
+				code: z.ZodIssueCode.custom,
+				path: ['MCP_RELEASE_AUTHORITY_JWKS_JSON'],
+				message: 'MCP v2 requires a non-empty public-only release authority JWKS',
+			});
+		}
 	}
 });
 

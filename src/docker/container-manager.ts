@@ -3,6 +3,7 @@ import Docker from 'dockerode';
 import { resolveImmutableImageReference } from './image-reference.js';
 import { config } from '../config.js';
 import type { ContainerResources } from '../types/index.js';
+import type { McpRuntimeBinding } from '../types/index.js';
 import { getAppNetworkName } from '../services/settings-service.js';
 
 export interface CreateContainerConfig {
@@ -23,6 +24,8 @@ export interface CreateContainerConfig {
     baseDomain?: string | null;    // e.g. 'apps.example.com' — combined with subdomain for Caddy
     createdBy?: string | null;     // JWT sub of the deployer
     createdAt?: number;            // epoch ms (defaults to now)
+    mcpBinding?: McpRuntimeBinding;
+    brokerMount?: { source: string; target: string };
 }
 
 // Default health policy encoded into labels so the (in-memory) health monitor can
@@ -58,6 +61,7 @@ export function buildContainerLabels(cfg: {
     baseDomain?: string | null;
     createdBy?: string | null;
     createdAt?: number;
+	mcpBinding?: McpRuntimeBinding;
 }): Record<string, string> {
     const labels: Record<string, string> = {
         // Legacy discovery labels (kept for backward compat with existing tooling).
@@ -88,7 +92,28 @@ export function buildContainerLabels(cfg: {
         'privos.health.max-fails': String(HEALTH_DEFAULTS.maxFails),
         'privos.health.restart': String(HEALTH_DEFAULTS.restart),
     };
-    if (cfg.subdomain && cfg.baseDomain) {
+	if (cfg.mcpBinding) {
+		Object.assign(labels, {
+			'privos.mcp.schema': '2',
+			'privos.mcp.cluster': cfg.mcpBinding.clusterId,
+			'privos.mcp.node': cfg.mcpBinding.nodeId,
+			'privos.mcp.installation': cfg.mcpBinding.installationId,
+			'privos.mcp.app': cfg.mcpBinding.mcpAppId,
+			'privos.mcp.replica': cfg.mcpBinding.replicaId,
+			'privos.mcp.image.digest': cfg.mcpBinding.imageDigest,
+			'privos.mcp.manifest.digest': cfg.mcpBinding.manifestDigest,
+			'privos.mcp.receipt': cfg.mcpBinding.receiptHash,
+			'privos.mcp.grant-epoch': String(cfg.mcpBinding.grantEpoch),
+			'privos.mcp.deployment-grant-hash': cfg.mcpBinding.deploymentGrantHash,
+			'privos.mcp.hub-origin': cfg.mcpBinding.hubOrigin,
+			'privos.mcp.hub-kid': cfg.mcpBinding.hubKid,
+			'privos.mcp.hub-jwk': JSON.stringify(cfg.mcpBinding.hubPublicJwk),
+		});
+	}
+    // V2 workloads are published only through the native path-aware proxy,
+    // which blocks MCP/bootstrap/identity routes. Never let legacy Caddy label
+    // discovery create an unfiltered second ingress.
+    if (cfg.subdomain && cfg.baseDomain && !cfg.mcpBinding) {
         const host = `${cfg.subdomain}.${cfg.baseDomain}`;
         labels.caddy = host;
         // `{{upstreams N}}` resolves to the container's network IP:N at runtime.
@@ -178,6 +203,7 @@ export class ContainerManager {
                 baseDomain: cfg.baseDomain,
                 createdBy: cfg.createdBy,
                 createdAt: cfg.createdAt,
+				mcpBinding: cfg.mcpBinding,
             }),
             HostConfig: {
                 NetworkMode: getAppNetworkName(cfg.workspaceId),
@@ -190,12 +216,22 @@ export class ContainerManager {
                 NanoCpus: Math.round(cfg.resources.cpus * 1e9),
                 PidsLimit: 100,
                 RestartPolicy: { Name: 'no' }, // health monitor handles restarts
-                Mounts: cfg.mounts?.map((m) => ({
-                    Type: 'volume' as const,
-                    Source: m.dockerVolumeName,
-                    Target: m.mountPath,
-                    ReadOnly: false,
-                })) ?? [],
+				Mounts: [
+					...(cfg.mounts?.map((m) => ({
+						Type: 'volume' as const,
+						Source: m.dockerVolumeName,
+						Target: m.mountPath,
+						ReadOnly: false,
+					})) ?? []),
+					...(cfg.brokerMount
+						? [{
+							Type: 'bind' as const,
+							Source: cfg.brokerMount.source,
+							Target: cfg.brokerMount.target,
+							ReadOnly: true,
+						}]
+						: []),
+				],
             },
         });
 

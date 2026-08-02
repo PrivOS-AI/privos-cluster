@@ -10,7 +10,9 @@ import {
     getImageRegistryAllowlist,
     isReverseProxyEnabled,
     resolveDomain,
+	getAppNetworkName,
 } from './settings-service.js';
+import { mcpBrokerManager } from './mcp-broker.js';
 import { refreshRoutes } from '../proxy/proxy-router.js';
 import type { Container, ContainerResources, ContainerVolume, DeployRequest, RedeployRequest } from '../types/index.js';
 
@@ -265,6 +267,7 @@ export async function deployManagedApp(req: DeployRequest): Promise<Container> {
 
     let dockerContainerId: string | null = null;
     const createdDockerVolumes: string[] = [];
+	const brokerMount = req.mcpBinding ? await mcpBrokerManager.prepare(req.mcpBinding.replicaId) : undefined;
 
     try {
         // Create Docker named volumes for each requested volume
@@ -304,8 +307,18 @@ export async function deployManagedApp(req: DeployRequest): Promise<Container> {
             subdomain,
             baseDomain,
             createdAt,
+			mcpBinding: req.mcpBinding,
+			brokerMount,
         });
         dockerContainerId = created.containerId;
+		if (req.mcpBinding) {
+			await mcpBrokerManager.register({
+				...req.mcpBinding,
+				containerId: clusterId,
+				dockerContainerId,
+				networkName: getAppNetworkName(req.workspaceId),
+			});
+		}
 
         await containerManager.startContainer(dockerContainerId);
 
@@ -348,6 +361,7 @@ export async function deployManagedApp(req: DeployRequest): Promise<Container> {
                 // best-effort
             }
         }
+		if (req.mcpBinding) await mcpBrokerManager.cleanup(req.mcpBinding.replicaId).catch(() => undefined);
         throw err;
     }
 }
@@ -673,7 +687,10 @@ export async function deleteContainer(containerId: string, workspaceId?: string)
     // Derive volume names from the container's own mounts before it's removed
     // — there is no volumes table to fall back on.
     let volumeNames: string[] = [];
+	let mcpReplicaId: string | undefined;
     try {
+		const info = await containerManager.inspectContainer(c.dockerContainerId);
+		mcpReplicaId = info.Config?.Labels?.['privos.mcp.replica'];
         const mounts = await getExistingMounts(c.dockerContainerId);
         volumeNames = mounts.map((m) => m.dockerVolumeName);
     } catch (err: any) {
@@ -702,6 +719,7 @@ export async function deleteContainer(containerId: string, workspaceId?: string)
             volumeErrors.push(err instanceof Error ? err : new Error(String(err)));
         }
     }
+	if (mcpReplicaId) await mcpBrokerManager.cleanup(mcpReplicaId).catch(() => undefined);
 
     logger.info({ containerId }, 'container deleted');
     refreshRoutes(); // host no longer resolves — stop routing to the removed container

@@ -27,7 +27,10 @@ import {
     DeployRequestSchema,
     RedeployRequestSchema,
     DispatchBodySchema,
+	McpDispatchBodySchema,
 } from '../schemas/app-schemas.js';
+import { verifyAgentDispatchAssertion } from '../services/mcp-dispatch.js';
+import { clusterMcpSafeReason, recordClusterMcpEvent } from '../services/mcp-observability.js';
 
 interface ValidationCheck {
     id: string;
@@ -427,11 +430,6 @@ const appsHandler: FastifyPluginAsync = async (fastify) => {
             if (!params.success) {
                 return reply.code(400).send({ error: 'invalid containerId' });
             }
-            const body = DispatchBodySchema.safeParse(req.body);
-            if (!body.success) {
-                return reply.code(400).send({ error: 'validation_error', details: body.error.issues });
-            }
-
             const container = await dockerState.getById(
                 params.data.containerId,
                 undefined,
@@ -443,11 +441,36 @@ const appsHandler: FastifyPluginAsync = async (fastify) => {
             if (container.state !== 'running') {
                 return reply.code(409).send({ error: 'container not running' });
             }
+			const info = await containerManager.inspectContainer(container.dockerContainerId);
+			const labels = (info.Config?.Labels ?? {}) as Record<string, string>;
+			let rpc: unknown;
+			let dispatchAssertion: string | undefined;
+			if (labels['privos.mcp.schema'] === '2') {
+				const body = McpDispatchBodySchema.safeParse(req.body);
+				if (!body.success) return reply.code(400).send({ error: 'validation_error', details: body.error.issues });
+				try {
+					verifyAgentDispatchAssertion({ compact: body.data.assertion, rpc: body.data.rpc, labels });
+				} catch (error) {
+					const reason = clusterMcpSafeReason(error, 'dispatch_assertion_invalid');
+					recordClusterMcpEvent({ event: 'private_dispatch', outcome: 'denied', boundary: 'agent', reason, correlationId: labels['privos.mcp.installation'] });
+					return reply.code(403).send({ error: 'mcp_dispatch_denied', code: reason });
+				}
+				recordClusterMcpEvent({ event: 'private_dispatch', outcome: 'allowed', boundary: 'agent', reason: 'verified', correlationId: labels['privos.mcp.installation'], emitLog: false });
+				rpc = body.data.rpc;
+				dispatchAssertion = body.data.assertion;
+			} else {
+				const body = DispatchBodySchema.safeParse(req.body);
+				if (!body.success) return reply.code(400).send({ error: 'validation_error', details: body.error.issues });
+				rpc = body.data;
+			}
 
             const upstream = await fetch(`${container.internalUrl}/mcp`, {
                 method: 'POST',
-                headers: { 'content-type': 'application/json' },
-                body: JSON.stringify(body.data),
+				headers: {
+					'content-type': 'application/json',
+					...(dispatchAssertion ? { 'x-privos-dispatch-assertion': dispatchAssertion } : {}),
+				},
+				body: JSON.stringify(rpc),
                 signal: AbortSignal.timeout(30_000),
             });
 
