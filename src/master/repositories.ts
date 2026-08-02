@@ -35,7 +35,8 @@ export class MasterRepositories {
 			this.lifecycleEvents.createIndex({ eventId: 1 }, { unique: true }),
 			this.lifecycleEvents.createIndex({ workspaceId: 1, at: 1 }),
 			this.usageDaily.createIndex({ workspaceId: 1, date: 1 }, { unique: true }),
-			this.mcpArtifactUses.createIndex({ _id: 1 }, { unique: true }),
+			// Mongo creates the _id index automatically and rejects an explicit
+			// `unique` option for that built-in index.
 			this.mcpArtifactUses.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
 		]);
 	}
