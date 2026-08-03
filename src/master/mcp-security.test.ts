@@ -50,7 +50,7 @@ function repositories(workspaceIds: string[]) {
 	};
 }
 
-function enrollmentProof(input: { clusterId: string; workspaceId: string; key: ReturnType<typeof identity> }): string {
+function enrollmentProof(input: { clusterId: string; workspaceId: string; deploymentId?: string; key: ReturnType<typeof identity> }): string {
 	const now = Math.floor(Date.now() / 1000);
 	return signEs256Jws({
 		privateJwk: input.key.privateJwk,
@@ -64,7 +64,7 @@ function enrollmentProof(input: { clusterId: string; workspaceId: string; key: R
 			exp: now + 120,
 			clusterId: input.clusterId,
 			workspaceId: input.workspaceId,
-			deploymentId: input.workspaceId,
+			deploymentId: input.deploymentId ?? input.workspaceId,
 			kid: input.key.kid,
 		},
 	});
@@ -204,4 +204,17 @@ test('enrollment proof is possession-bound and cannot cross workspace affinity',
 		}),
 		/hub_identity_enrollment_binding_mismatch/,
 	);
+});
+
+test('enrollment accepts a deployment identity distinct from the authenticated workspace', async () => {
+	const clusterId = 'privos-app-cluster';
+	const state = repositories(['workspace-a']);
+	const verifier = new McpSecurityVerifier(state.repositories, clusterId);
+	const key = identity();
+	const result = await verifier.enrollHubIdentity({
+		workspaceId: 'workspace-a',
+		publicJwk: key.publicJwk,
+		compact: enrollmentProof({ clusterId, workspaceId: 'workspace-a', deploymentId: 'deployment-a', key }),
+	});
+	assert.equal(result.hubKid, key.kid);
 });

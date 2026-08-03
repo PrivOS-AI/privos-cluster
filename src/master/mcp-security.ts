@@ -170,7 +170,6 @@ export class McpSecurityVerifier {
 		if (
 			payload.clusterId !== this.clusterId ||
 			payload.workspaceId !== input.workspaceId ||
-			payload.deploymentId !== input.workspaceId ||
 			payload.kid !== kid
 		) {
 			throw new Error('hub_identity_enrollment_binding_mismatch');
