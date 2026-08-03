@@ -1,6 +1,8 @@
 import Docker from 'dockerode';
 import { Readable } from 'stream';
 
+import { resolveImmutableImageReference } from './image-reference.js';
+
 /**
  * Progress event emitted by Docker during a pull. Shape mirrors Docker's
  * JSON stream — fields are all optional because layers emit different keys
@@ -113,7 +115,7 @@ export class ImageManager {
 		onProgress: (ev: PullProgressEvent) => void = () => {},
 		signal?: AbortSignal,
 	): Promise<InspectedImage> {
-		const repoTag = digest ? `${repository}@${digest}` : `${repository}:${tag}`;
+		const repoTag = resolveImmutableImageReference(repository, tag, digest);
 		if (signal?.aborted) throw new Error('Pull cancelled');
 
 		let stream: NodeJS.ReadableStream;
