@@ -29,6 +29,12 @@ const DeployRequestObject = z.object({
     volumes: z.array(VolumeSchema).max(10).optional(),
     subdomain: SubdomainLabelSchema.nullable().optional(),
     domain: z.string().trim().max(253).nullable().optional(), // base domain to publish under
+    // The master spreads its own deploy input into every agent dispatch, and that
+    // input carries the placement decision. The agent receives one replica at a
+    // time, so these are informational here — accepted so the strict schema does
+    // not reject the master's payload, and otherwise ignored.
+    availabilityTier: z.enum(['single', 'ha']).optional(),
+    stateless: z.boolean().optional(),
 });
 
 function validateDeployRequest(value: z.infer<typeof DeployRequestObject>, ctx: z.RefinementCtx): void {
