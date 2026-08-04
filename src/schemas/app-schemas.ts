@@ -111,6 +111,53 @@ export const McpDeployRequestSchema = DeployRequestObject.extend({ mcpBinding: M
 		}
 	});
 
+export const McpRuntimeProvisioningBindingV3Schema = z.object({
+	protocolVersion: z.literal(3),
+	clusterId: z.string().regex(/^[A-Za-z0-9-]+$/),
+	nodeId: z.string().regex(/^[A-Za-z0-9-]+$/),
+	workspaceId: z.string().min(1).max(160),
+	deploymentId: z.string().min(1).max(160),
+	generationId: z.string().min(1).max(160),
+	generationNumber: z.number().int().positive(),
+	runtimeInstallationId: z.string().min(1).max(160),
+	mcpAppId: z.string().min(1).max(160),
+	replicaId: z.string().uuid(),
+	containerId: z.string().uuid(),
+	imageDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+	manifestDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+	approvalReceiptHash: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+	authorizationEpoch: z.number().int().positive(),
+	deploymentGrantHash: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+	resourceManifestHash: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+	hubOrigin: z.string().url().refine((value) => new URL(value).protocol === 'https:', 'hubOrigin must use HTTPS'),
+	hubKid: z.string().min(20).max(128),
+	hubPublicJwk: PublicP256JwkSchema,
+}).strict();
+
+export const McpDeployRequestV3Schema = DeployRequestObject.extend({
+	mcpV3Binding: McpRuntimeProvisioningBindingV3Schema,
+}).strict().superRefine((value, ctx) => {
+	validateDeployRequest(value, ctx);
+	if (!value.appId) {
+		ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['appId'], message: 'appId is required for MCP v3' });
+	}
+	for (const key of Object.keys(value.envVars ?? {})) {
+		if (key.toUpperCase().startsWith('PRIVOS_')) {
+			ctx.addIssue({
+				code: z.ZodIssueCode.custom,
+				path: ['envVars', key],
+				message: 'PRIVOS_* environment names are reserved for the platform',
+			});
+		}
+	}
+	if (value.workspaceId !== value.mcpV3Binding.workspaceId) {
+		ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['workspaceId'], message: 'workspace binding mismatch' });
+	}
+	if (value.digest !== value.mcpV3Binding.imageDigest) {
+		ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['digest'], message: 'image digest binding mismatch' });
+	}
+});
+
 export const RedeployRequestSchema = z.object({
     workspaceId: z.string().regex(/^[A-Za-z0-9-]+$/).optional(),
     image: z.string().optional(),
@@ -173,3 +220,21 @@ export const McpDispatchBodySchema = z.object({
 	assertion: z.string().min(1),
 	rpc: DispatchBodySchema,
 }).strict();
+
+export const McpDispatchBodyV3Schema = z.discriminatedUnion('authorizationContext', [
+	z.object({
+		assertion: z.string().min(1),
+		rpc: DispatchBodySchema,
+		authorizationContext: z.literal('workspace'),
+		runtimeInstallationId: z.string().min(1).max(160),
+		runtimeResourceInventoryHash: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+	}).strict(),
+	z.object({
+		assertion: z.string().min(1),
+		rpc: DispatchBodySchema,
+		authorizationContext: z.literal('room'),
+		runtimeInstallationId: z.string().min(1).max(160),
+		authorizationBindingId: z.string().min(1).max(160),
+		runtimeResourceInventoryHash: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+	}).strict(),
+]);

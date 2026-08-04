@@ -6,10 +6,11 @@ import type { JsonWebKey } from 'node:crypto';
 
 import { config } from '../config.js';
 import { containerManager } from '../docker/index.js';
-import { jwkThumbprint } from '../security/artifacts.js';
+import { canonicalJson, jwkThumbprint } from '../security/artifacts.js';
 import { NodeIdentity } from '../security/node-identity.js';
 import { getAppNetworkName } from './settings-service.js';
 import { clusterMcpSafeReason, recordClusterMcpEvent } from './mcp-observability.js';
+import type { McpRuntimeBindingV3 } from '../types/index.js';
 
 export const MCP_IDENTITY_SOCKET_PATH = '/run/privos/identity.sock';
 
@@ -32,6 +33,24 @@ export type McpReplicaBinding = {
 	hubKid: string;
 	hubPublicJwk: JsonWebKey;
 };
+
+export type McpReplicaBindingV3 = McpRuntimeBindingV3 & {
+	protocolVersion: 3;
+	dockerContainerId: string;
+	networkName: string;
+	runtimeResourceInventoryHash: string;
+};
+
+type McpProvisioningReplicaBindingV3 = McpRuntimeBindingV3 & {
+	protocolVersion: 3;
+	dockerContainerId: string;
+	networkName: string;
+	runtimeResourceInventoryHash?: undefined;
+};
+
+type AnyMcpReplicaBinding = McpReplicaBinding | McpReplicaBindingV3 | McpProvisioningReplicaBindingV3;
+
+type PersistedMcpReplicaBindingV3 = Omit<McpReplicaBindingV3, 'dockerContainerId'> & { version: 1 };
 
 type BrokerRequest = { op: 'attest'; publicJwk: JsonWebKey; nonce: string };
 
@@ -69,7 +88,17 @@ export class McpBrokerManager {
 		return { source: directory, target: '/run/privos' };
 	}
 
-	async register(binding: McpReplicaBinding): Promise<{ source: string; target: string }> {
+	async register(binding: McpReplicaBinding | McpReplicaBindingV3): Promise<{ source: string; target: string }> {
+		if ('protocolVersion' in binding) await this.persistFinalizedV3(binding);
+		return this.registerSocket(binding);
+	}
+
+	/** Allocate the socket resource early while refusing evidence until final inventory establishment. */
+	async registerProvisioningV3(binding: McpProvisioningReplicaBindingV3): Promise<{ source: string; target: string }> {
+		return this.registerSocket(binding);
+	}
+
+	private async registerSocket(binding: AnyMcpReplicaBinding): Promise<{ source: string; target: string }> {
 		await this.close(binding.replicaId);
 		const directory = this.directory(binding.replicaId);
 		const socketPath = path.join(directory, 'identity.sock');
@@ -104,14 +133,138 @@ export class McpBrokerManager {
 		return { source: directory, target: '/run/privos' };
 	}
 
-	private async respond(socket: net.Socket, binding: McpReplicaBinding, raw: string): Promise<void> {
+	private async persistFinalizedV3(binding: McpReplicaBindingV3): Promise<void> {
+		const record: PersistedMcpReplicaBindingV3 = {
+			...binding,
+			version: 1,
+		};
+		delete (record as Partial<McpReplicaBindingV3>).dockerContainerId;
+		const filePath = path.join(this.directory(binding.replicaId), 'binding-v3.json');
+		try {
+			const existing = JSON.parse(await fs.readFile(filePath, 'utf8')) as unknown;
+			if (canonicalJson(existing) !== canonicalJson(record)) {
+				throw new Error('persisted_mcp_v3_broker_binding_conflict');
+			}
+			return;
+		} catch (error: unknown) {
+			if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+		}
+		const temporaryPath = `${filePath}.next-${process.pid}-${crypto.randomUUID()}`;
+		await fs.writeFile(temporaryPath, `${canonicalJson(record)}\n`, { flag: 'wx', mode: 0o600 });
+		try {
+			await fs.rename(temporaryPath, filePath);
+		} catch (error) {
+			await fs.rm(temporaryPath, { force: true });
+			throw error;
+		}
+	}
+
+	async restoreFinalizedV3(
+		labels: Record<string, string>,
+		dockerContainerId: string,
+	): Promise<void> {
+		const replicaId = labels['privos.mcp.replica'];
+		if (!replicaId) throw new Error('persisted_mcp_v3_broker_binding_invalid');
+		const persisted = JSON.parse(
+			await fs.readFile(path.join(this.directory(replicaId), 'binding-v3.json'), 'utf8'),
+		) as Partial<PersistedMcpReplicaBindingV3>;
+		const expectedPersistedAffinity: Partial<PersistedMcpReplicaBindingV3> = {
+			version: 1,
+			protocolVersion: 3,
+			clusterId: labels['privos.mcp.cluster'],
+			nodeId: labels['privos.mcp.node'],
+			workspaceId: labels['privos.mcp.workspace'],
+			deploymentId: labels['privos.mcp.deployment'],
+			generationId: labels['privos.mcp.generation'],
+			generationNumber: Number(labels['privos.mcp.generation-number']),
+			runtimeInstallationId: labels['privos.mcp.runtime-installation'],
+			mcpAppId: labels['privos.mcp.app'],
+			replicaId,
+			containerId: labels['privos.id'],
+			imageDigest: labels['privos.mcp.image.digest'],
+			manifestDigest: labels['privos.mcp.manifest.digest'],
+			approvalReceiptHash: labels['privos.mcp.approval-receipt'],
+			authorizationEpoch: Number(labels['privos.mcp.authorization-epoch']),
+			deploymentGrantHash: labels['privos.mcp.deployment-grant-hash'],
+			resourceManifestHash: labels['privos.mcp.resource-manifest-hash'],
+			hubOrigin: labels['privos.mcp.hub-origin'],
+			hubKid: labels['privos.mcp.hub-kid'],
+			networkName: getAppNetworkName(labels['privos.mcp.workspace']),
+		};
+		if (
+			Object.entries(expectedPersistedAffinity).some(([key, value]) =>
+				value === undefined || value === '' || Number.isNaN(value) || persisted[key as keyof PersistedMcpReplicaBindingV3] !== value) ||
+			typeof persisted.runtimeResourceInventoryHash !== 'string' ||
+			!/^[A-Za-z0-9_-]{43}$/.test(persisted.runtimeResourceInventoryHash)
+		) throw new Error('persisted_mcp_v3_broker_binding_invalid');
+		let hubPublicJwk: JsonWebKey;
+		try {
+			hubPublicJwk = JSON.parse(labels['privos.mcp.hub-jwk'] ?? '') as JsonWebKey;
+		} catch {
+			throw new Error('persisted_mcp_v3_broker_binding_invalid');
+		}
+		await this.register({
+			...(expectedPersistedAffinity as Omit<McpReplicaBindingV3, 'dockerContainerId' | 'hubPublicJwk' | 'runtimeResourceInventoryHash'>),
+			dockerContainerId,
+			hubPublicJwk,
+			runtimeResourceInventoryHash: persisted.runtimeResourceInventoryHash,
+		});
+	}
+
+	async restoreOrRegisterProvisioningV3(
+		binding: McpProvisioningReplicaBindingV3,
+		labels: Record<string, string>,
+	): Promise<void> {
+		try {
+			await this.restoreFinalizedV3(labels, binding.dockerContainerId);
+		} catch (error: unknown) {
+			if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+			await this.registerProvisioningV3(binding);
+		}
+	}
+
+	private async respond(
+		socket: net.Socket,
+		binding: AnyMcpReplicaBinding,
+		raw: string,
+	): Promise<void> {
 		try {
 			const request = JSON.parse(raw) as unknown;
 			if (!isBrokerRequest(request)) throw new Error('broker_request_invalid');
 			await this.assertContainerBinding(binding);
 			const now = Math.floor(Date.now() / 1000);
-			const attestation = await this.identity.sign(
-				{
+			let attestationPayload: Record<string, unknown>;
+			if ('protocolVersion' in binding) {
+				if (!binding.runtimeResourceInventoryHash) throw new Error('runtime_inventory_not_established');
+				attestationPayload = {
+					protocolVersion: 3,
+					type: 'node-workload-attestation',
+					iss: `urn:privos:cluster-node:${binding.clusterId}:${binding.nodeId}`,
+					aud: 'privos-hub-api',
+					iat: now,
+					exp: now + 45,
+					jti: crypto.randomUUID(),
+					clusterId: binding.clusterId,
+					nodeId: binding.nodeId,
+					workspaceId: binding.workspaceId,
+					deploymentId: binding.deploymentId,
+					generationId: binding.generationId,
+					generationNumber: binding.generationNumber,
+					runtimeInstallationId: binding.runtimeInstallationId,
+					mcpAppId: binding.mcpAppId,
+					replicaId: binding.replicaId,
+					containerId: binding.containerId,
+					imageDigest: binding.imageDigest,
+					manifestDigest: binding.manifestDigest,
+					approvalReceiptHash: binding.approvalReceiptHash,
+					authorizationEpoch: binding.authorizationEpoch,
+					resourceManifestHash: binding.resourceManifestHash,
+					runtimeResourceInventoryHash: binding.runtimeResourceInventoryHash,
+					dpopJkt: jwkThumbprint(request.publicJwk),
+					nonce: request.nonce,
+				};
+			} else {
+				attestationPayload = {
 					type: 'node-workload-attestation',
 					iss: `urn:privos:cluster-node:${binding.clusterId}:${binding.nodeId}`,
 					aud: 'privos-hub-api',
@@ -131,8 +284,12 @@ export class McpBrokerManager {
 					grantEpoch: binding.grantEpoch,
 					dpopJkt: jwkThumbprint(request.publicJwk),
 					nonce: request.nonce,
-				},
+				};
+			}
+			const attestation = await this.identity.sign(
+				attestationPayload,
 				'privos-node-attestation+jws',
+				'protocolVersion' in binding ? 3 : undefined,
 			);
 			socket.end(`${JSON.stringify({
 				ok: true,
@@ -141,19 +298,46 @@ export class McpBrokerManager {
 				hubKid: binding.hubKid,
 				hubPublicJwk: binding.hubPublicJwk,
 			})}\n`);
-			recordClusterMcpEvent({ event: 'broker_attestation', outcome: 'allowed', boundary: 'unix_socket', reason: 'issued', correlationId: binding.installationId, emitLog: false });
+			recordClusterMcpEvent({
+				event: 'broker_attestation',
+				outcome: 'allowed',
+				boundary: 'unix_socket',
+				reason: 'issued',
+				correlationId: 'protocolVersion' in binding ? binding.runtimeInstallationId : binding.installationId,
+				emitLog: false,
+			});
 		} catch (error: unknown) {
 			const code = clusterMcpSafeReason(error, 'broker_request_failed');
-			recordClusterMcpEvent({ event: 'broker_attestation', outcome: 'denied', boundary: 'unix_socket', reason: code, correlationId: binding.installationId });
+			recordClusterMcpEvent({
+				event: 'broker_attestation',
+				outcome: 'denied',
+				boundary: 'unix_socket',
+				reason: code,
+				correlationId: 'protocolVersion' in binding ? binding.runtimeInstallationId : binding.installationId,
+			});
 			socket.end(`${JSON.stringify({ ok: false, error: code })}\n`);
 		}
 	}
 
-	private async assertContainerBinding(binding: McpReplicaBinding): Promise<void> {
+	private async assertContainerBinding(binding: AnyMcpReplicaBinding): Promise<void> {
 		const info = await this.inspectContainer(binding.dockerContainerId);
 		if (!info?.State?.Running) throw new Error('container_not_running');
 		const labels = (info.Config?.Labels ?? {}) as Record<string, string>;
-		const expected: Record<string, string> = {
+		const expected: Record<string, string> = 'protocolVersion' in binding ? {
+			'privos.workspace': binding.workspaceId,
+			'privos.id': binding.containerId,
+			'privos.mcp.schema': '3',
+			'privos.mcp.runtime-installation': binding.runtimeInstallationId,
+			'privos.mcp.generation': binding.generationId,
+			'privos.mcp.replica': binding.replicaId,
+			'privos.mcp.image.digest': binding.imageDigest,
+			'privos.mcp.manifest.digest': binding.manifestDigest,
+			'privos.mcp.approval-receipt': binding.approvalReceiptHash,
+			'privos.mcp.authorization-epoch': String(binding.authorizationEpoch),
+			'privos.mcp.deployment-grant-hash': binding.deploymentGrantHash,
+			'privos.mcp.resource-manifest-hash': binding.resourceManifestHash,
+			'privos.mcp.hub-kid': binding.hubKid,
+		} : {
 			'privos.workspace': binding.workspaceId,
 			'privos.id': binding.containerId,
 			'privos.mcp.installation': binding.installationId,
@@ -162,9 +346,9 @@ export class McpBrokerManager {
 			'privos.mcp.manifest.digest': binding.manifestDigest,
 			'privos.mcp.receipt': binding.receiptHash,
 			'privos.mcp.grant-epoch': String(binding.grantEpoch),
-				'privos.mcp.deployment-grant-hash': binding.deploymentGrantHash,
-				'privos.mcp.hub-kid': binding.hubKid,
-			};
+			'privos.mcp.deployment-grant-hash': binding.deploymentGrantHash,
+			'privos.mcp.hub-kid': binding.hubKid,
+		};
 		if (Object.entries(expected).some(([key, value]) => labels[key] !== value)) {
 			throw new Error('container_binding_mismatch');
 		}
@@ -207,6 +391,13 @@ export async function rebindMcpBrokers(): Promise<{ rebound: number; failed: num
 		try {
 			const info = await containerManager.inspectContainer(listed.Id);
 			const labels = (info.Config?.Labels ?? {}) as Record<string, string>;
+			if (labels['privos.mcp.schema'] === '3') {
+				if (config.APP_CLUSTER_MCP_INSTALL_V3 === 'on') {
+					await mcpBrokerManager.restoreFinalizedV3(labels, listed.Id);
+					rebound += 1;
+				}
+				continue;
+			}
 			if (labels['privos.mcp.schema'] !== '2') continue;
 			const workspaceId = labels['privos.workspace'];
 			const binding: McpReplicaBinding = {

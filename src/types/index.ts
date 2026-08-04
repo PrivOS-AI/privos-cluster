@@ -62,7 +62,8 @@ export interface Container {
 	subdomain?: string | null; // DNS label routed to this container via Caddy
 	domain?: string | null;    // base domain the subdomain is published under
 	healthPolicy?: HealthPolicy; // self-restart policy read from labels (in-memory health monitor)
-	mcpV2?: boolean; // v2 workloads expose UI only; MCP/bootstrap/identity stay private
+	mcpV2?: boolean; // compatibility proxy bit: MCP workloads expose UI only; private paths stay blocked
+	mcpV3?: boolean; // v3 workloads reconcile only through the signed generation-aware path
 }
 
 export interface Setting<T = unknown> {
@@ -103,6 +104,7 @@ export interface DeployRequest {
 	subdomain?: string | null;
 	domain?: string | null;
 	mcpBinding?: McpRuntimeBinding;
+	mcpV3Binding?: McpRuntimeBindingV3;
 }
 
 export interface McpRuntimeBinding {
@@ -117,6 +119,31 @@ export interface McpRuntimeBinding {
 	receiptHash: string;
 	grantEpoch: number;
 	deploymentGrantHash: string;
+	hubOrigin: string;
+	hubKid: string;
+	hubPublicJwk: JsonWebKey;
+}
+
+/** Additive v3 generation-affine runtime binding. */
+export interface McpRuntimeBindingV3 {
+	protocolVersion: 3;
+	clusterId: string;
+	nodeId: string;
+	workspaceId: string;
+	deploymentId: string;
+	generationId: string;
+	generationNumber: number;
+	runtimeInstallationId: string;
+	mcpAppId: string;
+	replicaId: string;
+	containerId: string;
+	imageDigest: string;
+	manifestDigest: string;
+	approvalReceiptHash: string;
+	authorizationEpoch: number;
+	deploymentGrantHash: string;
+	resourceManifestHash: string;
+	runtimeResourceInventoryHash?: string;
 	hubOrigin: string;
 	hubKid: string;
 	hubPublicJwk: JsonWebKey;

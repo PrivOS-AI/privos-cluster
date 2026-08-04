@@ -1,20 +1,35 @@
 import type { FastifyPluginAsync } from 'fastify';
+import type { JsonWebKey } from 'node:crypto';
 import fp from 'fastify-plugin';
 import { z } from 'zod';
 
 import { config } from '../config.js';
-import { imageManager } from '../docker/index.js';
+import { containerManager, imageManager } from '../docker/index.js';
+import * as dockerState from '../docker/docker-state.js';
 import { resolveImmutableImageReference } from '../docker/image-reference.js';
-import { McpDeployRequestSchema } from '../schemas/app-schemas.js';
-import { canonicalJson, sha256 } from '../security/artifacts.js';
+import {
+	McpDeployRequestSchema,
+	McpDeployRequestV3Schema,
+} from '../schemas/app-schemas.js';
+import { canonicalJson, sha256, sha256Base64Url } from '../security/artifacts.js';
 import { deployManagedApp } from '../services/lifecycle-service.js';
-import { nodeIdentity } from '../services/mcp-broker.js';
+import { mcpBrokerManager, nodeIdentity } from '../services/mcp-broker.js';
 import { getClusterMcpMetrics, recordClusterMcpEvent } from '../services/mcp-observability.js';
+import { getAppNetworkName } from '../services/settings-service.js';
+import { RuntimeResourceDescriptorV3Schema } from '../master/protocol-v3.js';
 
 const InspectSchema = z.object({
 	image: z.string().min(1),
 	digest: z.string().regex(/^sha256:[a-f0-9]{64}$/),
 }).strict();
+
+const FinalizeV3Schema = z.object({
+	runtimeResourceInventoryHash: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+}).strict();
+
+function localResourceId(prefix: string, ...parts: string[]): string {
+	return `${prefix}-${sha256Base64Url(canonicalJson(parts))}`;
+}
 
 const mcpHandler: FastifyPluginAsync = async (fastify) => {
 	fastify.get('/api/v1/mcp/node-identity', { preHandler: fastify.authenticate }, async () => ({
@@ -93,6 +108,137 @@ const mcpHandler: FastifyPluginAsync = async (fastify) => {
 			nodeIdentity: await nodeIdentity.publicInfo(),
 			replicaId: parsed.data.mcpBinding.replicaId,
 		});
+	});
+
+	fastify.post('/api/v1/mcp/v3/apps/deploy', { preHandler: fastify.authenticate }, async (req, reply) => {
+		if (config.APP_CLUSTER_MCP_INSTALL_V3 !== 'on') {
+			return reply.code(404).send({ error: 'mcp_install_v3_disabled' });
+		}
+		if (config.REVERSE_PROXY_MODE !== 'native') {
+			return reply.code(503).send({ error: 'mcp_private_ingress_unavailable' });
+		}
+		const parsed = McpDeployRequestV3Schema.safeParse(req.body);
+		if (!parsed.success) {
+			return reply.code(400).send({ error: 'validation_error', details: parsed.error.issues });
+		}
+		const binding = parsed.data.mcpV3Binding;
+		if (
+			binding.clusterId !== config.FLEET_CLUSTER_ID ||
+			binding.nodeId !== config.FLEET_NODE_ID ||
+			parsed.data.workspaceId !== req.clusterAuth?.workspaceId
+		) return reply.code(403).send({ error: 'mcp_runtime_binding_mismatch' });
+
+		const container = await deployManagedApp(parsed.data);
+		const [identity, inspect] = await Promise.all([
+			nodeIdentity.publicInfo(),
+			containerManager.inspectContainer(container.dockerContainerId),
+		]);
+		const expectedResources = RuntimeResourceDescriptorV3Schema.array().parse([
+			{
+				kind: 'REPLICA',
+				resourceId: binding.replicaId,
+				ownershipScope: 'INSTALLATION_GENERATION',
+				nodeId: binding.nodeId,
+				replicaId: binding.replicaId,
+				attributes: { nodeIdentityKid: identity.kid },
+			},
+			{
+				kind: 'CONTAINER',
+				resourceId: binding.containerId,
+				ownershipScope: 'INSTALLATION_GENERATION',
+				nodeId: binding.nodeId,
+				replicaId: binding.replicaId,
+				attributes: { nodeIdentityKid: identity.kid },
+			},
+			...((inspect.Mounts ?? []) as Array<{ Type?: string; Name?: string; Destination?: string }>)
+				.filter((mount) => mount.Type === 'volume' && mount.Name)
+				.map((mount) => ({
+					kind: 'VOLUME' as const,
+					resourceId: mount.Name!,
+					ownershipScope: 'INSTALLATION_GENERATION' as const,
+					nodeId: binding.nodeId,
+					replicaId: binding.replicaId,
+					attributes: { mountPath: mount.Destination ?? '' },
+				})),
+			{
+				kind: 'BROKER_BINDING',
+				resourceId: localResourceId('broker-binding', binding.runtimeInstallationId, binding.replicaId),
+				ownershipScope: 'INSTALLATION_GENERATION',
+				nodeId: binding.nodeId,
+				replicaId: binding.replicaId,
+				attributes: {},
+			},
+			{
+				kind: 'BROKER_SOCKET',
+				resourceId: localResourceId('broker-socket', binding.runtimeInstallationId, binding.replicaId),
+				ownershipScope: 'INSTALLATION_GENERATION',
+				nodeId: binding.nodeId,
+				replicaId: binding.replicaId,
+				attributes: {},
+			},
+			{
+				kind: 'SERVICE_DISCOVERY',
+				resourceId: localResourceId('service', getAppNetworkName(binding.workspaceId), binding.containerId),
+				ownershipScope: 'INSTALLATION_GENERATION',
+				nodeId: binding.nodeId,
+				replicaId: binding.replicaId,
+				attributes: { networkName: getAppNetworkName(binding.workspaceId) },
+			},
+		]);
+		return reply.code(201).send({
+			...container,
+			nodeIdentity: identity,
+			replicaId: binding.replicaId,
+			expectedResources,
+		});
+	});
+
+	fastify.post('/api/v1/mcp/v3/apps/:containerId/finalize', { preHandler: fastify.authenticate }, async (req, reply) => {
+		if (config.APP_CLUSTER_MCP_INSTALL_V3 !== 'on') {
+			return reply.code(404).send({ error: 'mcp_install_v3_disabled' });
+		}
+		const containerId = (req.params as { containerId?: string }).containerId;
+		const parsed = FinalizeV3Schema.safeParse(req.body);
+		if (!containerId || !parsed.success) return reply.code(400).send({ error: 'validation_error' });
+		const container = await dockerState.getById(containerId, undefined, req.clusterAuth?.workspaceId);
+		if (!container) return reply.code(404).send({ error: 'not_found' });
+		const inspect = await containerManager.inspectContainer(container.dockerContainerId);
+		const labels = (inspect.Config?.Labels ?? {}) as Record<string, string>;
+		if (labels['privos.mcp.schema'] !== '3' || labels['privos.id'] !== containerId) {
+			return reply.code(409).send({ error: 'mcp_runtime_binding_mismatch' });
+		}
+		let hubPublicJwk: JsonWebKey;
+		try {
+			hubPublicJwk = JSON.parse(labels['privos.mcp.hub-jwk'] ?? '') as JsonWebKey;
+		} catch {
+			return reply.code(409).send({ error: 'mcp_runtime_binding_mismatch' });
+		}
+		await mcpBrokerManager.register({
+			protocolVersion: 3,
+			clusterId: labels['privos.mcp.cluster']!,
+			nodeId: labels['privos.mcp.node']!,
+			workspaceId: labels['privos.mcp.workspace']!,
+			deploymentId: labels['privos.mcp.deployment']!,
+			generationId: labels['privos.mcp.generation']!,
+			generationNumber: Number(labels['privos.mcp.generation-number']),
+			runtimeInstallationId: labels['privos.mcp.runtime-installation']!,
+			mcpAppId: labels['privos.mcp.app']!,
+			replicaId: labels['privos.mcp.replica']!,
+			containerId,
+			dockerContainerId: container.dockerContainerId,
+			imageDigest: labels['privos.mcp.image.digest']!,
+			manifestDigest: labels['privos.mcp.manifest.digest']!,
+			approvalReceiptHash: labels['privos.mcp.approval-receipt']!,
+			authorizationEpoch: Number(labels['privos.mcp.authorization-epoch']),
+			deploymentGrantHash: labels['privos.mcp.deployment-grant-hash']!,
+			resourceManifestHash: labels['privos.mcp.resource-manifest-hash']!,
+			runtimeResourceInventoryHash: parsed.data.runtimeResourceInventoryHash,
+			hubOrigin: labels['privos.mcp.hub-origin']!,
+			hubKid: labels['privos.mcp.hub-kid']!,
+			hubPublicJwk,
+			networkName: getAppNetworkName(labels['privos.mcp.workspace']),
+		});
+		return { ok: true };
 	});
 };
 

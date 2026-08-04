@@ -13,7 +13,7 @@ function sortCanonical(value: unknown): unknown {
 	if (value && typeof value === 'object') {
 		return Object.fromEntries(
 			Object.entries(value as Record<string, unknown>)
-				.sort(([left], [right]) => left.localeCompare(right))
+				.sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
 				.map(([key, child]) => [key, sortCanonical(child)]),
 		);
 	}
@@ -26,6 +26,11 @@ export function canonicalJson(value: unknown): string {
 
 export function sha256(value: string | Buffer): string {
 	return `sha256:${crypto.createHash('sha256').update(value).digest('hex')}`;
+}
+
+/** Protocol-v3 canonical/artifact hash: unpadded base64url SHA-256. */
+export function sha256Base64Url(value: string | Buffer): string {
+	return crypto.createHash('sha256').update(value).digest('base64url');
 }
 
 export function jwkThumbprint(jwk: JsonWebKey): string {
@@ -58,12 +63,17 @@ export function verifyEs256Jws(input: {
 	publicJwk: JsonWebKey;
 	typ: string;
 	kid?: string;
+	protocolVersion?: number;
 }): ParsedJws {
 	const parsed = parseJws(input.compact);
 	if (
 		parsed.header.alg !== 'ES256' ||
 		parsed.header.typ !== input.typ ||
-		(input.kid && parsed.header.kid !== input.kid)
+		(input.kid && parsed.header.kid !== input.kid) ||
+		(input.protocolVersion !== undefined && parsed.header.privos_protocol !== input.protocolVersion) ||
+		input.publicJwk.kty !== 'EC' ||
+		input.publicJwk.crv !== 'P-256' ||
+		Boolean(input.publicJwk.d)
 	) {
 		throw new Error('artifact_signature_invalid');
 	}
@@ -79,10 +89,20 @@ export function signEs256Jws(input: {
 	privateJwk: JsonWebKey;
 	kid: string;
 	typ: string;
+	protocolVersion?: number;
 }): string {
-	if (!input.privateJwk.d) throw new Error('private_jwk_invalid');
+	if (
+		!input.privateJwk.d ||
+		input.privateJwk.kty !== 'EC' ||
+		input.privateJwk.crv !== 'P-256'
+	) throw new Error('private_jwk_invalid');
 	const encodedHeader = Buffer.from(
-		canonicalJson({ alg: 'ES256', kid: input.kid, typ: input.typ, privos_protocol: 2 }),
+		canonicalJson({
+			alg: 'ES256',
+			kid: input.kid,
+			typ: input.typ,
+			privos_protocol: input.protocolVersion ?? 2,
+		}),
 	).toString('base64url');
 	const encodedPayload = Buffer.from(canonicalJson(input.payload)).toString('base64url');
 	const signingInput = Buffer.from(`${encodedHeader}.${encodedPayload}`, 'utf8');

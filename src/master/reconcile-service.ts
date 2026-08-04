@@ -48,6 +48,9 @@ export class ReconcileService {
 	): Promise<number> {
 		const appId = container.appId ?? container.id;
 		const app = await this.deps.repositories.apps.findOne({ appId, workspaceId });
+		// V3 recovery must resume from its persisted generation plan and exact
+		// inventory. Generic discovery must never invent a replica or mark it RUNNING.
+		if (container.mcpV3 || app?.kind === 'mcp-v3') return 0;
 		if (app) {
 			if (app.replicas.some((replica) => replica.containerId === container.id)) return 0;
 			await this.deps.repositories.apps.updateOne(

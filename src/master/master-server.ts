@@ -17,11 +17,13 @@ import { hubFacingRoutes } from './hub-facing-routes.js';
 import { portalAdminRoutes } from './portal-admin-routes.js';
 import { UsageAggregator } from './usage-aggregator.js';
 import { McpSecurityVerifier } from './mcp-security.js';
+import { ClusterMasterIdentity } from './cluster-master-identity.js';
 
 export function buildMasterServer(config: MasterConfig, repositories: MasterRepositories) {
 	const fastify = Fastify({ logger: { level: config.MASTER_LOG_LEVEL }, trustProxy: true });
 	const cipher = new KeyCipher(Buffer.from(config.APP_MASTER_KEY_ENCRYPTION_KEY_B64, 'base64'));
 	const agentClient = new AgentClient(cipher);
+	const clusterMasterIdentity = new ClusterMasterIdentity(repositories, cipher, config.APP_MASTER_CLUSTER_ID);
 	const ingress = new IngressRouteProgrammer({
 		enabled: config.APPS_INGRESS_ENABLED,
 		zoneId: config.CF_APPS_ZONE_ID,
@@ -39,7 +41,7 @@ export function buildMasterServer(config: MasterConfig, repositories: MasterRepo
 		locks: new WorkspaceLock(),
 		baseDomain: config.APPS_BASE_DOMAIN,
 	});
-	const mcpSecurity = config.APP_CLUSTER_MCP_INSTALL_V2 === 'on'
+	const mcpSecurity = config.APP_CLUSTER_MCP_INSTALL_V2 === 'on' || config.APP_CLUSTER_MCP_INSTALL_V3 === 'on'
 		? new McpSecurityVerifier(repositories, config.APP_MASTER_CLUSTER_ID)
 		: undefined;
 	fastify.get('/health', async () => ({
@@ -55,6 +57,9 @@ export function buildMasterServer(config: MasterConfig, repositories: MasterRepo
 		agentClient,
 		baseDomain: config.APPS_BASE_DOMAIN,
 		mcpSecurity,
+		mcpV2Enabled: config.APP_CLUSTER_MCP_INSTALL_V2 === 'on',
+		mcpV3Enabled: config.APP_CLUSTER_MCP_INSTALL_V3 === 'on',
+		clusterMasterIdentity,
 		mcpReleaseAuthorityJwks: (JSON.parse(config.MCP_RELEASE_AUTHORITY_JWKS_JSON) as { keys: JsonWebKey[] }).keys,
 	}));
 	fastify.register(portalAdminRoutes({

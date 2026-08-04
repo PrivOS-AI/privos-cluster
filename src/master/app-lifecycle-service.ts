@@ -28,6 +28,12 @@ export class AppLifecycleService {
 		action: 'start' | 'stop' | 'restart',
 	): Promise<unknown> {
 		const app = await this.load(workspaceId, appId);
+		if (app.kind === 'mcp-v3') {
+			throw Object.assign(new Error('MCP v3 lifecycle requires a signed Hub command'), {
+				code: 'MCP_SIGNED_LIFECYCLE_REQUIRED',
+				statusCode: 409,
+			});
+		}
 		const nodes = await this.loadNodes(app.replicas.map((replica) => replica.nodeId));
 		const responses = await Promise.all(app.replicas.map((replica) => {
 			const node = nodes.get(replica.nodeId)!;
@@ -70,7 +76,7 @@ export class AppLifecycleService {
 		},
 	): Promise<unknown> {
 		const app = await this.load(workspaceId, appId);
-		if (app.kind === 'mcp-v2') {
+		if (app.kind === 'mcp-v2' || app.kind === 'mcp-v3') {
 			const error: Error & { code?: string; statusCode?: number } = new Error(
 				'MCP redeployments require a new signed deployment grant',
 			);
@@ -146,6 +152,12 @@ export class AppLifecycleService {
 
 	async remove(workspaceId: string, appId: string): Promise<void> {
 		const app = await this.load(workspaceId, appId);
+		if (app.kind === 'mcp-v3') {
+			throw Object.assign(new Error('MCP v3 removal requires a signed Hub lifecycle command'), {
+				code: 'MCP_SIGNED_LIFECYCLE_REQUIRED',
+				statusCode: 409,
+			});
+		}
 		await this.deps.repositories.apps.updateOne(
 			{ appId, workspaceId },
 			{ $set: { state: 'REMOVING', updatedAt: new Date() } },
@@ -213,7 +225,9 @@ export class AppLifecycleService {
 			domain: new URL(app.uiUrl).hostname.split('.').slice(1).join('.'),
 			uiUrl: app.uiUrl,
 			availabilityTier: app.availabilityTier,
-			replicas: app.replicas,
+			...(app.kind === 'mcp-v3'
+				? { replicaCount: app.replicas.length }
+				: { replicas: app.replicas }),
 			createdAt: app.createdAt.getTime(),
 		};
 	}

@@ -15,6 +15,7 @@ import {
 import { mcpBrokerManager } from './mcp-broker.js';
 import { refreshRoutes } from '../proxy/proxy-router.js';
 import type { Container, ContainerResources, ContainerVolume, DeployRequest, RedeployRequest } from '../types/index.js';
+import { canonicalJson } from '../security/artifacts.js';
 
 const logger = pino({ level: config.LOG_LEVEL }).child({ component: 'lifecycle' });
 
@@ -229,7 +230,57 @@ export async function deployManagedApp(req: DeployRequest): Promise<Container> {
 
     // Cluster always generates its own UUID for container naming (uniqueness).
     // req.appId is stored as metadata only.
-    const clusterId = crypto.randomUUID();
+    const clusterId = req.mcpV3Binding?.containerId ?? crypto.randomUUID();
+	if (req.mcpV3Binding) {
+		const existing = await dockerState.getById(clusterId, getHealth, req.workspaceId);
+		if (existing) {
+			const info = await containerManager.inspectContainer(existing.dockerContainerId);
+			const labels = (info.Config?.Labels ?? {}) as Record<string, string>;
+			const expected = {
+				'privos.id': req.mcpV3Binding.containerId,
+				'privos.app-id': req.appId ?? '',
+				'privos.workspace': req.mcpV3Binding.workspaceId,
+				'privos.image.digest': req.mcpV3Binding.imageDigest,
+				'privos.mcp.schema': '3',
+				'privos.mcp.cluster': req.mcpV3Binding.clusterId,
+				'privos.mcp.node': req.mcpV3Binding.nodeId,
+				'privos.mcp.workspace': req.mcpV3Binding.workspaceId,
+				'privos.mcp.deployment': req.mcpV3Binding.deploymentId,
+				'privos.mcp.generation': req.mcpV3Binding.generationId,
+				'privos.mcp.generation-number': String(req.mcpV3Binding.generationNumber),
+				'privos.mcp.runtime-installation': req.mcpV3Binding.runtimeInstallationId,
+				'privos.mcp.app': req.mcpV3Binding.mcpAppId,
+				'privos.mcp.replica': req.mcpV3Binding.replicaId,
+				'privos.mcp.resource.kind': 'CONTAINER',
+				'privos.mcp.resource.id': req.mcpV3Binding.containerId,
+				'privos.mcp.image.digest': req.mcpV3Binding.imageDigest,
+				'privos.mcp.manifest.digest': req.mcpV3Binding.manifestDigest,
+				'privos.mcp.approval-receipt': req.mcpV3Binding.approvalReceiptHash,
+				'privos.mcp.authorization-epoch': String(req.mcpV3Binding.authorizationEpoch),
+				'privos.mcp.deployment-grant-hash': req.mcpV3Binding.deploymentGrantHash,
+				'privos.mcp.resource-manifest-hash': req.mcpV3Binding.resourceManifestHash,
+				'privos.mcp.hub-origin': req.mcpV3Binding.hubOrigin,
+				'privos.mcp.hub-kid': req.mcpV3Binding.hubKid,
+				'privos.mcp.hub-jwk': canonicalJson(req.mcpV3Binding.hubPublicJwk),
+			};
+			if (Object.entries(expected).some(([key, value]) => labels[key] !== value)) {
+				throw new Error('existing_mcp_v3_container_binding_mismatch');
+			}
+			await mcpBrokerManager.restoreOrRegisterProvisioningV3({
+				...req.mcpV3Binding,
+				dockerContainerId: existing.dockerContainerId,
+				networkName: getAppNetworkName(req.workspaceId),
+				runtimeResourceInventoryHash: undefined,
+			}, labels);
+			if (existing.state !== 'running') {
+				await containerManager.startContainer(existing.dockerContainerId);
+				const resumed = await dockerState.getById(clusterId, getHealth, req.workspaceId);
+				if (!resumed) throw new Error('mcp_v3_container_resume_failed');
+				return resumed;
+			}
+			return existing;
+		}
+	}
     const shortId = clusterId.slice(0, 12);
     const image = req.image;
     const tag = req.tag ?? DEFAULT_TAG;
@@ -267,7 +318,9 @@ export async function deployManagedApp(req: DeployRequest): Promise<Container> {
 
     let dockerContainerId: string | null = null;
     const createdDockerVolumes: string[] = [];
-	const brokerMount = req.mcpBinding ? await mcpBrokerManager.prepare(req.mcpBinding.replicaId) : undefined;
+	const brokerMount = req.mcpBinding || req.mcpV3Binding
+		? await mcpBrokerManager.prepare((req.mcpBinding ?? req.mcpV3Binding)!.replicaId)
+		: undefined;
 
     try {
         // Create Docker named volumes for each requested volume
@@ -308,6 +361,7 @@ export async function deployManagedApp(req: DeployRequest): Promise<Container> {
             baseDomain,
             createdAt,
 			mcpBinding: req.mcpBinding,
+			mcpV3Binding: req.mcpV3Binding,
 			brokerMount,
         });
         dockerContainerId = created.containerId;
@@ -317,6 +371,16 @@ export async function deployManagedApp(req: DeployRequest): Promise<Container> {
 				containerId: clusterId,
 				dockerContainerId,
 				networkName: getAppNetworkName(req.workspaceId),
+			});
+		} else if (req.mcpV3Binding) {
+			if (req.mcpV3Binding.runtimeResourceInventoryHash !== undefined) {
+				throw new Error('premature_runtime_inventory_claim');
+			}
+			await mcpBrokerManager.registerProvisioningV3({
+				...req.mcpV3Binding,
+				dockerContainerId,
+				networkName: getAppNetworkName(req.workspaceId),
+				runtimeResourceInventoryHash: undefined,
 			});
 		}
 
@@ -361,7 +425,9 @@ export async function deployManagedApp(req: DeployRequest): Promise<Container> {
                 // best-effort
             }
         }
-		if (req.mcpBinding) await mcpBrokerManager.cleanup(req.mcpBinding.replicaId).catch(() => undefined);
+		if (req.mcpBinding || req.mcpV3Binding) {
+			await mcpBrokerManager.cleanup((req.mcpBinding ?? req.mcpV3Binding)!.replicaId).catch(() => undefined);
+		}
         throw err;
     }
 }

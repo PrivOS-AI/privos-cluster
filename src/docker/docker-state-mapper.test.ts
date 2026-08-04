@@ -259,3 +259,78 @@ test('v2 MCP labels never create an unfiltered legacy Caddy ingress', () => {
 	assert.equal(labels['caddy.reverse_proxy'], undefined);
 	assert.equal(labels['privos.public-host'], undefined);
 });
+
+test('v3 MCP labels are generation affine without changing v2 label behavior', () => {
+	const base = {
+		id: 'cid-v3',
+		appId: 'app1',
+		image: 'registry.example/app',
+		tag: 'latest',
+		digest: `sha256:${'a'.repeat(64)}`,
+		workspaceId: 'workspace-1',
+		listingId: 'listing-1',
+		versionDigest: `sha256:${'b'.repeat(64)}`,
+		port: 3001,
+		resources: { memoryMb: 256, cpus: 0.5, tmpSizeMb: 64 },
+		subdomain: 'secure-app',
+		baseDomain: 'apps.example.com',
+	} as const;
+	const mcpV3Binding = {
+		protocolVersion: 3 as const,
+		clusterId: 'cluster-1',
+		nodeId: 'node-1',
+		workspaceId: 'workspace-1',
+		deploymentId: 'deployment-1',
+		generationId: 'generation-1',
+		generationNumber: 1,
+		runtimeInstallationId: 'runtime-1',
+		mcpAppId: 'mcp-app-1',
+		replicaId: '11111111-1111-4111-8111-111111111111',
+		containerId: 'cid-v3',
+		imageDigest: `sha256:${'a'.repeat(64)}`,
+		manifestDigest: `sha256:${'c'.repeat(64)}`,
+		approvalReceiptHash: 'a'.repeat(43),
+		authorizationEpoch: 1,
+		deploymentGrantHash: 'b'.repeat(43),
+		resourceManifestHash: 'c'.repeat(43),
+		hubOrigin: 'https://hub.example.com',
+		hubKid: 'hub-key-thumbprint',
+		hubPublicJwk: { kty: 'EC', crv: 'P-256', x: 'x', y: 'y' },
+	};
+	const labels = buildContainerLabels({ ...base, mcpV3Binding });
+	assert.equal(labels['privos.mcp.schema'], '3');
+	assert.equal(labels['privos.mcp.workspace'], 'workspace-1');
+	assert.equal(labels['privos.mcp.deployment'], 'deployment-1');
+	assert.equal(labels['privos.mcp.generation'], 'generation-1');
+	assert.equal(labels['privos.mcp.runtime-installation'], 'runtime-1');
+	assert.equal(labels['privos.mcp.runtime-resource-inventory-hash'], undefined);
+	assert.equal(labels['privos.mcp.resource.id'], 'cid-v3');
+	assert.equal(labels.caddy, undefined);
+	const inspectWithV3 = inspect();
+	const mapped = mapInspectToContainer({
+		...inspectWithV3,
+		Config: { ...inspectWithV3.Config, Labels: labels },
+	} as any);
+	assert.equal(mapped.mcpV2, true);
+	assert.equal(mapped.mcpV3, true);
+	assert.throws(() => buildContainerLabels({
+		...base,
+		mcpV3Binding,
+		mcpBinding: {
+			clusterId: 'cluster-1',
+			nodeId: 'node-1',
+			workspaceId: 'workspace-1',
+			installationId: 'installation-1',
+			mcpAppId: 'mcp-app-1',
+			replicaId: '11111111-1111-4111-8111-111111111111',
+			imageDigest: `sha256:${'a'.repeat(64)}`,
+			manifestDigest: `sha256:${'c'.repeat(64)}`,
+			receiptHash: `sha256:${'d'.repeat(64)}`,
+			grantEpoch: 1,
+			deploymentGrantHash: `sha256:${'e'.repeat(64)}`,
+			hubOrigin: 'https://hub.example.com',
+			hubKid: 'hub-key-thumbprint',
+			hubPublicJwk: { kty: 'EC', crv: 'P-256', x: 'x', y: 'y' },
+		},
+	}), /mcp_protocol_binding_conflict/);
+});

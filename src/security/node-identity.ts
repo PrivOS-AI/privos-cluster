@@ -120,8 +120,8 @@ export class NodeIdentity {
 		return { nodeId: identity.nodeId, kid: identity.kid, publicJwk: identity.publicJwk };
 	}
 
-	async sign(payload: Record<string, unknown>, typ: string): Promise<string> {
+	async sign(payload: Record<string, unknown>, typ: string, protocolVersion?: number): Promise<string> {
 		const identity = await this.load();
-		return signEs256Jws({ payload, privateJwk: identity.privateJwk, kid: identity.kid, typ });
+		return signEs256Jws({ payload, privateJwk: identity.privateJwk, kid: identity.kid, typ, protocolVersion });
 	}
 }

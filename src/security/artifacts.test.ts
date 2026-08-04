@@ -5,12 +5,19 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { canonicalJson, jwkThumbprint, sha256, signEs256Jws, verifyEs256Jws } from './artifacts.js';
+import { canonicalJson, jwkThumbprint, parseJws, sha256, sha256Base64Url, signEs256Jws, verifyEs256Jws } from './artifacts.js';
 import { generateNodeIdentity, rotateNodeIdentityFile, validateNodeIdentity } from './node-identity.js';
 
 test('canonical JSON and digest are stable across property order', () => {
 	assert.equal(canonicalJson({ z: 1, a: { y: 2, b: 3 } }), '{"a":{"b":3,"y":2},"z":1}');
 	assert.equal(sha256(canonicalJson({ b: 2, a: 1 })), sha256(canonicalJson({ a: 1, b: 2 })));
+	assert.match(sha256Base64Url(canonicalJson({ a: 1 })), /^[A-Za-z0-9_-]{43}$/);
+});
+
+test('canonical JSON freezes locale-independent UTF-16 code-unit ordering', () => {
+	const canonical = canonicalJson({ 'ä': 1, Z: 2, a: 3, A: 4 });
+	assert.equal(canonical, '{"A":4,"Z":2,"a":3,"ä":1}');
+	assert.equal(sha256Base64Url(canonical), '6sXZfEHGkkeyqCwwo0Dfx0-UboWlGXnMKRCmhTAblK8');
 });
 
 test('ES256 artifacts verify only with the pinned key and type', () => {
@@ -19,6 +26,7 @@ test('ES256 artifacts verify only with the pinned key and type', () => {
 	const publicJwk = pair.publicKey.export({ format: 'jwk' });
 	const kid = jwkThumbprint(publicJwk);
 	const compact = signEs256Jws({ payload: { value: 'ok' }, privateJwk, kid, typ: 'test+jws' });
+	assert.equal(parseJws(compact).header.privos_protocol, 2);
 	assert.equal(verifyEs256Jws({ compact, publicJwk, kid, typ: 'test+jws' }).payload.value, 'ok');
 	assert.throws(() => verifyEs256Jws({ compact, publicJwk, kid, typ: 'wrong+jws' }), /artifact_signature_invalid/);
 });

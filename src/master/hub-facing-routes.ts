@@ -1,5 +1,6 @@
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
 import type { JsonWebKey } from 'node:crypto';
+import { z } from 'zod';
 import type { WorkspaceAuth } from './workspace-auth.js';
 import { bearerFromHeader } from './workspace-auth.js';
 import type { DeploymentService } from './deployment-service.js';
@@ -8,8 +9,43 @@ import type { MasterRepositories } from './repositories.js';
 import type { AgentClient, AgentResponse } from './agent-client.js';
 import type { McpSecurityVerifier } from './mcp-security.js';
 import { verifyMarketplaceReleaseAttestation } from './mcp-security.js';
-import { jwkThumbprint, sha256 } from '../security/artifacts.js';
+import { jwkThumbprint, sha256, sha256Base64Url } from '../security/artifacts.js';
 import { clusterMcpSafeReason, recordClusterMcpEvent } from '../services/mcp-observability.js';
+import type { ClusterMasterIdentity } from './cluster-master-identity.js';
+
+const DispatchRpcSchema = z.object({
+	jsonrpc: z.string().optional(),
+	method: z.string(),
+	params: z.unknown().optional(),
+	id: z.union([z.string(), z.number()]).optional(),
+});
+
+const McpV3InstallBodySchema = z.object({
+	deploymentGrantJws: z.string().min(1),
+}).strict();
+
+const McpV3ActivationBodySchema = z.object({
+	runtimeInventoryAttestation: z.object({
+		compact: z.string().min(1),
+		artifactHash: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+	}).strict(),
+}).strict();
+
+const McpV3DispatchBodySchema = z.discriminatedUnion('authorizationContext', [
+	z.object({
+		assertion: z.string().min(1),
+		rpc: DispatchRpcSchema,
+		authorizationContext: z.literal('workspace'),
+		runtimeInstallationId: z.string().min(1).max(160),
+	}).strict(),
+	z.object({
+		assertion: z.string().min(1),
+		rpc: DispatchRpcSchema,
+		authorizationContext: z.literal('room'),
+		runtimeInstallationId: z.string().min(1).max(160),
+		authorizationBindingId: z.string().min(1).max(160),
+	}).strict(),
+]);
 
 declare module 'fastify' {
 	interface FastifyRequest {
@@ -37,6 +73,9 @@ export function hubFacingRoutes(deps: {
 	agentClient: AgentClient;
 	baseDomain: string;
 	mcpSecurity?: McpSecurityVerifier;
+	mcpV2Enabled: boolean;
+	mcpV3Enabled: boolean;
+	clusterMasterIdentity: ClusterMasterIdentity;
 	mcpReleaseAuthorityJwks: JsonWebKey[];
 }): FastifyPluginAsync {
 	return async (fastify) => {
@@ -126,10 +165,105 @@ export function hubFacingRoutes(deps: {
 		{
 			const app = await deps.repositories.apps.findOne({ workspaceId: workspaceId(req), appId: appId(req), state: { $ne: 'REMOVED' } });
 			if (!app) return reply.code(404).send({ error: 'app not found' });
+			if (app.kind === 'mcp-v3') {
+				if (!deps.mcpV3Enabled || !deps.mcpSecurity) {
+					return reply.code(404).send({ error: 'mcp_install_v3_disabled' });
+				}
+				if (
+					app.state !== 'RUNNING' ||
+					!app.mcpInventoryAttestationEstablishedAt ||
+					!app.mcpDeploymentId ||
+					!app.mcpGenerationId ||
+					!app.mcpGenerationNumber ||
+					!app.mcpRuntimeInstallationId ||
+					!app.mcpAppId ||
+					!app.manifestDigest ||
+					!app.mcpApprovalReceiptHash ||
+					!app.mcpAuthorizationEpoch ||
+					!app.resourceManifestHash ||
+					!app.runtimeResourceInventoryHash
+				) return reply.code(409).send({ error: 'mcp_v3_runtime_not_active' });
+				const body = McpV3DispatchBodySchema.safeParse(req.body);
+				if (!body.success) {
+					return reply.code(400).send({ error: 'validation_error', details: body.error.issues });
+				}
+				if (body.data.runtimeInstallationId !== app.mcpRuntimeInstallationId) {
+					return reply.code(403).send({ error: 'mcp_dispatch_denied', code: 'GENERATION_AFFINITY_MISMATCH' });
+				}
+				try {
+					await deps.mcpSecurity.consumeDispatchAssertionV3({
+						compact: body.data.assertion,
+						rpc: body.data.rpc,
+						workspaceId: app.workspaceId,
+						expected: {
+							deploymentId: app.mcpDeploymentId,
+							generationId: app.mcpGenerationId,
+							generationNumber: app.mcpGenerationNumber,
+							runtimeInstallationId: app.mcpRuntimeInstallationId,
+							resourceManifestHash: app.resourceManifestHash,
+							runtimeResourceInventoryHash: app.runtimeResourceInventoryHash,
+							issuer: `urn:privos:hub:${app.mcpDeploymentId}`,
+							manifestDigest: app.manifestDigest,
+							runtimeApprovalReceiptHash: app.mcpApprovalReceiptHash,
+							runtimeGrantEpoch: app.mcpAuthorizationEpoch,
+							mcpAppId: app.mcpAppId!,
+							clusterAppId: app.appId,
+						},
+						authorization: body.data,
+					});
+				} catch (error) {
+					const reason = clusterMcpSafeReason(error, 'dispatch_assertion_invalid');
+					recordClusterMcpEvent({
+						event: 'private_dispatch', outcome: 'denied', boundary: 'master_v3', reason,
+						correlationId: app.mcpRuntimeInstallationId,
+					});
+					return reply.code(403).send({
+						error: 'mcp_dispatch_denied',
+						code: reason,
+					});
+				}
+				recordClusterMcpEvent({
+					event: 'private_dispatch', outcome: 'allowed', boundary: 'master_v3', reason: 'verified',
+					correlationId: app.mcpRuntimeInstallationId, emitLog: false,
+				});
+				const activeNodes = await deps.repositories.nodes.find({
+					nodeId: { $in: app.replicas.map((replica) => replica.nodeId) },
+					status: 'ACTIVE',
+				}).toArray();
+				const candidates = app.replicas.flatMap((replica) => {
+					const node = activeNodes.find((candidate) => candidate.nodeId === replica.nodeId);
+					return replica.state === 'running' && node ? [{ replica, node }] : [];
+				});
+				const health = await Promise.all(candidates.map(async (candidate) => {
+					try {
+						const response = await deps.agentClient.request(
+							candidate.node,
+							app.workspaceId,
+							'GET',
+							`/api/v1/apps/${candidate.replica.containerId}/status`,
+						);
+						const status = response.body as { state?: unknown; healthStatus?: unknown };
+						return response.status < 300 && status.state === 'running' && status.healthStatus !== 'unhealthy'
+							? candidate
+							: null;
+					} catch {
+						return null;
+					}
+				}));
+				const selected = health.find((candidate) => candidate !== null);
+				if (!selected) return reply.code(409).send({ error: 'replica_node_unavailable' });
+				return sendAgent(reply, await deps.agentClient.request(
+					selected.node,
+					app.workspaceId,
+					'POST',
+					`/api/v1/apps/${selected.replica.containerId}/dispatch`,
+					{ ...body.data, runtimeResourceInventoryHash: app.runtimeResourceInventoryHash },
+				));
+			}
 			if (app.kind !== 'mcp-v2') {
 				return sendAgent(reply, await deps.lifecycle.proxy(workspaceId(req), appId(req), 'POST', '/dispatch', req.body));
 			}
-			if (!deps.mcpSecurity || app.state !== 'RUNNING' || !app.mcpInstallationId || !app.receiptHash || !app.grantEpoch) {
+			if (!deps.mcpV2Enabled || !deps.mcpSecurity || app.state !== 'RUNNING' || !app.mcpInstallationId || !app.receiptHash || !app.grantEpoch) {
 				return reply.code(409).send({ error: 'mcp_app_not_dispatchable' });
 			}
 			const body = req.body as { assertion?: string; rpc?: unknown };
@@ -183,7 +317,9 @@ export function hubFacingRoutes(deps: {
 		});
 		fastify.delete(`${root}/apps/:appId`, { preHandler: authenticate }, async (req, reply) => {
 			const app = await deps.repositories.apps.findOne({ workspaceId: workspaceId(req), appId: appId(req), state: { $ne: 'REMOVED' } });
-			if (app?.kind === 'mcp-v2') return reply.code(409).send({ error: 'mcp_revocation_required' });
+			if (app?.kind === 'mcp-v2' || app?.kind === 'mcp-v3') {
+				return reply.code(409).send({ error: 'mcp_revocation_required' });
+			}
 			await deps.lifecycle.remove(workspaceId(req), appId(req));
 			return { ok: true };
 		});
@@ -203,6 +339,23 @@ export function hubFacingRoutes(deps: {
 			const response = await deps.agentClient.request(node, workspaceId(req), 'POST', '/api/v1/mcp/images/inspect', req.body);
 			if (response.status >= 300) return sendAgent(reply, response);
 			return reply.send(response.body);
+		});
+		fastify.get(`${root}/mcp/v3/cluster-identity`, { preHandler: authenticate }, async (req, reply) => {
+			if (!deps.mcpV3Enabled) return reply.code(404).send({ error: 'mcp_install_v3_disabled' });
+			return deps.clusterMasterIdentity.publicInfo();
+		});
+		fastify.get(`${root}/mcp/v3/identity`, { preHandler: authenticate }, async (req, reply) => {
+			if (!deps.mcpV3Enabled) return reply.code(404).send({ error: 'mcp_install_v3_disabled' });
+			const identity = await deps.clusterMasterIdentity.publicInfo();
+			return {
+				protocolVersion: identity.protocolVersion,
+				clusterId: identity.clusterId,
+				issuer: identity.issuer,
+				algorithm: identity.algorithm,
+				kid: identity.kid,
+				publicJwk: identity.publicJwk,
+				artifactTypes: identity.artifactTypes,
+			};
 		});
 		fastify.post(`${root}/mcp/identity/enroll`, { preHandler: authenticate }, async (req, reply) => {
 			if (!deps.mcpSecurity) return reply.code(404).send({ error: 'mcp_install_v2_disabled' });
@@ -263,7 +416,7 @@ export function hubFacingRoutes(deps: {
 		});
 
 		fastify.post(`${root}/mcp/apps/install`, { preHandler: authenticate }, async (req, reply) => {
-			if (!deps.mcpSecurity) return reply.code(404).send({ error: 'mcp_install_v2_disabled' });
+			if (!deps.mcpV2Enabled || !deps.mcpSecurity) return reply.code(404).send({ error: 'mcp_install_v2_disabled' });
 			const compact = (req.body as { deploymentGrant?: string })?.deploymentGrant;
 			if (!compact) return reply.code(400).send({ error: 'deployment_grant_required' });
 			let grant: Awaited<ReturnType<McpSecurityVerifier['consumeDeploymentGrant']>>;
@@ -325,8 +478,91 @@ export function hubFacingRoutes(deps: {
 			});
 		});
 
+		fastify.post(`${root}/mcp/v3/apps/install`, { preHandler: authenticate }, async (req, reply) => {
+			if (!deps.mcpV3Enabled || !deps.mcpSecurity) {
+				return reply.code(404).send({ error: 'mcp_install_v3_disabled' });
+			}
+			const body = McpV3InstallBodySchema.safeParse(req.body);
+			if (!body.success) return reply.code(400).send({ error: 'validation_error', details: body.error.issues });
+			let grant: Awaited<ReturnType<McpSecurityVerifier['consumeProvisioningDeploymentGrantV3']>>;
+			try {
+				grant = await deps.mcpSecurity.consumeProvisioningDeploymentGrantV3({
+					compact: body.data.deploymentGrantJws,
+					workspaceId: workspaceId(req),
+				});
+			} catch (error) {
+				return reply.code(403).send({
+					error: 'deployment_grant_invalid',
+					code: clusterMcpSafeReason(error, 'deployment_grant_invalid'),
+				});
+			}
+			const node = await deps.repositories.nodes.findOne({ status: 'ACTIVE' });
+			if (!node) return reply.code(409).send({ error: 'CAPACITY_UNAVAILABLE' });
+			const inspectedResponse = await deps.agentClient.request(node, workspaceId(req), 'POST', '/api/v1/mcp/images/inspect', {
+				image: grant.deployment.image,
+				digest: grant.deployment.imageDigest,
+			});
+			if (inspectedResponse.status >= 300) return sendAgent(reply, inspectedResponse);
+			const inspected = inspectedResponse.body as { imageDigest: string; manifestDigest: string };
+			if (
+				inspected.imageDigest !== grant.deployment.imageDigest ||
+				inspected.manifestDigest !== grant.deployment.manifestDigest
+			) return reply.code(409).send({ error: 'inspected_artifact_binding_mismatch' });
+			verifyMarketplaceReleaseAttestation({
+				compact: grant.deployment.releaseAttestationJws,
+				trustedJwks: deps.mcpReleaseAuthorityJwks,
+				listingId: grant.deployment.listingId,
+				imageDigest: inspected.imageDigest,
+				manifestDigest: inspected.manifestDigest,
+			});
+			const hubIdentity = await deps.mcpSecurity.publicInfo(workspaceId(req));
+			if (!hubIdentity) return reply.code(409).send({ error: 'hub_identity_not_enrolled' });
+			const { app, inventory } = await deps.deployment.deployMcpV3(
+				workspaceId(req),
+				grant,
+				sha256Base64Url(body.data.deploymentGrantJws),
+				hubIdentity,
+			);
+			const attestation = await deps.clusterMasterIdentity.signRuntimeInventoryAttestation({
+				deploymentGrantJti: grant.jti,
+				inventoryId: inventory.inventoryId,
+			});
+			return reply.code(201).send({
+				state: 'PROVISIONING',
+				clusterAppId: app.appId,
+				runtimeInstallationId: grant.runtimeInstallationId,
+				runtimeInventoryAttestation: {
+					compact: attestation.compact,
+					artifactHash: attestation.artifactHash,
+					kid: attestation.kid,
+				},
+			});
+		});
+
+		fastify.post(`${root}/mcp/v3/apps/:runtimeInstallationId/activate`, { preHandler: authenticate }, async (req, reply) => {
+			if (!deps.mcpV3Enabled) return reply.code(404).send({ error: 'mcp_install_v3_disabled' });
+			const body = McpV3ActivationBodySchema.safeParse(req.body);
+			if (!body.success) return reply.code(400).send({ error: 'validation_error', details: body.error.issues });
+			const app = await deps.deployment.activateMcpV3(workspaceId(req), {
+				runtimeInstallationId: (req.params as { runtimeInstallationId: string }).runtimeInstallationId,
+				compact: body.data.runtimeInventoryAttestation.compact,
+				artifactHash: body.data.runtimeInventoryAttestation.artifactHash,
+			});
+			if (!(app.mcpInventoryAttestationEstablishedAt instanceof Date)) {
+				throw new Error('mcp_v3_activation_timestamp_missing');
+			}
+			const activatedAt = Math.floor(app.mcpInventoryAttestationEstablishedAt.getTime() / 1000);
+			if (!Number.isSafeInteger(activatedAt) || activatedAt < 1) throw new Error('mcp_v3_activation_timestamp_invalid');
+			return {
+				state: 'RUNNING',
+				clusterAppId: app.appId,
+				runtimeInstallationId: app.mcpRuntimeInstallationId,
+				activatedAt,
+			};
+		});
+
 		fastify.post(`${root}/mcp/apps/:installationId/activate`, { preHandler: authenticate }, async (req) => {
-			if (!deps.mcpSecurity) throw Object.assign(new Error('mcp_install_v2_disabled'), { statusCode: 404 });
+			if (!deps.mcpV2Enabled || !deps.mcpSecurity) throw Object.assign(new Error('mcp_install_v2_disabled'), { statusCode: 404 });
 			const body = req.body as { receiptHash?: string; grantEpoch?: number };
 			return deps.deployment.activateMcp(workspaceId(req), {
 				installationId: (req.params as { installationId: string }).installationId,
@@ -336,7 +572,7 @@ export function hubFacingRoutes(deps: {
 		});
 
 		fastify.post(`${root}/mcp/apps/:installationId/revoke`, { preHandler: authenticate }, async (req, reply) => {
-			if (!deps.mcpSecurity) return reply.code(404).send({ error: 'mcp_install_v2_disabled' });
+			if (!deps.mcpV2Enabled || !deps.mcpSecurity) return reply.code(404).send({ error: 'mcp_install_v2_disabled' });
 			const installationId = (req.params as { installationId: string }).installationId;
 			const body = req.body as { receiptHash?: string; grantEpoch?: number };
 			const app = await deps.repositories.apps.findOne({

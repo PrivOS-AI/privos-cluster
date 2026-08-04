@@ -2,9 +2,9 @@ import Docker from 'dockerode';
 
 import { resolveImmutableImageReference } from './image-reference.js';
 import { config } from '../config.js';
-import type { ContainerResources } from '../types/index.js';
-import type { McpRuntimeBinding } from '../types/index.js';
+import type { ContainerResources, McpRuntimeBinding, McpRuntimeBindingV3 } from '../types/index.js';
 import { getAppNetworkName } from '../services/settings-service.js';
+import { buildMcpRuntimeResourceLabelsV3 } from '../security/mcp-resource-labels-v3.js';
 
 export interface CreateContainerConfig {
     id: string;             // cluster-generated uuid — becomes the API container id (label privos.id)
@@ -25,6 +25,7 @@ export interface CreateContainerConfig {
     createdBy?: string | null;     // JWT sub of the deployer
     createdAt?: number;            // epoch ms (defaults to now)
     mcpBinding?: McpRuntimeBinding;
+	mcpV3Binding?: McpRuntimeBindingV3;
     brokerMount?: { source: string; target: string };
 }
 
@@ -62,7 +63,9 @@ export function buildContainerLabels(cfg: {
     createdBy?: string | null;
     createdAt?: number;
 	mcpBinding?: McpRuntimeBinding;
+	mcpV3Binding?: McpRuntimeBindingV3;
 }): Record<string, string> {
+	if (cfg.mcpBinding && cfg.mcpV3Binding) throw new Error('mcp_protocol_binding_conflict');
     const labels: Record<string, string> = {
         // Legacy discovery labels (kept for backward compat with existing tooling).
         'mcp-app': 'true',
@@ -110,10 +113,16 @@ export function buildContainerLabels(cfg: {
 			'privos.mcp.hub-jwk': JSON.stringify(cfg.mcpBinding.hubPublicJwk),
 		});
 	}
+	if (cfg.mcpV3Binding) {
+		Object.assign(labels, buildMcpRuntimeResourceLabelsV3(cfg.mcpV3Binding, {
+			kind: 'CONTAINER',
+			resourceId: cfg.id,
+		}));
+	}
     // V2 workloads are published only through the native path-aware proxy,
     // which blocks MCP/bootstrap/identity routes. Never let legacy Caddy label
     // discovery create an unfiltered second ingress.
-    if (cfg.subdomain && cfg.baseDomain && !cfg.mcpBinding) {
+    if (cfg.subdomain && cfg.baseDomain && !cfg.mcpBinding && !cfg.mcpV3Binding) {
         const host = `${cfg.subdomain}.${cfg.baseDomain}`;
         labels.caddy = host;
         // `{{upstreams N}}` resolves to the container's network IP:N at runtime.
@@ -204,6 +213,7 @@ export class ContainerManager {
                 createdBy: cfg.createdBy,
                 createdAt: cfg.createdAt,
 				mcpBinding: cfg.mcpBinding,
+				mcpV3Binding: cfg.mcpV3Binding,
             }),
             HostConfig: {
                 NetworkMode: getAppNetworkName(cfg.workspaceId),
