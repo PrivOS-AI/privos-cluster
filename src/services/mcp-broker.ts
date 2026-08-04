@@ -368,6 +368,11 @@ export class McpBrokerManager {
 		await fs.rm(this.directory(replicaId), { recursive: true, force: true });
 	}
 
+	/** True while a broker socket for this replica is still live and bindable. */
+	isBound(replicaId: string): boolean {
+		return this.servers.has(replicaId);
+	}
+
 	async closeAll(): Promise<void> {
 		await Promise.all([...this.servers.keys()].map((replicaId) => this.close(replicaId)));
 	}

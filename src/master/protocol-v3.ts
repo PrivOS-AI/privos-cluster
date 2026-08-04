@@ -333,6 +333,8 @@ export const ClusterLifecycleStepV3Schema = z.enum([
 	'ACKNOWLEDGEMENT_SIGNED',
 ]);
 
+export type ClusterLifecycleStepV3 = z.infer<typeof ClusterLifecycleStepV3Schema>;
+
 export const ClusterLifecycleCheckpointV3Schema = z.object({
 	protocolVersion: z.literal(MCP_PROTOCOL_V3),
 	type: z.literal('cluster-lifecycle-checkpoint'),

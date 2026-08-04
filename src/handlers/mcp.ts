@@ -240,6 +240,129 @@ const mcpHandler: FastifyPluginAsync = async (fastify) => {
 		});
 		return { ok: true };
 	});
+
+	/**
+	 * Remove exactly the resources the master's persisted inventory names.
+	 *
+	 * Container inspection is never the source of truth here: a container that is
+	 * already gone, or an inspect that fails, must not silently skip its volumes.
+	 * Every declared identity is acted on and reported individually so the master
+	 * can prove absence instead of assuming it.
+	 */
+	fastify.post('/api/v1/mcp/v3/runtimes/remove', { preHandler: fastify.authenticate }, async (req, reply) => {
+		if (config.APP_CLUSTER_MCP_INSTALL_V3 !== 'on') {
+			return reply.code(404).send({ error: 'mcp_install_v3_disabled' });
+		}
+		const parsed = RuntimeCleanupBodySchema.safeParse(req.body);
+		if (!parsed.success) return reply.code(400).send({ error: 'validation_error', details: parsed.error.issues });
+		const workspaceId = req.clusterAuth?.workspaceId;
+		const results = [];
+		for (const resource of parsed.data.resources) {
+			results.push(await removeRuntimeResource(resource, workspaceId));
+		}
+		return { results };
+	});
+
+	fastify.post('/api/v1/mcp/v3/runtimes/absence', { preHandler: fastify.authenticate }, async (req, reply) => {
+		if (config.APP_CLUSTER_MCP_INSTALL_V3 !== 'on') {
+			return reply.code(404).send({ error: 'mcp_install_v3_disabled' });
+		}
+		const parsed = RuntimeCleanupBodySchema.safeParse(req.body);
+		if (!parsed.success) return reply.code(400).send({ error: 'validation_error', details: parsed.error.issues });
+		const workspaceId = req.clusterAuth?.workspaceId;
+		const results = [];
+		for (const resource of parsed.data.resources) {
+			results.push(await observeRuntimeResource(resource, workspaceId));
+		}
+		return { results };
+	});
 };
+
+const RuntimeCleanupBodySchema = z
+	.object({
+		runtimeInstallationId: z.string().min(1).max(160),
+		resources: z.array(RuntimeResourceDescriptorV3Schema).min(1).max(512),
+	})
+	.strict();
+
+type RuntimeCleanupOutcome = {
+	kind: string;
+	resourceId: string;
+	status: 'ABSENT' | 'REMOVED' | 'FAILED' | 'UNKNOWN';
+	reasonCode: string | null;
+};
+
+const CONTAINER_KINDS = new Set(['REPLICA', 'CONTAINER']);
+
+async function removeRuntimeResource(
+	resource: z.infer<typeof RuntimeResourceDescriptorV3Schema>,
+	workspaceId?: string,
+): Promise<RuntimeCleanupOutcome> {
+	const identity = { kind: resource.kind, resourceId: resource.resourceId };
+	try {
+		if (CONTAINER_KINDS.has(resource.kind)) {
+			const containerId = resource.attributes.containerId;
+			if (!containerId) return { ...identity, status: 'UNKNOWN', reasonCode: 'container_id_missing' };
+			const container = await dockerState.getById(containerId, undefined, workspaceId);
+			if (!container) return { ...identity, status: 'ABSENT', reasonCode: null };
+			await containerManager.stopContainer(container.dockerContainerId, 10).catch(() => undefined);
+			await containerManager.removeContainer(container.dockerContainerId, true);
+			return { ...identity, status: 'REMOVED', reasonCode: null };
+		}
+		if (resource.kind === 'VOLUME') {
+			const volumeName = resource.attributes.volumeName;
+			if (!volumeName) return { ...identity, status: 'UNKNOWN', reasonCode: 'volume_name_missing' };
+			// The declared name removes the volume even when its container is long
+			// gone, which a mount-derived list could never do.
+			try {
+				await containerManager.removeVolume(volumeName);
+				return { ...identity, status: 'REMOVED', reasonCode: null };
+			} catch (error: unknown) {
+				if ((error as { statusCode?: number }).statusCode === 404) return { ...identity, status: 'ABSENT', reasonCode: null };
+				throw error;
+			}
+		}
+		if (resource.kind === 'BROKER_BINDING' || resource.kind === 'BROKER_SOCKET' || resource.kind === 'SERVICE_DISCOVERY') {
+			const replicaId = resource.replicaId ?? resource.attributes.replicaId;
+			if (!replicaId) return { ...identity, status: 'UNKNOWN', reasonCode: 'replica_id_missing' };
+			await mcpBrokerManager.cleanup(replicaId);
+			return { ...identity, status: 'REMOVED', reasonCode: null };
+		}
+		// Ingress is programmed by the master, not by a node agent.
+		return { ...identity, status: 'UNKNOWN', reasonCode: 'resource_kind_not_node_owned' };
+	} catch (error: unknown) {
+		return { ...identity, status: 'FAILED', reasonCode: (error as { code?: string }).code ?? 'node_cleanup_failed' };
+	}
+}
+
+async function observeRuntimeResource(
+	resource: z.infer<typeof RuntimeResourceDescriptorV3Schema>,
+	workspaceId?: string,
+): Promise<RuntimeCleanupOutcome> {
+	const identity = { kind: resource.kind, resourceId: resource.resourceId };
+	try {
+		if (CONTAINER_KINDS.has(resource.kind)) {
+			const containerId = resource.attributes.containerId;
+			if (!containerId) return { ...identity, status: 'UNKNOWN', reasonCode: 'container_id_missing' };
+			const container = await dockerState.getById(containerId, undefined, workspaceId);
+			return { ...identity, status: container ? 'FAILED' : 'ABSENT', reasonCode: container ? 'container_still_present' : null };
+		}
+		if (resource.kind === 'VOLUME') {
+			const volumeName = resource.attributes.volumeName;
+			if (!volumeName) return { ...identity, status: 'UNKNOWN', reasonCode: 'volume_name_missing' };
+			const volumes = await containerManager.listVolumes();
+			const present = volumes.some((volume: { Name?: string }) => volume?.Name === volumeName);
+			return { ...identity, status: present ? 'FAILED' : 'ABSENT', reasonCode: present ? 'volume_still_present' : null };
+		}
+		if (resource.kind === 'BROKER_BINDING' || resource.kind === 'BROKER_SOCKET' || resource.kind === 'SERVICE_DISCOVERY') {
+			const replicaId = resource.replicaId ?? resource.attributes.replicaId;
+			if (!replicaId) return { ...identity, status: 'UNKNOWN', reasonCode: 'replica_id_missing' };
+			return { ...identity, status: mcpBrokerManager.isBound(replicaId) ? 'FAILED' : 'ABSENT', reasonCode: null };
+		}
+		return { ...identity, status: 'UNKNOWN', reasonCode: 'resource_kind_not_node_owned' };
+	} catch (error: unknown) {
+		return { ...identity, status: 'UNKNOWN', reasonCode: (error as { code?: string }).code ?? 'node_absence_check_failed' };
+	}
+}
 
 export default fp(mcpHandler, { name: 'mcp-handler' });

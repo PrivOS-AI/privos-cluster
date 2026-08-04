@@ -18,6 +18,7 @@ import { portalAdminRoutes } from './portal-admin-routes.js';
 import { UsageAggregator } from './usage-aggregator.js';
 import { McpSecurityVerifier } from './mcp-security.js';
 import { ClusterMasterIdentity } from './cluster-master-identity.js';
+import { McpUninstallServiceV3 } from './mcp-uninstall-service-v3.js';
 
 export function buildMasterServer(config: MasterConfig, repositories: MasterRepositories) {
 	const fastify = Fastify({ logger: { level: config.MASTER_LOG_LEVEL }, trustProxy: true });
@@ -60,6 +61,15 @@ export function buildMasterServer(config: MasterConfig, repositories: MasterRepo
 		mcpV2Enabled: config.APP_CLUSTER_MCP_INSTALL_V2 === 'on',
 		mcpV3Enabled: config.APP_CLUSTER_MCP_INSTALL_V3 === 'on',
 		clusterMasterIdentity,
+		mcpUninstall: config.APP_CLUSTER_MCP_INSTALL_V3 === 'on'
+			? new McpUninstallServiceV3({
+				repositories,
+				agentClient,
+				ingress,
+				clusterMasterIdentity,
+				clusterId: config.APP_MASTER_CLUSTER_ID,
+			})
+			: undefined,
 		mcpReleaseAuthorityJwks: (JSON.parse(config.MCP_RELEASE_AUTHORITY_JWKS_JSON) as { keys: JsonWebKey[] }).keys,
 	}));
 	fastify.register(portalAdminRoutes({

@@ -12,6 +12,7 @@ import { verifyMarketplaceReleaseAttestation } from './mcp-security.js';
 import { jwkThumbprint, sha256, sha256Base64Url } from '../security/artifacts.js';
 import { clusterMcpSafeReason, recordClusterMcpEvent } from '../services/mcp-observability.js';
 import type { ClusterMasterIdentity } from './cluster-master-identity.js';
+import type { McpUninstallServiceV3 } from './mcp-uninstall-service-v3.js';
 
 const DispatchRpcSchema = z.object({
 	jsonrpc: z.string().optional(),
@@ -22,6 +23,16 @@ const DispatchRpcSchema = z.object({
 
 const McpV3InstallBodySchema = z.object({
 	deploymentGrantJws: z.string().min(1),
+}).strict();
+
+const McpV3UninstallBodySchema = z.object({
+	lifecycleCommandJws: z.string().min(1),
+	issuer: z.string().min(1).max(200),
+	deploymentId: z.string().min(1).max(160),
+	generationId: z.string().min(1).max(160),
+	generationNumber: z.number().int().positive(),
+	resourceManifestHash: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+	runtimeResourceInventoryHash: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
 }).strict();
 
 const McpV3ActivationBodySchema = z.object({
@@ -76,6 +87,7 @@ export function hubFacingRoutes(deps: {
 	mcpV2Enabled: boolean;
 	mcpV3Enabled: boolean;
 	clusterMasterIdentity: ClusterMasterIdentity;
+	mcpUninstall?: McpUninstallServiceV3;
 	mcpReleaseAuthorityJwks: JsonWebKey[];
 }): FastifyPluginAsync {
 	return async (fastify) => {
@@ -537,6 +549,47 @@ export function hubFacingRoutes(deps: {
 					kid: attestation.kid,
 				},
 			});
+		});
+
+		/**
+		 * Remove one runtime generation under a signed, single-use Hub command.
+		 * The response carries the Cluster's signed acknowledgement, which can only
+		 * claim completion when every declared resource is proven absent.
+		 */
+		fastify.post(`${root}/mcp/v3/apps/:runtimeInstallationId/uninstall`, { preHandler: authenticate }, async (req, reply) => {
+			if (!deps.mcpV3Enabled || !deps.mcpSecurity || !deps.mcpUninstall) {
+				return reply.code(404).send({ error: 'mcp_install_v3_disabled' });
+			}
+			const body = McpV3UninstallBodySchema.safeParse(req.body);
+			if (!body.success) return reply.code(400).send({ error: 'validation_error', details: body.error.issues });
+			const runtimeInstallationId = (req.params as { runtimeInstallationId: string }).runtimeInstallationId;
+			let command;
+			try {
+				command = await deps.mcpSecurity.consumeLifecycleCommandV3({
+					compact: body.data.lifecycleCommandJws,
+					workspaceId: workspaceId(req),
+					expected: {
+						deploymentId: body.data.deploymentId,
+						generationId: body.data.generationId,
+						generationNumber: body.data.generationNumber,
+						runtimeInstallationId,
+						resourceManifestHash: body.data.resourceManifestHash,
+						runtimeResourceInventoryHash: body.data.runtimeResourceInventoryHash,
+						issuer: body.data.issuer,
+					},
+				});
+			} catch (error) {
+				return reply.code(403).send({
+					error: 'lifecycle_command_invalid',
+					code: clusterMcpSafeReason(error, 'lifecycle_command_invalid'),
+				});
+			}
+			const result = await deps.mcpUninstall.uninstall({
+				workspaceId: workspaceId(req),
+				command,
+				commandHash: sha256Base64Url(body.data.lifecycleCommandJws),
+			});
+			return reply.code(result.state === 'COMPLETED' ? 200 : 409).send(result);
 		});
 
 		fastify.post(`${root}/mcp/v3/apps/:runtimeInstallationId/activate`, { preHandler: authenticate }, async (req, reply) => {
