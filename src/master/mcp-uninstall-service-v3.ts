@@ -40,6 +40,16 @@ export type McpUninstallResultV3 = {
 const NODE_OWNED_KINDS = new Set(['REPLICA', 'CONTAINER', 'VOLUME', 'BROKER_BINDING', 'BROKER_SOCKET', 'SERVICE_DISCOVERY']);
 
 /**
+ * States an attempt passes through while it is running. An operation found in
+ * one of these was interrupted mid-attempt: the state describes where the dead
+ * attempt got to, not a fact about the world, and the transition table rightly
+ * refuses to run a new attempt forward from it. `CLEANUP_REQUIRED` is the
+ * parked, re-enterable state the table already provides — every one of these
+ * may legally move there, and every phase may legally be re-entered from it.
+ */
+const MID_ATTEMPT_STATES: ReadonlySet<ClusterLifecycleStateV3> = new Set(['ACCESS_REVOKED', 'RUNTIME_REMOVING', 'VERIFYING']);
+
+/**
  * Reason codes end up inside the signed final acknowledgement, whose schema
  * accepts `^[A-Z][A-Z0-9_]{1,95}$`. One unsignable code fails the whole
  * acknowledgement and leaves the uninstall unfinishable, so a code reported by a
@@ -100,6 +110,32 @@ export class McpUninstallServiceV3 {
 			};
 		}
 
+		await this.parkInterruptedAttempt(command.operationId);
+		await this.deps.repositories.clusterLifecycleOperations.updateOne(
+			{ operationId: command.operationId },
+			{ $inc: { attempts: 1 }, $set: { updatedAt: new Date() } },
+		);
+		try {
+			return await this.runAttempt(command, inventory);
+		} catch (error: unknown) {
+			// Best effort: a thrown attempt parks itself so observers see the
+			// truthful state immediately. A hard crash skips this, which is why
+			// the next entry parks first.
+			await this.parkInterruptedAttempt(command.operationId).catch(() => undefined);
+			throw error;
+		}
+	}
+
+	/**
+	 * One attempt of the phase sequence. Every phase is idempotent against the
+	 * world — revoking again, removing an absent resource, and observing are all
+	 * safe — so an attempt never skips phases based on a dead attempt's state;
+	 * it re-proves the world instead.
+	 */
+	private async runAttempt(
+		command: ClusterLifecycleCommandPayloadV3,
+		inventory: RuntimeResourceInventory,
+	): Promise<McpUninstallResultV3> {
 		await this.revokeDispatch(command);
 		await this.checkpoint(command, inventory, 'ACCESS_REVOKED', 'ACCESS_REVOKED', 2, []);
 
@@ -146,7 +182,6 @@ export class McpUninstallServiceV3 {
 					updatedAt: new Date(),
 					...(complete ? { completedAt: new Date(), activeOperationKey: undefined } : {}),
 				},
-				$inc: { attempts: 1 },
 			},
 		);
 		if (complete) {
@@ -160,6 +195,23 @@ export class McpUninstallServiceV3 {
 			operationId: command.operationId,
 			acknowledgement: { compact: signed.compact, artifactHash: signed.artifactHash, kid: signed.kid },
 		};
+	}
+
+	/**
+	 * Park an operation whose last attempt died mid-flight in
+	 * `CLEANUP_REQUIRED`, the state the transition table designates for
+	 * re-entry. A no-op for fresh, parked, or completed operations. Guarded by
+	 * the observed state so a concurrent attempt that has already moved the
+	 * operation forward is never dragged back.
+	 */
+	private async parkInterruptedAttempt(operationId: string): Promise<void> {
+		const operation = await this.deps.repositories.clusterLifecycleOperations.findOne({ operationId });
+		if (!operation || !MID_ATTEMPT_STATES.has(operation.state)) return;
+		assertClusterLifecycleTransitionV3(operation.state, 'CLEANUP_REQUIRED');
+		await this.deps.repositories.clusterLifecycleOperations.updateOne(
+			{ operationId, state: operation.state },
+			{ $set: { state: 'CLEANUP_REQUIRED', updatedAt: new Date() } },
+		);
 	}
 
 	private async openOperation(

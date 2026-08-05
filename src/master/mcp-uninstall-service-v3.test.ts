@@ -46,6 +46,7 @@ type World = {
 	cleanupResults: Map<string, any>;
 	signedState?: string;
 	signedResults?: unknown[];
+	signerFailuresRemaining?: number;
 };
 
 function buildService(world: World) {
@@ -102,6 +103,10 @@ function buildService(world: World) {
 		clusterMasterIdentity: {
 			publicInfo: async () => ({ kid: 'K'.repeat(43) }),
 			signFinalAcknowledgement: async (input: any) => {
+				if ((world.signerFailuresRemaining ?? 0) > 0) {
+					world.signerFailuresRemaining! -= 1;
+					throw new Error('acknowledgement signing failed');
+				}
 				world.signedState = input.state;
 				world.signedResults = input.results;
 				return { payload: { jti: 'ack-1' }, compact: 'signed.ack', artifactHash: 'H'.repeat(43), kid: 'K'.repeat(43) };
@@ -237,6 +242,44 @@ test('a retry under a freshly minted command resumes the same operation', async 
 	});
 	assert.equal(retried.operationId, first.operationId);
 	assert.equal(world.operations.size, 1);
+});
+
+test('an attempt that dies mid-flight is parked and the next one resumes to completion', async () => {
+	// The exact production wreckage: the signer throws after the VERIFYING
+	// checkpoint, so without parking the operation is stuck in a state no new
+	// attempt may legally leave.
+	const world = freshWorld({ signerFailuresRemaining: 1 });
+	const service = buildService(world);
+	await assert.rejects(
+		() => service.uninstall({ workspaceId: 'workspace-1', command, commandHash: 'D'.repeat(43) }),
+		/acknowledgement signing failed/,
+	);
+	const parked = world.operations.get(command.operationId);
+	assert.equal(parked.state, 'CLEANUP_REQUIRED');
+	assert.equal(parked.attempts, 1);
+
+	const retried = await service.uninstall({
+		workspaceId: 'workspace-1',
+		command: { ...command, jti: 'a1b2c3d4-0000-4000-8000-000000000002', nonce: 'nonce-3' },
+		commandHash: 'F'.repeat(43),
+	});
+	assert.equal(retried.state, 'COMPLETED');
+	assert.equal(world.operations.get(command.operationId).attempts, 2);
+});
+
+test('a hard crash that never parked is recovered on the next entry', async () => {
+	// kill -9 shape: no catch ran, so the stored state is a mid-attempt one.
+	const world = freshWorld({ signerFailuresRemaining: 1 });
+	const service = buildService(world);
+	await assert.rejects(() => service.uninstall({ workspaceId: 'workspace-1', command, commandHash: 'D'.repeat(43) }));
+	world.operations.get(command.operationId).state = 'VERIFYING';
+
+	const retried = await service.uninstall({
+		workspaceId: 'workspace-1',
+		command: { ...command, jti: 'a1b2c3d4-0000-4000-8000-000000000003', nonce: 'nonce-4' },
+		commandHash: 'A'.repeat(43),
+	});
+	assert.equal(retried.state, 'COMPLETED');
 });
 
 test('a command naming a different runtime is a replay conflict', async () => {
