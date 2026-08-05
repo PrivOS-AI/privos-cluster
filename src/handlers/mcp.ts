@@ -10,9 +10,10 @@ import { resolveImmutableImageReference } from '../docker/image-reference.js';
 import {
 	McpDeployRequestSchema,
 	McpDeployRequestV3Schema,
+	McpReconfigureRequestV3Schema,
 } from '../schemas/app-schemas.js';
 import { canonicalJson, sha256, sha256Base64Url } from '../security/artifacts.js';
-import { deployManagedApp } from '../services/lifecycle-service.js';
+import { deployManagedApp, reconfigureManagedAppV3 } from '../services/lifecycle-service.js';
 import { mcpBrokerManager, nodeIdentity } from '../services/mcp-broker.js';
 import { getClusterMcpMetrics, recordClusterMcpEvent } from '../services/mcp-observability.js';
 import { getAppNetworkName } from '../services/settings-service.js';
@@ -190,6 +191,50 @@ const mcpHandler: FastifyPluginAsync = async (fastify) => {
 			nodeIdentity: identity,
 			replicaId: binding.replicaId,
 			expectedResources,
+		});
+	});
+
+	/**
+	 * Apply a new environment to an already-finalized v3 replica.
+	 *
+	 * The master only reaches here after verifying the Hub's signed reconfigure
+	 * command, so this endpoint's own job is to refuse anything that does not
+	 * match the container it is about to replace — the container identity and
+	 * therefore the attested resource inventory must survive unchanged.
+	 */
+	fastify.post('/api/v1/mcp/v3/apps/:containerId/reconfigure', { preHandler: fastify.authenticate }, async (req, reply) => {
+		if (config.APP_CLUSTER_MCP_INSTALL_V3 !== 'on') {
+			return reply.code(404).send({ error: 'mcp_install_v3_disabled' });
+		}
+		if (config.REVERSE_PROXY_MODE !== 'native') {
+			return reply.code(503).send({ error: 'mcp_private_ingress_unavailable' });
+		}
+		const containerId = (req.params as { containerId?: string }).containerId;
+		const parsed = McpReconfigureRequestV3Schema.safeParse(req.body);
+		if (!containerId || !parsed.success) {
+			return reply.code(400).send({ error: 'validation_error', details: parsed.success ? undefined : parsed.error.issues });
+		}
+		const binding = parsed.data.mcpV3Binding;
+		if (
+			binding.clusterId !== config.FLEET_CLUSTER_ID ||
+			binding.nodeId !== config.FLEET_NODE_ID ||
+			binding.containerId !== containerId ||
+			parsed.data.workspaceId !== req.clusterAuth?.workspaceId
+		) return reply.code(403).send({ error: 'mcp_runtime_binding_mismatch' });
+
+		const container = await reconfigureManagedAppV3(parsed.data);
+		recordClusterMcpEvent({
+			event: 'provisioning',
+			outcome: 'changed',
+			boundary: 'agent_reconfigure',
+			reason: 'reconfigured',
+			correlationId: binding.runtimeInstallationId,
+		});
+		return reply.code(200).send({
+			...container,
+			nodeIdentity: await nodeIdentity.publicInfo(),
+			replicaId: binding.replicaId,
+			configEpoch: parsed.data.configEpoch,
 		});
 	});
 

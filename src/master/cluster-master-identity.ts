@@ -10,10 +10,12 @@ import type { MasterRepositories } from './repositories.js';
 import { KeyCipher } from './key-crypto.js';
 import {
 	ClusterFinalAcknowledgementPayloadV3Schema,
+	ClusterReconfigureAcknowledgementPayloadV3Schema,
 	ClusterRuntimeInventoryAttestationPayloadV3Schema,
 	MCP_PROTOCOL_V3,
 	verifyClusterRuntimeInventoryAttestationV3,
 	type ClusterFinalAcknowledgementPayloadV3,
+	type ClusterReconfigureAcknowledgementPayloadV3,
 	type ClusterRuntimeInventoryAttestationPayloadV3,
 } from './protocol-v3.js';
 import { runtimeResourceInventoryHashV3 } from './runtime-resource-inventory.js';
@@ -30,6 +32,11 @@ type IdentityMaterial = {
 
 type FinalAcknowledgementInput = Omit<
 	ClusterFinalAcknowledgementPayloadV3,
+	'protocolVersion' | 'type' | 'aud' | 'iss' | 'jti' | 'nonce' | 'iat' | 'exp'
+>;
+
+type ReconfigureAcknowledgementInput = Omit<
+	ClusterReconfigureAcknowledgementPayloadV3,
 	'protocolVersion' | 'type' | 'aud' | 'iss' | 'jti' | 'nonce' | 'iat' | 'exp'
 >;
 
@@ -63,6 +70,7 @@ export class ClusterMasterIdentity {
 		artifactTypes: readonly [
 			'privos-cluster-runtime-inventory-attestation+jws',
 			'privos-cluster-final-cleanup-ack+jws',
+			'privos-cluster-reconfigure-ack+jws',
 		];
 		kid: string;
 		publicJwk: JsonWebKey;
@@ -77,6 +85,7 @@ export class ClusterMasterIdentity {
 			artifactTypes: [
 				'privos-cluster-runtime-inventory-attestation+jws',
 				'privos-cluster-final-cleanup-ack+jws',
+				'privos-cluster-reconfigure-ack+jws',
 			],
 			kid: record.kid,
 			publicJwk: record.publicJwk,
@@ -256,6 +265,45 @@ export class ClusterMasterIdentity {
 			privateJwk: material.privateJwk,
 			kid: material.record.kid,
 			typ: 'privos-cluster-final-cleanup-ack+jws',
+			protocolVersion: MCP_PROTOCOL_V3,
+		});
+		return { payload, compact, artifactHash: sha256Base64Url(compact), kid: material.record.kid };
+	}
+
+	async signReconfigureAcknowledgement(
+		input: ReconfigureAcknowledgementInput,
+		lifetimeSeconds = 300,
+	): Promise<{
+		payload: ClusterReconfigureAcknowledgementPayloadV3;
+		compact: string;
+		artifactHash: string;
+		kid: string;
+	}> {
+		if (input.clusterId !== this.clusterId) throw new Error('cluster_acknowledgement_affinity_mismatch');
+		if (!Number.isInteger(lifetimeSeconds) || lifetimeSeconds < 1 || lifetimeSeconds > 300) {
+			throw new Error('cluster_acknowledgement_lifetime_invalid');
+		}
+		const material = await this.load();
+		const now = Math.floor(Date.now() / 1000);
+		const payload = ClusterReconfigureAcknowledgementPayloadV3Schema.parse({
+			...input,
+			// Key names only. A value here would put an operator secret into Hub
+			// persistence and Hub logs.
+			appliedKeys: [...input.appliedKeys].sort(),
+			protocolVersion: MCP_PROTOCOL_V3,
+			type: 'cluster-reconfigure-acknowledgement',
+			iss: this.issuer,
+			aud: 'privos-hub-api',
+			jti: crypto.randomUUID(),
+			nonce: crypto.randomBytes(24).toString('base64url'),
+			iat: now,
+			exp: now + lifetimeSeconds,
+		});
+		const compact = signEs256Jws({
+			payload,
+			privateJwk: material.privateJwk,
+			kid: material.record.kid,
+			typ: 'privos-cluster-reconfigure-ack+jws',
 			protocolVersion: MCP_PROTOCOL_V3,
 		});
 		return { payload, compact, artifactHash: sha256Base64Url(compact), kid: material.record.kid };

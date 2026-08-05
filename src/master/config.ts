@@ -17,6 +17,9 @@ const MasterConfigSchema = z.object({
 	APP_MASTER_CLUSTER_ID: z.string().regex(/^[A-Za-z0-9-]+$/).default('privos-app-cluster'),
 	APP_CLUSTER_MCP_INSTALL_V2: z.enum(['on', 'off']).default('off'),
 	APP_CLUSTER_MCP_INSTALL_V3: z.enum(['on', 'off']).default('off'),
+	// Configuration-redeploy kill switch. Defaults on wherever v3 installs are
+	// on: the route is additive and disabling it leaves installs untouched.
+	APP_CLUSTER_MCP_RECONFIGURE_V3: z.enum(['on', 'off']).default('on'),
 	MCP_RELEASE_AUTHORITY_JWKS_JSON: z.string().default('{"keys":[]}'),
 }).superRefine((config, ctx) => {
 	let key: Buffer | null = null;

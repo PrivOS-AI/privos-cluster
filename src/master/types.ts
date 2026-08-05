@@ -80,7 +80,15 @@ export interface MasterApp {
 	imageDigest: string;
 	resources: ContainerResources;
 	port: number;
+	/** Operator-supplied non-secret environment. Secret values live encrypted. */
 	envVars: Record<string, string>;
+	/** AES-GCM blob of the secret subset, sealed with the master key. */
+	secretEnvVarsEnc?: string;
+	/** Names inside the sealed blob, so the set is auditable without opening it. */
+	secretEnvKeys?: string[];
+	/** Configuration generation currently running on every replica. */
+	appliedConfigEpoch?: number;
+	appliedConfigAt?: Date;
 	volumes: Array<{ name: 'data'; mountPath: string; sizeMb?: number }>;
 	storageBytes: number;
 	availabilityTier: AvailabilityTier;
@@ -265,7 +273,13 @@ export interface ClusterCleanupResultRecord {
 export interface McpProtocolV3ArtifactUse {
 	_id: string;
 	protocolVersion: 3;
-	kind: 'deployment-grant' | 'dispatch-assertion' | 'lifecycle-command' | 'node-cleanup-result' | 'cluster-final-acknowledgement';
+	kind:
+		| 'deployment-grant'
+		| 'dispatch-assertion'
+		| 'lifecycle-command'
+		| 'reconfigure-command'
+		| 'node-cleanup-result'
+		| 'cluster-final-acknowledgement';
 	jti: string;
 	nonce: string;
 	clusterId: string;

@@ -17,6 +17,7 @@ test('all Hub-facing v3 provisioning identity and install routes fail closed whi
 		baseDomain: 'apps.example.com',
 		mcpV2Enabled: false,
 		mcpV3Enabled: false,
+		mcpReconfigureEnabled: false,
 		clusterMasterIdentity: {
 			publicInfo: async () => {
 				identityReads += 1;
@@ -53,10 +54,12 @@ test('v3 activation returns the exact persisted runtime-active instant on every 
 	await fastify.register(hubFacingRoutes({
 		auth: { verify: async (workspaceId: string) => ({ workspaceId }) } as any,
 		deployment: {
+			publicUrlFor: (subdomain: string) => `https://${subdomain}.apps.example.com`,
 			activateMcpV3: async () => {
 				activationCalls += 1;
 				return {
 					appId: 'cluster-app-1',
+					subdomain: 'library-app',
 					mcpRuntimeInstallationId: 'runtime-1',
 					mcpInventoryAttestationEstablishedAt: establishedAt,
 				};
@@ -68,6 +71,7 @@ test('v3 activation returns the exact persisted runtime-active instant on every 
 		baseDomain: 'apps.example.com',
 		mcpV2Enabled: false,
 		mcpV3Enabled: true,
+		mcpReconfigureEnabled: true,
 		clusterMasterIdentity: {} as any,
 		mcpReleaseAuthorityJwks: [],
 	}));
@@ -141,6 +145,7 @@ test('v3 dispatch verifies parent/child affinity before Cluster selects a live H
 		} as any,
 		mcpV2Enabled: false,
 		mcpV3Enabled: true,
+		mcpReconfigureEnabled: true,
 		clusterMasterIdentity: {} as any,
 		mcpReleaseAuthorityJwks: [],
 	}));

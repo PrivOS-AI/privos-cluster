@@ -35,6 +35,18 @@ const McpV3UninstallBodySchema = z.object({
 	runtimeResourceInventoryHash: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
 }).strict();
 
+const McpV3ReconfigureBodySchema = z.object({
+	reconfigureCommandJws: z.string().min(1),
+	issuer: z.string().min(1).max(200),
+	deploymentId: z.string().min(1).max(160),
+	generationId: z.string().min(1).max(160),
+	generationNumber: z.number().int().positive(),
+	clusterAppId: z.string().min(1).max(160),
+	manifestDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+	resourceManifestHash: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+	runtimeResourceInventoryHash: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+}).strict();
+
 const McpV3ActivationBodySchema = z.object({
 	runtimeInventoryAttestation: z.object({
 		compact: z.string().min(1),
@@ -86,6 +98,8 @@ export function hubFacingRoutes(deps: {
 	mcpSecurity?: McpSecurityVerifier;
 	mcpV2Enabled: boolean;
 	mcpV3Enabled: boolean;
+	/** Kill switch for the configuration-redeploy route; installs are unaffected. */
+	mcpReconfigureEnabled: boolean;
 	clusterMasterIdentity: ClusterMasterIdentity;
 	mcpUninstall?: McpUninstallServiceV3;
 	mcpReleaseAuthorityJwks: JsonWebKey[];
@@ -543,10 +557,130 @@ export function hubFacingRoutes(deps: {
 				state: 'PROVISIONING',
 				clusterAppId: app.appId,
 				runtimeInstallationId: grant.runtimeInstallationId,
+				publicUrl: deps.deployment.publicUrlFor(app.subdomain),
 				runtimeInventoryAttestation: {
 					compact: attestation.compact,
 					artifactHash: attestation.artifactHash,
 					kid: attestation.kid,
+				},
+			});
+		});
+
+		/**
+		 * Apply a new operator environment to a running generation.
+		 *
+		 * Additive to the install path: a Hub that predates the contract never
+		 * calls it, and calling it can only ever change environment values — the
+		 * image, permissions, and resources of the generation are untouchable
+		 * here, and the response's acknowledgement is the Cluster's attested
+		 * evidence of which configuration epoch is actually running.
+		 */
+		fastify.post(`${root}/mcp/v3/apps/:runtimeInstallationId/reconfigure`, { preHandler: authenticate }, async (req, reply) => {
+			if (!deps.mcpV3Enabled || !deps.mcpSecurity || !deps.mcpReconfigureEnabled) {
+				return reply.code(404).send({ error: 'mcp_reconfigure_v3_disabled' });
+			}
+			const body = McpV3ReconfigureBodySchema.safeParse(req.body);
+			if (!body.success) return reply.code(400).send({ error: 'validation_error', details: body.error.issues });
+			const runtimeInstallationId = (req.params as { runtimeInstallationId: string }).runtimeInstallationId;
+			let command;
+			try {
+				command = await deps.mcpSecurity.consumeReconfigureCommandV3({
+					compact: body.data.reconfigureCommandJws,
+					workspaceId: workspaceId(req),
+					expected: {
+						deploymentId: body.data.deploymentId,
+						generationId: body.data.generationId,
+						generationNumber: body.data.generationNumber,
+						runtimeInstallationId,
+						resourceManifestHash: body.data.resourceManifestHash,
+						runtimeResourceInventoryHash: body.data.runtimeResourceInventoryHash,
+						issuer: body.data.issuer,
+						clusterAppId: body.data.clusterAppId,
+						manifestDigest: body.data.manifestDigest,
+					},
+				});
+			} catch (error) {
+				return reply.code(403).send({
+					error: 'reconfigure_command_invalid',
+					code: clusterMcpSafeReason(error, 'reconfigure_command_invalid'),
+				});
+			}
+			let applied;
+			try {
+				applied = await deps.deployment.reconfigureMcpV3(workspaceId(req), command);
+			} catch (error) {
+				recordClusterMcpEvent({
+					event: 'provisioning',
+					outcome: 'denied',
+					boundary: 'master_reconfigure',
+					reason: clusterMcpSafeReason(error, 'reconfigure_failed'),
+					correlationId: runtimeInstallationId,
+				});
+				const acknowledgement = await deps.clusterMasterIdentity.signReconfigureAcknowledgement({
+					operationId: command.operationId,
+					clusterId: command.clusterId,
+					workspaceId: command.workspaceId,
+					deploymentId: command.deploymentId,
+					generationId: command.generationId,
+					generationNumber: command.generationNumber,
+					runtimeInstallationId: command.runtimeInstallationId,
+					clusterAppId: command.clusterAppId,
+					manifestDigest: command.manifestDigest,
+					resourceManifestHash: command.resourceManifestHash,
+					runtimeResourceInventoryHash: command.runtimeResourceInventoryHash,
+					configEpoch: command.configEpoch,
+					state: 'FAILED',
+					appliedKeys: [],
+					appliedAt: null,
+					errorCode: clusterMcpSafeReason(error, 'RECONFIGURE_FAILED').toUpperCase().replace(/[^A-Z0-9_]/g, '_'),
+				});
+				return reply.code(409).send({
+					state: 'FAILED',
+					clusterAppId: command.clusterAppId,
+					runtimeInstallationId: command.runtimeInstallationId,
+					configEpoch: command.configEpoch,
+					acknowledgement: {
+						compact: acknowledgement.compact,
+						artifactHash: acknowledgement.artifactHash,
+						kid: acknowledgement.kid,
+					},
+				});
+			}
+			const acknowledgement = await deps.clusterMasterIdentity.signReconfigureAcknowledgement({
+				operationId: command.operationId,
+				clusterId: command.clusterId,
+				workspaceId: command.workspaceId,
+				deploymentId: command.deploymentId,
+				generationId: command.generationId,
+				generationNumber: command.generationNumber,
+				runtimeInstallationId: command.runtimeInstallationId,
+				clusterAppId: command.clusterAppId,
+				manifestDigest: command.manifestDigest,
+				resourceManifestHash: command.resourceManifestHash,
+				runtimeResourceInventoryHash: command.runtimeResourceInventoryHash,
+				configEpoch: command.configEpoch,
+				state: 'APPLIED',
+				appliedKeys: applied.appliedKeys,
+				appliedAt: (applied.app.appliedConfigAt ?? new Date()).toISOString(),
+				errorCode: null,
+			});
+			recordClusterMcpEvent({
+				event: 'provisioning',
+				outcome: 'changed',
+				boundary: 'master_reconfigure',
+				reason: 'reconfigured',
+				correlationId: runtimeInstallationId,
+			});
+			return reply.code(200).send({
+				state: 'RUNNING',
+				clusterAppId: applied.app.appId,
+				runtimeInstallationId,
+				configEpoch: command.configEpoch,
+				publicUrl: deps.deployment.publicUrlFor(applied.app.subdomain),
+				acknowledgement: {
+					compact: acknowledgement.compact,
+					artifactHash: acknowledgement.artifactHash,
+					kid: acknowledgement.kid,
 				},
 			});
 		});
@@ -606,6 +740,10 @@ export function hubFacingRoutes(deps: {
 			}
 			const activatedAt = Math.floor(app.mcpInventoryAttestationEstablishedAt.getTime() / 1000);
 			if (!Number.isSafeInteger(activatedAt) || activatedAt < 1) throw new Error('mcp_v3_activation_timestamp_invalid');
+			// publicUrl deliberately does NOT appear here. A deployed Hub verifies
+			// this response by exact key set, so an added field would fail every
+			// activation between the Cluster release and the Hub release. The
+			// install response — which no Hub shape-checks — carries it instead.
 			return {
 				state: 'RUNNING',
 				clusterAppId: app.appId,

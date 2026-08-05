@@ -14,8 +14,17 @@ import {
 } from './settings-service.js';
 import { mcpBrokerManager } from './mcp-broker.js';
 import { refreshRoutes } from '../proxy/proxy-router.js';
-import type { Container, ContainerResources, ContainerVolume, DeployRequest, RedeployRequest } from '../types/index.js';
+import type {
+	Container,
+	ContainerResources,
+	ContainerVolume,
+	DeployRequest,
+	McpRuntimeBindingV3,
+	RedeployRequest,
+} from '../types/index.js';
+import type { JsonWebKey } from 'node:crypto';
 import { canonicalJson } from '../security/artifacts.js';
+import { assertRawRedeployAllowedForLabels } from './redeploy-secret-guard.js';
 
 const logger = pino({ level: config.LOG_LEVEL }).child({ component: 'lifecycle' });
 
@@ -356,6 +365,8 @@ export async function deployManagedApp(req: DeployRequest): Promise<Container> {
             port,
             resources,
             envVars,
+            platformEnvVars: req.platformEnvVars,
+            secretEnvKeys: req.secretEnvKeys,
             mounts,
             subdomain,
             baseDomain,
@@ -433,6 +444,127 @@ export async function deployManagedApp(req: DeployRequest): Promise<Container> {
 }
 
 // ---------------------------------------------------------------------------
+// reconfigureManagedAppV3
+// ---------------------------------------------------------------------------
+
+/**
+ * Recreate one already-provisioned v3 replica with a new environment.
+ *
+ * The container keeps its cluster identity (`privos.id`), so the generation's
+ * hash-pinned runtime resource inventory stays exactly as attested — this is a
+ * configuration change, never a new generation. Everything else about the
+ * container is rebuilt from the request, which the master derived from the
+ * verified reconfigure command; a request that disagrees with the labels the
+ * container already carries is refused before anything is torn down.
+ */
+export async function reconfigureManagedAppV3(
+	req: Omit<DeployRequest, 'mcpV3Binding'> & {
+		mcpV3Binding: Omit<McpRuntimeBindingV3, 'hubOrigin' | 'hubKid' | 'hubPublicJwk'>;
+		runtimeResourceInventoryHash: string;
+	},
+): Promise<Container> {
+	const clusterId = req.mcpV3Binding.containerId;
+	const existing = await getContainerOr404(clusterId, req.workspaceId);
+	const inspect = await containerManager.inspectContainer(existing.dockerContainerId);
+	const labels = (inspect.Config?.Labels ?? {}) as Record<string, string>;
+	const expected = {
+		'privos.id': req.mcpV3Binding.containerId,
+		'privos.workspace': req.mcpV3Binding.workspaceId,
+		'privos.image.digest': req.mcpV3Binding.imageDigest,
+		'privos.mcp.schema': '3',
+		'privos.mcp.cluster': req.mcpV3Binding.clusterId,
+		'privos.mcp.node': req.mcpV3Binding.nodeId,
+		'privos.mcp.deployment': req.mcpV3Binding.deploymentId,
+		'privos.mcp.generation': req.mcpV3Binding.generationId,
+		'privos.mcp.generation-number': String(req.mcpV3Binding.generationNumber),
+		'privos.mcp.runtime-installation': req.mcpV3Binding.runtimeInstallationId,
+		'privos.mcp.app': req.mcpV3Binding.mcpAppId,
+		'privos.mcp.replica': req.mcpV3Binding.replicaId,
+		'privos.mcp.manifest.digest': req.mcpV3Binding.manifestDigest,
+		'privos.mcp.resource-manifest-hash': req.mcpV3Binding.resourceManifestHash,
+		'privos.mcp.approval-receipt': req.mcpV3Binding.approvalReceiptHash,
+		'privos.mcp.authorization-epoch': String(req.mcpV3Binding.authorizationEpoch),
+		'privos.mcp.deployment-grant-hash': req.mcpV3Binding.deploymentGrantHash,
+	};
+	if (Object.entries(expected).some(([key, value]) => labels[key] !== value)) {
+		throw new Error('mcp_v3_reconfigure_binding_mismatch');
+	}
+	let hubPublicJwk: JsonWebKey;
+	try {
+		hubPublicJwk = JSON.parse(labels['privos.mcp.hub-jwk'] ?? '') as JsonWebKey;
+	} catch {
+		throw new Error('mcp_v3_reconfigure_binding_mismatch');
+	}
+	const binding: McpRuntimeBindingV3 = {
+		...req.mcpV3Binding,
+		hubOrigin: labels['privos.mcp.hub-origin']!,
+		hubKid: labels['privos.mcp.hub-kid']!,
+		hubPublicJwk,
+	};
+
+	const port = req.port ?? existing.port;
+	const mounts = await getExistingMounts(existing.dockerContainerId);
+	const baseDomain = isReverseProxyEnabled() ? resolveDomain(req.domain ?? existing.domain) : null;
+	const subdomain = req.subdomain ?? existing.subdomain ?? null;
+
+	logger.info(
+		{ clusterId, replicaId: req.mcpV3Binding.replicaId, envKeys: Object.keys(req.envVars ?? {}).sort() },
+		'reconfiguring managed v3 app',
+	);
+
+	// The image is already local (this generation is running on it), but pull by
+	// digest anyway so a pruned layer fails BEFORE the running container is gone.
+	await containerManager.pullImage(req.image, req.tag ?? DEFAULT_TAG, req.digest);
+	await mcpBrokerManager.cleanup(req.mcpV3Binding.replicaId);
+	await containerManager.stopContainer(existing.dockerContainerId, 10);
+	await containerManager.removeContainer(existing.dockerContainerId, true);
+
+	const brokerMount = await mcpBrokerManager.prepare(req.mcpV3Binding.replicaId);
+	const created = await containerManager.createAppContainer({
+		id: clusterId,
+		appId: req.appId ?? clusterId.slice(0, 12),
+		containerName: buildContainerName({ appId: req.appId, subdomain, image: req.image }),
+		image: req.image,
+		tag: req.tag ?? DEFAULT_TAG,
+		digest: req.digest,
+		workspaceId: req.workspaceId,
+		listingId: req.listingId,
+		versionDigest: req.versionDigest,
+		port,
+		resources: { ...getDefaultResources(), ...req.resources },
+		envVars: req.envVars ?? {},
+		platformEnvVars: req.platformEnvVars,
+		secretEnvKeys: req.secretEnvKeys,
+		mounts,
+		subdomain,
+		baseDomain,
+		mcpV3Binding: binding,
+		brokerMount,
+	});
+	// Re-establish the finalized broker binding: the socket was torn down with
+	// the old container, and dispatch stays refused until the inventory hash the
+	// generation was attested under is restored.
+	await mcpBrokerManager.register({
+		...binding,
+		dockerContainerId: created.containerId,
+		networkName: getAppNetworkName(req.workspaceId),
+		runtimeResourceInventoryHash: req.runtimeResourceInventoryHash,
+	});
+	await containerManager.startContainer(created.containerId);
+
+	const internalUrl = await getInternalUrl(created.containerId, port);
+	if (!(await waitForHealthy(internalUrl, 30_000))) {
+		logger.warn({ clusterId, internalUrl }, 'container did not become healthy within 30s after reconfigure');
+	}
+
+	const container = await dockerState.getById(clusterId, getHealth, req.workspaceId);
+	if (!container) throw new Error(`Container not found after reconfigure: ${clusterId}`);
+	logger.info({ clusterId, dockerContainerId: created.containerId }, 'reconfigure complete');
+	refreshRoutes();
+	return container;
+}
+
+// ---------------------------------------------------------------------------
 // startContainer
 // ---------------------------------------------------------------------------
 
@@ -503,12 +635,19 @@ export async function restartContainer(containerId: string, workspaceId?: string
 // redeployContainer
 // ---------------------------------------------------------------------------
 
+/** Inspect a container and apply the raw-redeploy secret guard to its labels. */
+async function assertRawRedeployAllowed(dockerContainerId: string): Promise<void> {
+	const info = await containerManager.inspectContainer(dockerContainerId);
+	assertRawRedeployAllowedForLabels((info.Config?.Labels ?? {}) as Record<string, string>);
+}
+
 export async function redeployContainer(
     containerId: string,
     req: RedeployRequest,
     workspaceId?: string,
 ): Promise<Container> {
     const c = await getContainerOr404(containerId, workspaceId);
+    await assertRawRedeployAllowed(c.dockerContainerId);
 
     const newImage = req.image ?? c.image;
     const newTag = req.tag ?? c.tag;
@@ -606,6 +745,7 @@ export async function rollingRedeployContainer(
     workspaceId?: string,
 ): Promise<Container> {
     const old = await getContainerOr404(containerId, workspaceId);
+    await assertRawRedeployAllowed(old.dockerContainerId);
 
     if (old.state !== 'running') {
         throw new Error(`Cannot rolling-redeploy a non-running container (state=${old.state}) — start it first`);

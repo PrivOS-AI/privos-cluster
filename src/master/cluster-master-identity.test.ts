@@ -59,6 +59,7 @@ test('Cluster master identity persists encrypted and signs generation-affine fin
 	assert.deepEqual(firstPublic.artifactTypes, [
 		'privos-cluster-runtime-inventory-attestation+jws',
 		'privos-cluster-final-cleanup-ack+jws',
+		'privos-cluster-reconfigure-ack+jws',
 	]);
 	assert.equal(firstPublic.publicJwk.d, undefined);
 	assert.ok(state.row);

@@ -17,6 +17,8 @@ import test from 'node:test';
 
 import {
 	ClusterFinalAcknowledgementPayloadV3Schema,
+	ClusterReconfigureAcknowledgementPayloadV3Schema,
+	ClusterReconfigureCommandPayloadV3Schema,
 	RuntimeResourceDescriptorV3Schema,
 } from './protocol-v3.js';
 
@@ -57,6 +59,49 @@ if (!fs.existsSync(VECTOR_FILE)) {
 			descriptors.canonicalContainer.resourceId,
 			'a CONTAINER declares the container it names under attributes.containerId',
 		);
+	});
+
+	test('the committed reconfigure command parses through the real schema', () => {
+		const parsed = ClusterReconfigureCommandPayloadV3Schema.parse(
+			vectors.reconfigureCommandPayload.payload,
+		);
+		assert.deepEqual(parsed.secretKeys, ['HRM_SMTP_PASSWORD']);
+		assert.ok(parsed.secretKeys.every((key) => key in parsed.envVars));
+		assert.equal(parsed.configEpoch, 2);
+	});
+
+	test('a reconfigure command may not carry a PRIVOS_ environment name', () => {
+		// The platform owns that namespace: it is the only reason an injected
+		// PRIVOS_PUBLIC_URL can be trusted by the app that reads it.
+		const mutated = structuredClone(vectors.reconfigureCommandPayload.payload);
+		mutated.envVars.PRIVOS_PUBLIC_URL = 'https://attacker.example';
+		assert.throws(() => ClusterReconfigureCommandPayloadV3Schema.parse(mutated));
+	});
+
+	test('a reconfigure command may not name a secret it does not carry', () => {
+		const mutated = structuredClone(vectors.reconfigureCommandPayload.payload);
+		mutated.secretKeys = ['HRM_UNDECLARED'];
+		assert.throws(() => ClusterReconfigureCommandPayloadV3Schema.parse(mutated));
+	});
+
+	test('the committed reconfigure acknowledgement carries key names, never values', () => {
+		const parsed = ClusterReconfigureAcknowledgementPayloadV3Schema.parse(
+			vectors.reconfigureAcknowledgementPayload.payload,
+		);
+		assert.equal(parsed.state, 'APPLIED');
+		assert.ok(parsed.appliedAt);
+		const commandEnv = vectors.reconfigureCommandPayload.payload.envVars as Record<string, string>;
+		const serialized = JSON.stringify(parsed);
+		for (const value of Object.values(commandEnv)) {
+			assert.ok(!serialized.includes(value), `acknowledgement leaked the value of an env entry: ${value}`);
+		}
+		assert.deepEqual(parsed.appliedKeys, Object.keys(commandEnv).sort());
+	});
+
+	test('an applied acknowledgement without its timestamp is refused', () => {
+		const mutated = structuredClone(vectors.reconfigureAcknowledgementPayload.payload);
+		mutated.appliedAt = null;
+		assert.throws(() => ClusterReconfigureAcknowledgementPayloadV3Schema.parse(mutated));
 	});
 
 	test('a legacy CONTAINER without the attribute still names its container via resourceId', () => {

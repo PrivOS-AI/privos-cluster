@@ -99,6 +99,14 @@ export interface DeployRequest {
 	port?: number;
 	resources?: Partial<ContainerResources>;
 	envVars?: Record<string, string>;
+	/**
+	 * Platform-owned PRIVOS_* variables the master injects. Kept apart from
+	 * `envVars` because the operator-supplied map is refused the PRIVOS_
+	 * namespace; merging happens at container create, where platform wins.
+	 */
+	platformEnvVars?: Record<string, string>;
+	/** Names within `envVars` whose values must never reach a Docker label. */
+	secretEnvKeys?: string[];
 	appId?: string;
 	volumes?: ContainerVolume[];
 	subdomain?: string | null;

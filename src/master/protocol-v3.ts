@@ -26,6 +26,16 @@ const Digest = z.string().regex(/^sha256:[a-f0-9]{64}$/);
 const ArtifactHash = z.string().regex(/^[A-Za-z0-9_-]{43}$/);
 const Nonce = z.string().regex(/^[A-Za-z0-9_-]{16,128}$/);
 const SafeReasonCode = z.string().regex(/^[A-Z][A-Z0-9_]{1,95}$/);
+/** Operator-declarable environment name; the PRIVOS_ namespace is platform-only. */
+const EnvName = z.string().regex(/^[A-Z][A-Z0-9_]{0,63}$/).refine(
+	(value) => !value.startsWith('PRIVOS_'),
+	{ message: 'PRIVOS_ environment names are reserved for the platform' },
+);
+/**
+ * Configuration generation within one runtime generation. Orthogonal to
+ * authorizationEpoch: applying configuration can never widen permissions.
+ */
+const ConfigEpoch = z.number().int().positive();
 const TimedArtifactShape = {
 	protocolVersion: z.literal(MCP_PROTOCOL_V3),
 	iss: Identifier,
@@ -53,6 +63,9 @@ export const McpProtocolV3ErrorCodeSchema = z.enum([
 	'UNINSTALL_ALREADY_IN_PROGRESS',
 	'CLEANUP_REQUIRED',
 	'MIGRATION_REVIEW_REQUIRED',
+	'CONFIG_EPOCH_INVALID',
+	'CONFIG_ENVIRONMENT_RESERVED',
+	'RUNTIME_NOT_RECONFIGURABLE',
 ]);
 
 export type McpProtocolV3ErrorCode = z.infer<typeof McpProtocolV3ErrorCodeSchema>;
@@ -133,6 +146,10 @@ const DeploymentDescriptorV3Schema = z.object({
 		tmpSizeMb: z.number().int().min(16).max(4096),
 	}).strict(),
 	envVars: z.record(z.string(), z.string()),
+	// Which of envVars are operator secrets. Optional so a Hub that predates the
+	// contract still installs; absent means "nothing is secret", which is the
+	// pre-existing behaviour (the Hub only ever sent {}).
+	secretEnvKeys: z.array(EnvName).max(32).optional(),
 	volumes: z.array(z.object({
 		name: z.string().regex(/^[a-z0-9-]{1,32}$/),
 		mountPath: z.string().startsWith('/').max(200),
@@ -160,11 +177,94 @@ export const McpDeploymentGrantPayloadV3Schema = z.object({
 	approvalReceiptHash: ArtifactHash,
 	approvedPermissionCeilingHash: ArtifactHash,
 	authorizationEpoch: z.number().int().positive(),
+	// Configuration generation for the operator-supplied environment. Optional so
+	// a Hub that predates the contract still installs; absent means epoch 1.
+	configEpoch: ConfigEpoch.optional(),
 	hubOrigin: z.string().url().refine((value) => new URL(value).protocol === 'https:'),
 	deployment: DeploymentDescriptorV3Schema,
 }).strict();
 
 export type McpDeploymentGrantPayloadV3 = z.infer<typeof McpDeploymentGrantPayloadV3Schema>;
+
+/**
+ * Configuration-only redeploy of an existing generation.
+ *
+ * Deliberately NOT a re-issued deployment grant: a grant is bound to a fresh
+ * generation identity (reuse raises GENERATION_IDENTITY_REUSED), and nothing
+ * about the image, permissions, or resources may move here. The command
+ * restates the generation only so the Cluster can bind it to what it holds.
+ */
+export const ClusterReconfigureCommandPayloadV3Schema = z.object({
+	...TimedArtifactShape,
+	type: z.literal('cluster-reconfigure-command'),
+	aud: z.literal('privos-apps-master'),
+	action: z.literal('RECONFIGURE_RUNTIME'),
+	operationId: z.string().uuid(),
+	clusterId: Identifier,
+	workspaceId: Identifier,
+	deploymentId: Identifier,
+	generationId: Identifier,
+	generationNumber: z.number().int().positive(),
+	runtimeInstallationId: Identifier,
+	clusterAppId: Identifier,
+	mcpAppId: Identifier,
+	manifestDigest: Digest,
+	resourceManifestHash: ArtifactHash,
+	runtimeResourceInventoryHash: ArtifactHash,
+	authorizationEpoch: z.number().int().positive(),
+	configEpoch: ConfigEpoch,
+	envVars: z.record(EnvName, z.string().max(4096)).refine(
+		(value) => Object.keys(value).length <= 32,
+		{ message: 'at most 32 environment values' },
+	),
+	secretKeys: z.array(EnvName).max(32),
+}).strict().superRefine((value, ctx) => {
+	for (const key of value.secretKeys) {
+		if (!(key in value.envVars)) {
+			ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['secretKeys'], message: 'secret names must exist in envVars' });
+		}
+	}
+});
+
+export type ClusterReconfigureCommandPayloadV3 = z.infer<typeof ClusterReconfigureCommandPayloadV3Schema>;
+
+/**
+ * Cluster evidence that a configuration epoch is the one now running. Key NAMES
+ * only — this artifact is persisted and logged on the Hub.
+ */
+export const ClusterReconfigureAcknowledgementPayloadV3Schema = z.object({
+	...TimedArtifactShape,
+	type: z.literal('cluster-reconfigure-acknowledgement'),
+	aud: z.literal('privos-hub-api'),
+	operationId: z.string().uuid(),
+	clusterId: Identifier,
+	workspaceId: Identifier,
+	deploymentId: Identifier,
+	generationId: Identifier,
+	generationNumber: z.number().int().positive(),
+	runtimeInstallationId: Identifier,
+	clusterAppId: Identifier,
+	manifestDigest: Digest,
+	resourceManifestHash: ArtifactHash,
+	runtimeResourceInventoryHash: ArtifactHash,
+	configEpoch: ConfigEpoch,
+	state: z.enum(['APPLIED', 'FAILED']),
+	appliedKeys: z.array(EnvName).max(32),
+	appliedAt: z.string().datetime().nullable(),
+	errorCode: SafeReasonCode.nullable(),
+}).strict().superRefine((value, ctx) => {
+	if (value.state === 'APPLIED' && value.appliedAt === null) {
+		ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['appliedAt'], message: 'an applied epoch must carry its timestamp' });
+	}
+	const sorted = [...value.appliedKeys].sort();
+	if (value.appliedKeys.some((key, index) => key !== sorted[index])) {
+		ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['appliedKeys'], message: 'applied keys must be sorted' });
+	}
+});
+
+export type ClusterReconfigureAcknowledgementPayloadV3 = z.infer<
+	typeof ClusterReconfigureAcknowledgementPayloadV3Schema
+>;
 
 const DispatchCommonShape = {
 	...TimedArtifactShape,
@@ -715,6 +815,26 @@ export function verifyLifecycleCommandV3(input: {
 		maximumLifetimeSeconds: 300,
 	});
 	assertGenerationAffinityV3(payload, input.expected);
+	return payload;
+}
+
+export function verifyReconfigureCommandV3(input: {
+	compact: string;
+	publicJwk: JsonWebKey;
+	kid: string;
+	expected: GenerationAffinityV3 & { clusterAppId: string; manifestDigest: string };
+}): ClusterReconfigureCommandPayloadV3 {
+	const payload = verifySignedV3({
+		...input,
+		typ: 'privos-cluster-reconfigure-command+jws',
+		schema: ClusterReconfigureCommandPayloadV3Schema,
+		maximumLifetimeSeconds: 300,
+	});
+	assertGenerationAffinityV3(payload, input.expected);
+	if (
+		payload.clusterAppId !== input.expected.clusterAppId ||
+		payload.manifestDigest !== input.expected.manifestDigest
+	) throw new McpProtocolV3Error('GENERATION_AFFINITY_MISMATCH');
 	return payload;
 }
 

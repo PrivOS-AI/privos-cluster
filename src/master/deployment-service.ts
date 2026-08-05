@@ -9,10 +9,13 @@ import { QuotaService } from './quota-service.js';
 import { selectNodes, type NodeReservation, SchedulingError } from './scheduler.js';
 import { SubdomainRegistry } from './subdomain-registry.js';
 import { WorkspaceLock } from './workspace-lock.js';
+import { KeyCipher } from './key-crypto.js';
 import type { McpDeploymentGrantPayload } from './mcp-security.js';
 import { canonicalJson, jwkThumbprint, sha256Base64Url } from '../security/artifacts.js';
 import {
+	McpProtocolV3Error,
 	RuntimeResourceDescriptorV3Schema,
+	type ClusterReconfigureCommandPayloadV3,
 	type McpDeploymentGrantPayloadV3,
 	type RuntimeResourceDescriptorV3,
 } from './protocol-v3.js';
@@ -54,6 +57,7 @@ export class DeploymentService {
 		subdomains: SubdomainRegistry;
 		locks: WorkspaceLock;
 		baseDomain: string;
+		cipher: KeyCipher;
 	}) {}
 
 	async deploy(workspaceId: string, raw: unknown): Promise<MasterApp> {
@@ -224,6 +228,10 @@ export class DeploymentService {
 				});
 				const now = new Date();
 				const subdomain = grant.deployment.subdomain ?? await this.deps.subdomains.allocate(input.listingId);
+				// Operator secrets never rest in the clear in the master DB: only
+				// the non-secret half is queryable, the rest is sealed with the
+				// same master key that protects node and identity material.
+				const sealed = this.sealOperatorEnv(input.envVars, grant.deployment.secretEnvKeys ?? []);
 				app = {
 					appId: grant.deployment.clusterAppId,
 					workspaceId,
@@ -233,13 +241,17 @@ export class DeploymentService {
 					imageDigest: input.digest,
 					resources: input.resources,
 					port: input.port,
-					envVars: input.envVars,
+					envVars: sealed.envVars,
+					...(sealed.secretEnvVarsEnc ? { secretEnvVarsEnc: sealed.secretEnvVarsEnc } : {}),
 					volumes: input.volumes,
 					storageBytes,
 					availabilityTier: input.availabilityTier as AvailabilityTier,
 					stateless: input.stateless,
 					subdomain,
 					uiUrl: `https://${subdomain}.${this.deps.baseDomain}`,
+					secretEnvKeys: sealed.secretEnvKeys,
+					appliedConfigEpoch: grant.configEpoch ?? 1,
+					appliedConfigAt: now,
 					replicas: [],
 					state: 'PROVISIONING',
 					kind: 'mcp-v3',
@@ -341,6 +353,8 @@ export class DeploymentService {
 							workspaceId,
 							subdomain: app.subdomain,
 							domain: this.deps.baseDomain,
+							platformEnvVars: this.platformEnvVarsV3(app.subdomain),
+							secretEnvKeys: app.secretEnvKeys ?? [],
 							mcpV3Binding: {
 								protocolVersion: 3,
 								clusterId: grant.clusterId,
@@ -528,6 +542,184 @@ export class DeploymentService {
 			await this.recordMcpV3StartedEvents(app, establishedAt);
 			return { ...app, state: 'RUNNING', mcpInventoryAttestationEstablishedAt: establishedAt, updatedAt: establishedAt };
 		});
+	}
+
+	/** The public origin of a managed runtime; also what the app sees as PRIVOS_PUBLIC_URL. */
+	publicUrlFor(subdomain: string): string {
+		return `https://${subdomain}.${this.deps.baseDomain}`;
+	}
+
+	/**
+	 * Platform-owned container environment.
+	 *
+	 * Injected here rather than carried in the Hub's grant on purpose: the
+	 * PRIVOS_ namespace is refused on every grant-supplied env map, so a value
+	 * bearing these names can only have come from the Cluster.
+	 */
+	private platformEnvVarsV3(subdomain: string): Record<string, string> {
+		return {
+			PRIVOS_PUBLIC_URL: this.publicUrlFor(subdomain),
+			PRIVOS_ACCESS_MODE: 'managed-runtime',
+		};
+	}
+
+	/**
+	 * Apply a verified configuration epoch to a running v3 generation.
+	 *
+	 * Containers are recreated in place — same cluster container identity, same
+	 * attested resource inventory — because the environment is only readable by
+	 * a process at start. HA runs one replica at a time so the ingress always
+	 * has a healthy upstream.
+	 */
+	async reconfigureMcpV3(
+		workspaceId: string,
+		command: ClusterReconfigureCommandPayloadV3,
+	): Promise<{ app: MasterApp; appliedKeys: string[] }> {
+		return this.deps.locks.run(workspaceId, async () => {
+			const app = await this.deps.repositories.apps.findOne({
+				workspaceId,
+				kind: 'mcp-v3',
+				mcpRuntimeInstallationId: command.runtimeInstallationId,
+				state: { $ne: 'REMOVED' },
+			});
+			if (!app) throw new McpProtocolV3Error('RUNTIME_NOT_RECONFIGURABLE', 'app_not_found');
+			if (app.state !== 'RUNNING') throw new McpProtocolV3Error('RUNTIME_NOT_RECONFIGURABLE', `state_${app.state}`);
+			if (
+				app.appId !== command.clusterAppId ||
+				app.mcpDeploymentId !== command.deploymentId ||
+				app.mcpGenerationId !== command.generationId ||
+				app.mcpGenerationNumber !== command.generationNumber ||
+				app.mcpAppId !== command.mcpAppId ||
+				app.manifestDigest !== command.manifestDigest ||
+				app.resourceManifestHash !== command.resourceManifestHash ||
+				app.runtimeResourceInventoryHash !== command.runtimeResourceInventoryHash ||
+				app.mcpAuthorizationEpoch !== command.authorizationEpoch
+			) throw new McpProtocolV3Error('GENERATION_AFFINITY_MISMATCH');
+
+			const applied = app.appliedConfigEpoch ?? 1;
+			// A repeat of the epoch that is already running is idempotent only when
+			// the environment is byte-identical; anything else — including an equal
+			// epoch with different values — is a downgrade or a forgery attempt.
+			if (command.configEpoch < applied) throw new McpProtocolV3Error('CONFIG_EPOCH_INVALID', 'epoch_downgrade');
+			if (command.configEpoch === applied) {
+				if (canonicalJson(this.operatorEnvOf(app)) !== canonicalJson(command.envVars)) {
+					throw new McpProtocolV3Error('CONFIG_EPOCH_INVALID', 'epoch_reused');
+				}
+				return { app, appliedKeys: Object.keys(command.envVars).sort() };
+			}
+
+			const nodes = await this.deps.repositories.nodes.find({
+				nodeId: { $in: [...new Set(app.replicas.map((replica) => replica.nodeId))] },
+				status: 'ACTIVE',
+			}).toArray();
+			// Replicas may share a node, so require every replica's node to
+			// resolve rather than comparing counts.
+			if (app.replicas.some((replica) => !nodes.some((node) => node.nodeId === replica.nodeId))) {
+				throw new Error('mcp_replica_node_missing');
+			}
+
+			const sealed = this.sealOperatorEnv(command.envVars, command.secretKeys);
+			const secretKeys = sealed.secretEnvKeys;
+
+			for (const replica of app.replicas) {
+				const node = nodes.find((candidate) => candidate.nodeId === replica.nodeId)!;
+				const response = await this.deps.agentClient.request(
+					node,
+					workspaceId,
+					'POST',
+					`/api/v1/mcp/v3/apps/${replica.containerId}/reconfigure`,
+					{
+						appId: app.appId,
+						workspaceId,
+						listingId: app.listingId,
+						versionDigest: app.versionDigest,
+						image: app.image,
+						digest: app.imageDigest,
+						tag: 'latest',
+						port: app.port,
+						resources: app.resources,
+						envVars: command.envVars,
+						platformEnvVars: this.platformEnvVarsV3(app.subdomain),
+						secretEnvKeys: secretKeys,
+						volumes: app.volumes,
+						availabilityTier: app.availabilityTier,
+						stateless: app.stateless,
+						subdomain: app.subdomain,
+						domain: this.deps.baseDomain,
+						configEpoch: command.configEpoch,
+						runtimeResourceInventoryHash: command.runtimeResourceInventoryHash,
+						mcpV3Binding: {
+							protocolVersion: 3,
+							clusterId: command.clusterId,
+							nodeId: node.nodeId,
+							workspaceId,
+							deploymentId: command.deploymentId,
+							generationId: command.generationId,
+							generationNumber: command.generationNumber,
+							runtimeInstallationId: command.runtimeInstallationId,
+							mcpAppId: command.mcpAppId,
+							replicaId: replica.replicaId,
+							containerId: replica.containerId,
+							imageDigest: app.imageDigest,
+							manifestDigest: command.manifestDigest,
+							approvalReceiptHash: app.mcpApprovalReceiptHash,
+							authorizationEpoch: command.authorizationEpoch,
+							deploymentGrantHash: app.mcpDeploymentGrantHash,
+							resourceManifestHash: command.resourceManifestHash,
+						},
+					},
+				);
+				if (response.status >= 300) {
+					throw new Error(`agent MCP v3 reconfigure failed: ${JSON.stringify(response.body)}`);
+				}
+			}
+
+			const appliedAt = new Date();
+			const persisted = await this.deps.repositories.apps.updateOne(
+				{ appId: app.appId, workspaceId, appliedConfigEpoch: { $lt: command.configEpoch } },
+				{
+					$set: {
+						envVars: sealed.envVars,
+						secretEnvKeys: sealed.secretEnvKeys,
+						appliedConfigEpoch: command.configEpoch,
+						appliedConfigAt: appliedAt,
+						updatedAt: appliedAt,
+						...(sealed.secretEnvVarsEnc ? { secretEnvVarsEnc: sealed.secretEnvVarsEnc } : {}),
+					},
+					// A removed secret must not leave its previous value behind.
+					...(sealed.secretEnvVarsEnc ? {} : { $unset: { secretEnvVarsEnc: 1 as const } }),
+				},
+			);
+			if (persisted.matchedCount !== 1) throw new Error('mcp_v3_reconfigure_persistence_conflict');
+			const reconfigured = await this.deps.repositories.apps.findOne({ appId: app.appId, workspaceId });
+			if (!reconfigured || reconfigured.appliedConfigEpoch !== command.configEpoch) {
+				throw new Error('mcp_v3_reconfigure_persistence_conflict');
+			}
+			return { app: reconfigured, appliedKeys: Object.keys(command.envVars).sort() };
+		});
+	}
+
+	/** Reassemble the operator environment the app currently runs on. */
+	private operatorEnvOf(app: MasterApp): Record<string, string> {
+		if (!app.secretEnvVarsEnc) return app.envVars;
+		return { ...app.envVars, ...(JSON.parse(this.deps.cipher.decrypt(app.secretEnvVarsEnc)) as Record<string, string>) };
+	}
+
+	/** Split an operator environment into its queryable and sealed halves. */
+	private sealOperatorEnv(
+		envVars: Record<string, string>,
+		declaredSecretKeys: string[],
+	): { envVars: Record<string, string>; secretEnvKeys: string[]; secretEnvVarsEnc?: string } {
+		const secretEnvKeys = [...new Set(declaredSecretKeys.filter((key) => key in envVars))].sort();
+		if (!secretEnvKeys.length) return { envVars, secretEnvKeys };
+		const entries = Object.entries(envVars);
+		return {
+			envVars: Object.fromEntries(entries.filter(([key]) => !secretEnvKeys.includes(key))),
+			secretEnvKeys,
+			secretEnvVarsEnc: this.deps.cipher.encrypt(
+				canonicalJson(Object.fromEntries(entries.filter(([key]) => secretEnvKeys.includes(key)))),
+			),
+		};
 	}
 
 	private async recordMcpV3StartedEvents(app: MasterApp, establishedAt: Date): Promise<void> {

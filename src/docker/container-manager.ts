@@ -1,3 +1,5 @@
+import crypto from 'node:crypto';
+
 import Docker from 'dockerode';
 
 import { resolveImmutableImageReference } from './image-reference.js';
@@ -19,6 +21,10 @@ export interface CreateContainerConfig {
     port: number;
     resources: ContainerResources;
     envVars?: Record<string, string>;
+    /** Platform-owned PRIVOS_* variables; they override any same-named entry. */
+    platformEnvVars?: Record<string, string>;
+    /** Names within envVars whose values must stay out of the Docker labels. */
+    secretEnvKeys?: string[];
     mounts?: Array<{ dockerVolumeName: string; mountPath: string }>;  // named volume mounts
     subdomain?: string | null;     // DNS label
     baseDomain?: string | null;    // e.g. 'apps.example.com' — combined with subdomain for Caddy
@@ -35,6 +41,23 @@ export const HEALTH_DEFAULTS = { path: '/health', maxFails: 3, restart: true } a
 
 // Sentinel for "no value" in a Docker label (labels can't be null/absent-typed cleanly).
 const LABEL_NONE = '';
+
+/** Key-sorted JSON so the env digest is stable across insertion orders. */
+function canonicalEnvJson(env: Record<string, string>): string {
+	return JSON.stringify(Object.keys(env).sort().map((key) => [key, env[key]]));
+}
+
+/**
+ * Environment actually handed to the container process. Platform PRIVOS_*
+ * variables always win: the operator map is refused that namespace upstream, so
+ * a collision here can only be an attempt to shadow a platform value.
+ */
+export function resolveContainerEnv(cfg: {
+	envVars?: Record<string, string>;
+	platformEnvVars?: Record<string, string>;
+}): Record<string, string> {
+	return { ...(cfg.envVars ?? {}), ...(cfg.platformEnvVars ?? {}) };
+}
 
 /**
  * Build the Docker label map for a container. This is the FULL metadata schema:
@@ -58,6 +81,7 @@ export function buildContainerLabels(cfg: {
     port: number;
     resources: ContainerResources;
     envVars?: Record<string, string>;
+    secretEnvKeys?: string[];
     subdomain?: string | null;
     baseDomain?: string | null;
     createdBy?: string | null;
@@ -66,6 +90,15 @@ export function buildContainerLabels(cfg: {
 	mcpV3Binding?: McpRuntimeBindingV3;
 }): Record<string, string> {
 	if (cfg.mcpBinding && cfg.mcpV3Binding) throw new Error('mcp_protocol_binding_conflict');
+	const userEnv = cfg.envVars ?? {};
+	const secretKeys = (cfg.secretEnvKeys ?? []).filter((key) => key in userEnv).sort();
+	// Labels are world-readable to anyone who can run `docker inspect`. Operator
+	// secrets are therefore recorded by NAME only; their values live solely in
+	// the container's own Config.Env. The digest covers the full user env so
+	// drift is still detectable without exposing anything.
+	const labelledEnv = Object.fromEntries(
+		Object.entries(userEnv).filter(([key]) => !secretKeys.includes(key)),
+	);
     const labels: Record<string, string> = {
         // Legacy discovery labels (kept for backward compat with existing tooling).
         'mcp-app': 'true',
@@ -83,10 +116,12 @@ export function buildContainerLabels(cfg: {
         'privos.version.digest': cfg.versionDigest || LABEL_NONE,
         'privos.port': String(cfg.port),
         'privos.resources': JSON.stringify(cfg.resources),
-        // Only the USER-supplied env is recorded (matches the DB, which stored
-        // req.envVars). Do NOT reconstruct env from Config.Env — that also
-        // carries image-baked ENV (incl. any secrets) and the injected PORT.
-        'privos.env': JSON.stringify(cfg.envVars ?? {}),
+        // Only the USER-supplied, NON-SECRET env is recorded (matches the DB,
+        // which stored req.envVars). Do NOT reconstruct env from Config.Env —
+        // that also carries image-baked ENV (incl. any secrets) and PORT.
+        'privos.env': JSON.stringify(labelledEnv),
+        'privos.env.secret-keys': JSON.stringify(secretKeys),
+        'privos.env.digest': crypto.createHash('sha256').update(canonicalEnvJson(userEnv)).digest('hex'),
         'privos.subdomain': cfg.subdomain || LABEL_NONE,
         'privos.domain': cfg.baseDomain || LABEL_NONE,
         'privos.created-by': cfg.createdBy || LABEL_NONE,
@@ -186,7 +221,7 @@ export class ContainerManager {
     ): Promise<{ containerId: string; containerName: string; hostPort: number }> {
         const containerName = cfg.containerName;
 
-        const env = Object.entries(cfg.envVars || {}).map(([k, v]) => `${k}=${v}`);
+        const env = Object.entries(resolveContainerEnv(cfg)).map(([k, v]) => `${k}=${v}`);
         env.push(`PORT=${cfg.port}`);
 
         const portKey = `${cfg.port}/tcp`;
@@ -208,6 +243,7 @@ export class ContainerManager {
                 port: cfg.port,
                 resources: cfg.resources,
                 envVars: cfg.envVars,
+                secretEnvKeys: cfg.secretEnvKeys,
                 subdomain: cfg.subdomain,
                 baseDomain: cfg.baseDomain,
                 createdBy: cfg.createdBy,

@@ -41,6 +41,7 @@ export function buildMasterServer(config: MasterConfig, repositories: MasterRepo
 		subdomains: new SubdomainRegistry(repositories),
 		locks: new WorkspaceLock(),
 		baseDomain: config.APPS_BASE_DOMAIN,
+		cipher,
 	});
 	const mcpSecurity = config.APP_CLUSTER_MCP_INSTALL_V2 === 'on' || config.APP_CLUSTER_MCP_INSTALL_V3 === 'on'
 		? new McpSecurityVerifier(repositories, config.APP_MASTER_CLUSTER_ID)
@@ -60,6 +61,7 @@ export function buildMasterServer(config: MasterConfig, repositories: MasterRepo
 		mcpSecurity,
 		mcpV2Enabled: config.APP_CLUSTER_MCP_INSTALL_V2 === 'on',
 		mcpV3Enabled: config.APP_CLUSTER_MCP_INSTALL_V3 === 'on',
+		mcpReconfigureEnabled: config.APP_CLUSTER_MCP_RECONFIGURE_V3 === 'on',
 		clusterMasterIdentity,
 		mcpUninstall: config.APP_CLUSTER_MCP_INSTALL_V3 === 'on'
 			? new McpUninstallServiceV3({
