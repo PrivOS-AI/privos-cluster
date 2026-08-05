@@ -39,6 +39,23 @@ export type McpUninstallResultV3 = {
 
 const NODE_OWNED_KINDS = new Set(['REPLICA', 'CONTAINER', 'VOLUME', 'BROKER_BINDING', 'BROKER_SOCKET', 'SERVICE_DISCOVERY']);
 
+/**
+ * Reason codes end up inside the signed final acknowledgement, whose schema
+ * accepts `^[A-Z][A-Z0-9_]{1,95}$`. One unsignable code fails the whole
+ * acknowledgement and leaves the uninstall unfinishable, so a code reported by a
+ * node is normalised here rather than trusted — a node this master cannot
+ * redeploy in lockstep must never be able to strand a teardown.
+ */
+const safeReasonCode = (value: string | null | undefined): string | null => {
+	if (!value) return null;
+	const normalised = value
+		.toUpperCase()
+		.replace(/[^A-Z0-9_]/g, '_')
+		.replace(/^[^A-Z]+/, '')
+		.slice(0, 96);
+	return /^[A-Z][A-Z0-9_]{1,95}$/.test(normalised) ? normalised : 'NODE_REASON_UNPRINTABLE';
+};
+
 export class McpUninstallServiceV3 {
 	constructor(
 		private readonly deps: {
@@ -221,12 +238,12 @@ export class McpUninstallServiceV3 {
 				continue;
 			}
 			if (!NODE_OWNED_KINDS.has(resource.kind)) {
-				results.push({ kind: resource.kind, resourceId: resource.resourceId, status: 'UNKNOWN', reasonCode: 'resource_kind_unowned', verifiedAt: null });
+				results.push({ kind: resource.kind, resourceId: resource.resourceId, status: 'UNKNOWN', reasonCode: 'RESOURCE_KIND_UNOWNED', verifiedAt: null });
 				continue;
 			}
 			// A resource with no node affinity cannot be proven removed anywhere.
 			if (!resource.nodeId) {
-				results.push({ kind: resource.kind, resourceId: resource.resourceId, status: 'UNKNOWN', reasonCode: 'node_affinity_missing', verifiedAt: null });
+				results.push({ kind: resource.kind, resourceId: resource.resourceId, status: 'UNKNOWN', reasonCode: 'NODE_AFFINITY_MISSING', verifiedAt: null });
 				continue;
 			}
 			byNode.set(resource.nodeId, [...(byNode.get(resource.nodeId) ?? []), resource]);
@@ -239,7 +256,7 @@ export class McpUninstallServiceV3 {
 						kind: resource.kind,
 						resourceId: resource.resourceId,
 						status: 'UNKNOWN' as const,
-						reasonCode: 'node_unavailable',
+						reasonCode: 'NODE_UNAVAILABLE',
 						verifiedAt: null,
 					})),
 				);
@@ -264,7 +281,7 @@ export class McpUninstallServiceV3 {
 				continue;
 			}
 			if (!resource.nodeId || !NODE_OWNED_KINDS.has(resource.kind)) {
-				results.push({ kind: resource.kind, resourceId: resource.resourceId, status: 'UNKNOWN', reasonCode: 'absence_not_verifiable', verifiedAt: null });
+				results.push({ kind: resource.kind, resourceId: resource.resourceId, status: 'UNKNOWN', reasonCode: 'ABSENCE_NOT_VERIFIABLE', verifiedAt: null });
 				continue;
 			}
 			byNode.set(resource.nodeId, [...(byNode.get(resource.nodeId) ?? []), resource]);
@@ -277,7 +294,7 @@ export class McpUninstallServiceV3 {
 						kind: resource.kind,
 						resourceId: resource.resourceId,
 						status: 'UNKNOWN' as const,
-						reasonCode: 'node_unavailable',
+						reasonCode: 'NODE_UNAVAILABLE',
 						verifiedAt: null,
 					})),
 				);
@@ -310,24 +327,24 @@ export class McpUninstallServiceV3 {
 				resources,
 			});
 		} catch {
-			return unknown('node_request_failed');
+			return unknown('NODE_REQUEST_FAILED');
 		}
-		if (response.status >= 300) return unknown('node_request_rejected');
+		if (response.status >= 300) return unknown('NODE_REQUEST_REJECTED');
 		const outcomes = (response.body as { results?: NodeCleanupOutcome[] })?.results;
-		if (!Array.isArray(outcomes)) return unknown('node_response_invalid');
+		if (!Array.isArray(outcomes)) return unknown('NODE_RESPONSE_INVALID');
 		const byIdentity = new Map(outcomes.map((outcome) => [`${outcome.kind} ${outcome.resourceId}`, outcome]));
 		const verifiedAt = new Date().toISOString();
 		return resources.map((resource) => {
 			const outcome = byIdentity.get(`${resource.kind} ${resource.resourceId}`);
 			if (!outcome) {
-				return { kind: resource.kind, resourceId: resource.resourceId, status: 'UNKNOWN' as const, reasonCode: 'node_result_missing', verifiedAt: null };
+				return { kind: resource.kind, resourceId: resource.resourceId, status: 'UNKNOWN' as const, reasonCode: 'NODE_RESULT_MISSING', verifiedAt: null };
 			}
 			const proven = outcome.status === 'ABSENT' || outcome.status === 'REMOVED';
 			return {
 				kind: resource.kind,
 				resourceId: resource.resourceId,
 				status: outcome.status,
-				reasonCode: outcome.reasonCode ?? null,
+				reasonCode: safeReasonCode(outcome.reasonCode),
 				verifiedAt: proven ? verifiedAt : null,
 			};
 		});
@@ -336,13 +353,13 @@ export class McpUninstallServiceV3 {
 	private async removeIngress(resource: RuntimeResourceDescriptorV3): Promise<ResourceCleanupResultV3> {
 		const subdomain = resource.attributes.subdomain;
 		if (!subdomain) {
-			return { kind: resource.kind, resourceId: resource.resourceId, status: 'UNKNOWN', reasonCode: 'subdomain_missing', verifiedAt: null };
+			return { kind: resource.kind, resourceId: resource.resourceId, status: 'UNKNOWN', reasonCode: 'SUBDOMAIN_MISSING', verifiedAt: null };
 		}
 		try {
 			await this.deps.ingress.remove(subdomain);
 			return { kind: resource.kind, resourceId: resource.resourceId, status: 'REMOVED', reasonCode: null, verifiedAt: new Date().toISOString() };
 		} catch {
-			return { kind: resource.kind, resourceId: resource.resourceId, status: 'FAILED', reasonCode: 'ingress_remove_failed', verifiedAt: null };
+			return { kind: resource.kind, resourceId: resource.resourceId, status: 'FAILED', reasonCode: 'INGRESS_REMOVE_FAILED', verifiedAt: null };
 		}
 	}
 

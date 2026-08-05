@@ -294,6 +294,21 @@ type RuntimeCleanupOutcome = {
 
 const CONTAINER_KINDS = new Set(['REPLICA', 'CONTAINER']);
 
+/**
+ * Reason codes travel to the Hub inside a signed cleanup acknowledgement whose
+ * schema accepts `^[A-Z][A-Z0-9_]{1,95}$`. A code that cannot be signed strands
+ * the whole uninstall, so anything from outside — a Docker error `code`, say —
+ * is normalised rather than trusted.
+ */
+const safeReasonCode = (value: string, fallback: string): string => {
+	const normalised = value
+		.toUpperCase()
+		.replace(/[^A-Z0-9_]/g, '_')
+		.replace(/^[^A-Z]+/, '')
+		.slice(0, 96);
+	return /^[A-Z][A-Z0-9_]{1,95}$/.test(normalised) ? normalised : fallback;
+};
+
 async function removeRuntimeResource(
 	resource: z.infer<typeof RuntimeResourceDescriptorV3Schema>,
 	workspaceId?: string,
@@ -302,7 +317,7 @@ async function removeRuntimeResource(
 	try {
 		if (CONTAINER_KINDS.has(resource.kind)) {
 			const containerId = resource.attributes.containerId;
-			if (!containerId) return { ...identity, status: 'UNKNOWN', reasonCode: 'container_id_missing' };
+			if (!containerId) return { ...identity, status: 'UNKNOWN', reasonCode: 'CONTAINER_ID_MISSING' };
 			const container = await dockerState.getById(containerId, undefined, workspaceId);
 			if (!container) return { ...identity, status: 'ABSENT', reasonCode: null };
 			await containerManager.stopContainer(container.dockerContainerId, 10).catch(() => undefined);
@@ -311,7 +326,7 @@ async function removeRuntimeResource(
 		}
 		if (resource.kind === 'VOLUME') {
 			const volumeName = resource.attributes.volumeName;
-			if (!volumeName) return { ...identity, status: 'UNKNOWN', reasonCode: 'volume_name_missing' };
+			if (!volumeName) return { ...identity, status: 'UNKNOWN', reasonCode: 'VOLUME_NAME_MISSING' };
 			// The declared name removes the volume even when its container is long
 			// gone, which a mount-derived list could never do.
 			try {
@@ -324,14 +339,14 @@ async function removeRuntimeResource(
 		}
 		if (resource.kind === 'BROKER_BINDING' || resource.kind === 'BROKER_SOCKET' || resource.kind === 'SERVICE_DISCOVERY') {
 			const replicaId = resource.replicaId ?? resource.attributes.replicaId;
-			if (!replicaId) return { ...identity, status: 'UNKNOWN', reasonCode: 'replica_id_missing' };
+			if (!replicaId) return { ...identity, status: 'UNKNOWN', reasonCode: 'REPLICA_ID_MISSING' };
 			await mcpBrokerManager.cleanup(replicaId);
 			return { ...identity, status: 'REMOVED', reasonCode: null };
 		}
 		// Ingress is programmed by the master, not by a node agent.
-		return { ...identity, status: 'UNKNOWN', reasonCode: 'resource_kind_not_node_owned' };
+		return { ...identity, status: 'UNKNOWN', reasonCode: 'RESOURCE_KIND_NOT_NODE_OWNED' };
 	} catch (error: unknown) {
-		return { ...identity, status: 'FAILED', reasonCode: (error as { code?: string }).code ?? 'node_cleanup_failed' };
+		return { ...identity, status: 'FAILED', reasonCode: safeReasonCode((error as { code?: string }).code ?? '', 'NODE_CLEANUP_FAILED') };
 	}
 }
 
@@ -343,25 +358,25 @@ async function observeRuntimeResource(
 	try {
 		if (CONTAINER_KINDS.has(resource.kind)) {
 			const containerId = resource.attributes.containerId;
-			if (!containerId) return { ...identity, status: 'UNKNOWN', reasonCode: 'container_id_missing' };
+			if (!containerId) return { ...identity, status: 'UNKNOWN', reasonCode: 'CONTAINER_ID_MISSING' };
 			const container = await dockerState.getById(containerId, undefined, workspaceId);
-			return { ...identity, status: container ? 'FAILED' : 'ABSENT', reasonCode: container ? 'container_still_present' : null };
+			return { ...identity, status: container ? 'FAILED' : 'ABSENT', reasonCode: container ? 'CONTAINER_STILL_PRESENT' : null };
 		}
 		if (resource.kind === 'VOLUME') {
 			const volumeName = resource.attributes.volumeName;
-			if (!volumeName) return { ...identity, status: 'UNKNOWN', reasonCode: 'volume_name_missing' };
+			if (!volumeName) return { ...identity, status: 'UNKNOWN', reasonCode: 'VOLUME_NAME_MISSING' };
 			const volumes = await containerManager.listVolumes();
 			const present = volumes.some((volume: { Name?: string }) => volume?.Name === volumeName);
-			return { ...identity, status: present ? 'FAILED' : 'ABSENT', reasonCode: present ? 'volume_still_present' : null };
+			return { ...identity, status: present ? 'FAILED' : 'ABSENT', reasonCode: present ? 'VOLUME_STILL_PRESENT' : null };
 		}
 		if (resource.kind === 'BROKER_BINDING' || resource.kind === 'BROKER_SOCKET' || resource.kind === 'SERVICE_DISCOVERY') {
 			const replicaId = resource.replicaId ?? resource.attributes.replicaId;
-			if (!replicaId) return { ...identity, status: 'UNKNOWN', reasonCode: 'replica_id_missing' };
+			if (!replicaId) return { ...identity, status: 'UNKNOWN', reasonCode: 'REPLICA_ID_MISSING' };
 			return { ...identity, status: mcpBrokerManager.isBound(replicaId) ? 'FAILED' : 'ABSENT', reasonCode: null };
 		}
-		return { ...identity, status: 'UNKNOWN', reasonCode: 'resource_kind_not_node_owned' };
+		return { ...identity, status: 'UNKNOWN', reasonCode: 'RESOURCE_KIND_NOT_NODE_OWNED' };
 	} catch (error: unknown) {
-		return { ...identity, status: 'UNKNOWN', reasonCode: (error as { code?: string }).code ?? 'node_absence_check_failed' };
+		return { ...identity, status: 'UNKNOWN', reasonCode: safeReasonCode((error as { code?: string }).code ?? '', 'NODE_ABSENCE_CHECK_FAILED') };
 	}
 }
 

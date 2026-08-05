@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { McpUninstallServiceV3 } from './mcp-uninstall-service-v3.js';
+import { ResourceCleanupResultV3Schema } from './protocol-v3.js';
 import type { RuntimeResourceDescriptorV3 } from './protocol-v3.js';
 
 const expectedResources: RuntimeResourceDescriptorV3[] = [
@@ -163,6 +164,34 @@ test('a volume the node cannot prove absent blocks completion instead of passing
 	// Access stays revoked; the app is never marked removed on residue.
 	assert.equal(world.appUpdates[0].$set?.state, 'REVOKING');
 	assert.ok(!world.appUpdates.some((update) => update.$set?.state === 'REMOVED'));
+});
+
+test('every reported reason stays signable, whatever a node calls it', async () => {
+	// A residue result is the only path that carries a reason, and the reason
+	// travels inside the signed acknowledgement. A code the payload schema
+	// rejects fails the signature and leaves the uninstall unfinishable, so the
+	// node is not trusted to name its own failures in the wire alphabet.
+	const world = freshWorld({
+		nodeOutcomes: {
+			remove: [
+				{ kind: 'CONTAINER', resourceId: 'container:replica-1', status: 'REMOVED', reasonCode: null },
+				{ kind: 'VOLUME', resourceId: 'volume:data', status: 'FAILED', reasonCode: 'volume busy: /var/lib/x' },
+			],
+			absence: [
+				{ kind: 'CONTAINER', resourceId: 'container:replica-1', status: 'ABSENT', reasonCode: null },
+				{ kind: 'VOLUME', resourceId: 'volume:data', status: 'FAILED', reasonCode: 'volume_still_present' },
+			],
+		},
+	});
+	const result = await buildService(world).uninstall({ workspaceId: 'workspace-1', command, commandHash: 'D'.repeat(43) });
+	assert.equal(result.state, 'CLEANUP_REQUIRED');
+	for (const signed of world.signedResults ?? []) {
+		ResourceCleanupResultV3Schema.parse(signed);
+	}
+	const volume = (world.signedResults ?? []).find(
+		(entry) => (entry as { resourceId?: string }).resourceId === 'volume:data',
+	) as { reasonCode?: string } | undefined;
+	assert.equal(volume?.reasonCode, 'VOLUME_STILL_PRESENT');
 });
 
 test('an unreachable node is unknown, never a silent success', async () => {
