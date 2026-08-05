@@ -148,7 +148,7 @@ const mcpHandler: FastifyPluginAsync = async (fastify) => {
 				ownershipScope: 'INSTALLATION_GENERATION',
 				nodeId: binding.nodeId,
 				replicaId: binding.replicaId,
-				attributes: { nodeIdentityKid: identity.kid },
+				attributes: { nodeIdentityKid: identity.kid, containerId: binding.containerId },
 			},
 			...((inspect.Mounts ?? []) as Array<{ Type?: string; Name?: string; Destination?: string }>)
 				.filter((mount) => mount.Type === 'volume' && mount.Name)
@@ -292,7 +292,16 @@ type RuntimeCleanupOutcome = {
 	reasonCode: string | null;
 };
 
-const CONTAINER_KINDS = new Set(['REPLICA', 'CONTAINER']);
+/**
+ * A CONTAINER resource is declared with the platform container id as its
+ * resourceId — the same value the runtime sets as the `privos.id` label — and
+ * v3 provisioning did not repeat it under `attributes.containerId`. Inventories
+ * are hash-pinned at provisioning time, so already-provisioned generations can
+ * never gain the attribute; the identity the descriptor carries has to be
+ * honoured or those generations become impossible to tear down.
+ */
+const declaredContainerId = (resource: z.infer<typeof RuntimeResourceDescriptorV3Schema>): string | undefined =>
+	resource.attributes.containerId ?? (resource.kind === 'CONTAINER' ? resource.resourceId : undefined);
 
 /**
  * Reason codes travel to the Hub inside a signed cleanup acknowledgement whose
@@ -315,8 +324,17 @@ async function removeRuntimeResource(
 ): Promise<RuntimeCleanupOutcome> {
 	const identity = { kind: resource.kind, resourceId: resource.resourceId };
 	try {
-		if (CONTAINER_KINDS.has(resource.kind)) {
-			const containerId = resource.attributes.containerId;
+		if (resource.kind === 'REPLICA') {
+			// The replica's container is declared and removed as its own CONTAINER
+			// resource; the replica itself is the broker-side registration, and
+			// completion still requires the container proven absent independently.
+			const replicaId = resource.replicaId ?? resource.attributes.replicaId ?? resource.resourceId;
+			if (!replicaId) return { ...identity, status: 'UNKNOWN', reasonCode: 'REPLICA_ID_MISSING' };
+			await mcpBrokerManager.cleanup(replicaId);
+			return { ...identity, status: 'REMOVED', reasonCode: null };
+		}
+		if (resource.kind === 'CONTAINER') {
+			const containerId = declaredContainerId(resource);
 			if (!containerId) return { ...identity, status: 'UNKNOWN', reasonCode: 'CONTAINER_ID_MISSING' };
 			const container = await dockerState.getById(containerId, undefined, workspaceId);
 			if (!container) return { ...identity, status: 'ABSENT', reasonCode: null };
@@ -356,8 +374,13 @@ async function observeRuntimeResource(
 ): Promise<RuntimeCleanupOutcome> {
 	const identity = { kind: resource.kind, resourceId: resource.resourceId };
 	try {
-		if (CONTAINER_KINDS.has(resource.kind)) {
-			const containerId = resource.attributes.containerId;
+		if (resource.kind === 'REPLICA') {
+			const replicaId = resource.replicaId ?? resource.attributes.replicaId ?? resource.resourceId;
+			if (!replicaId) return { ...identity, status: 'UNKNOWN', reasonCode: 'REPLICA_ID_MISSING' };
+			return { ...identity, status: mcpBrokerManager.isBound(replicaId) ? 'FAILED' : 'ABSENT', reasonCode: mcpBrokerManager.isBound(replicaId) ? 'REPLICA_STILL_BOUND' : null };
+		}
+		if (resource.kind === 'CONTAINER') {
+			const containerId = declaredContainerId(resource);
 			if (!containerId) return { ...identity, status: 'UNKNOWN', reasonCode: 'CONTAINER_ID_MISSING' };
 			const container = await dockerState.getById(containerId, undefined, workspaceId);
 			return { ...identity, status: container ? 'FAILED' : 'ABSENT', reasonCode: container ? 'CONTAINER_STILL_PRESENT' : null };
