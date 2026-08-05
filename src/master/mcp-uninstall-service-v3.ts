@@ -169,10 +169,28 @@ export class McpUninstallServiceV3 {
 	): Promise<ClusterLifecycleOperation> {
 		const existing = await this.deps.repositories.clusterLifecycleOperations.findOne({ operationId: command.operationId });
 		if (existing) {
-			if (existing.commandHash !== commandHash || existing.runtimeInstallationId !== command.runtimeInstallationId) {
+			// An operation is bound to what its command *names*, not to the bytes
+			// that carried it. Commands are short lived and the Hub mints a fresh
+			// one for every attempt, so pinning the artifact hash here would refuse
+			// each legitimate retry and leave the teardown unfinishable. Reuse of
+			// the bytes is already refused where the command is consumed, which is
+			// also where every field below was verified against this cluster.
+			if (
+				existing.runtimeInstallationId !== command.runtimeInstallationId ||
+				existing.generationId !== command.generationId ||
+				existing.generationNumber !== command.generationNumber ||
+				existing.clusterAppId !== command.clusterAppId ||
+				existing.resourceManifestHash !== command.resourceManifestHash ||
+				existing.runtimeResourceInventoryHash !== command.runtimeResourceInventoryHash
+			) {
 				throw Object.assign(new Error('lifecycle command affinity conflict'), { code: 'ARTIFACT_REPLAYED', statusCode: 409 });
 			}
-			return existing;
+			if (existing.commandHash === commandHash) return existing;
+			await this.deps.repositories.clusterLifecycleOperations.updateOne(
+				{ operationId: command.operationId },
+				{ $set: { commandJti: command.jti, commandHash, updatedAt: new Date() } },
+			);
+			return { ...existing, commandJti: command.jti, commandHash };
 		}
 		const now = new Date();
 		const record = {

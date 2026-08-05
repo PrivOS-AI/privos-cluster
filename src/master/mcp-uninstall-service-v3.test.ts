@@ -224,12 +224,31 @@ test('redelivering the same command replays the stored acknowledgement', async (
 	assert.equal(world.operations.size, 1);
 });
 
-test('a changed command body for the same operation is a replay conflict', async () => {
+test('a retry under a freshly minted command resumes the same operation', async () => {
+	// Commands are short lived and the Hub mints a new one per attempt, so a
+	// different artifact is the normal shape of a retry, not a conflict.
+	const world = freshWorld();
+	const service = buildService(world);
+	const first = await service.uninstall({ workspaceId: 'workspace-1', command, commandHash: 'D'.repeat(43) });
+	const retried = await service.uninstall({
+		workspaceId: 'workspace-1',
+		command: { ...command, jti: 'a1b2c3d4-0000-4000-8000-000000000001', nonce: 'nonce-2' },
+		commandHash: 'E'.repeat(43),
+	});
+	assert.equal(retried.operationId, first.operationId);
+	assert.equal(world.operations.size, 1);
+});
+
+test('a command naming a different runtime is a replay conflict', async () => {
 	const world = freshWorld();
 	const service = buildService(world);
 	await service.uninstall({ workspaceId: 'workspace-1', command, commandHash: 'D'.repeat(43) });
 	await assert.rejects(
-		() => service.uninstall({ workspaceId: 'workspace-1', command, commandHash: 'E'.repeat(43) }),
+		() => service.uninstall({
+			workspaceId: 'workspace-1',
+			command: { ...command, runtimeInstallationId: 'c3f0a1d2-0000-4000-8000-00000000dead' },
+			commandHash: 'E'.repeat(43),
+		}),
 		/lifecycle command affinity conflict/,
 	);
 });
