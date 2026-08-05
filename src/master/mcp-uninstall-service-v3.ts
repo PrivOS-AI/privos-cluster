@@ -468,15 +468,23 @@ export class McpUninstallServiceV3 {
 		if (operation && operation.state !== state) assertClusterLifecycleTransitionV3(operation.state, state);
 		const checkpointKey = sha256Base64Url(canonicalJson({ operationId: command.operationId, state, step, sequence }));
 		const now = new Date();
+		// One checkpoint document per (operation, sequence) — that is what the
+		// unique index enforces. A resumed attempt reaching a sequence its dead
+		// predecessor already wrote may land a different state (the predecessor
+		// signed CLEANUP_REQUIRED, this attempt proves COMPLETED), so the document
+		// records the latest attempt's outcome rather than refusing to exist.
 		await this.deps.repositories.clusterLifecycleCheckpoints.updateOne(
-			{ checkpointKey },
+			{ operationId: command.operationId, sequence },
 			{
 				$setOnInsert: {
 					_id: `lifecycle-checkpoint:${crypto.randomUUID()}`,
 					protocolVersion: 3 as const,
-					checkpointKey,
 					operationId: command.operationId,
 					sequence,
+					createdAt: now,
+				},
+				$set: {
+					checkpointKey,
 					checkpoint: {
 						protocolVersion: 3 as const,
 						type: 'cluster-lifecycle-checkpoint' as const,
@@ -497,7 +505,7 @@ export class McpUninstallServiceV3 {
 						results: [...results],
 						errorCode: null,
 					},
-					createdAt: now,
+					updatedAt: now,
 				},
 			},
 			{ upsert: true },

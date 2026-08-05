@@ -68,8 +68,12 @@ function buildService(world: World) {
 			},
 		},
 		clusterLifecycleCheckpoints: {
-			updateOne: async ({ checkpointKey }: { checkpointKey: string }, update: any) => {
-				if (!world.checkpoints.has(checkpointKey)) world.checkpoints.set(checkpointKey, update.$setOnInsert);
+			// Mirrors the real collection's unique index: one document per
+			// (operationId, sequence), with the latest attempt's content applied.
+			updateOne: async (filter: { operationId: string; sequence: number }, update: any) => {
+				const key = `${filter.operationId}:${filter.sequence}`;
+				const current = world.checkpoints.get(key) ?? { ...(update.$setOnInsert ?? {}) };
+				world.checkpoints.set(key, { ...current, ...(update.$set ?? {}) });
 			},
 		},
 		clusterCleanupResults: {
@@ -280,6 +284,48 @@ test('a hard crash that never parked is recovered on the next entry', async () =
 		commandHash: 'A'.repeat(43),
 	});
 	assert.equal(retried.state, 'COMPLETED');
+});
+
+test('a residue attempt followed by a clean one converges to COMPLETED', async () => {
+	// The production shape: attempt one signs CLEANUP_REQUIRED and writes the
+	// final checkpoint; the world is then actually cleaned; attempt two proves
+	// it and must be able to re-write that sequence with the better outcome
+	// instead of colliding with the unique (operationId, sequence) index.
+	const world = freshWorld({
+		nodeOutcomes: {
+			remove: [
+				{ kind: 'CONTAINER', resourceId: 'container:replica-1', status: 'REMOVED', reasonCode: null },
+				{ kind: 'VOLUME', resourceId: 'volume:data', status: 'FAILED', reasonCode: 'volume_busy' },
+			],
+			absence: [
+				{ kind: 'CONTAINER', resourceId: 'container:replica-1', status: 'ABSENT', reasonCode: null },
+				{ kind: 'VOLUME', resourceId: 'volume:data', status: 'FAILED', reasonCode: 'volume_still_present' },
+			],
+		},
+	});
+	const service = buildService(world);
+	const first = await service.uninstall({ workspaceId: 'workspace-1', command, commandHash: 'D'.repeat(43) });
+	assert.equal(first.state, 'CLEANUP_REQUIRED');
+
+	world.nodeOutcomes = {
+		remove: [
+			{ kind: 'CONTAINER', resourceId: 'container:replica-1', status: 'ABSENT', reasonCode: null },
+			{ kind: 'VOLUME', resourceId: 'volume:data', status: 'ABSENT', reasonCode: null },
+		],
+		absence: [
+			{ kind: 'CONTAINER', resourceId: 'container:replica-1', status: 'ABSENT', reasonCode: null },
+			{ kind: 'VOLUME', resourceId: 'volume:data', status: 'ABSENT', reasonCode: null },
+		],
+	};
+	const second = await service.uninstall({
+		workspaceId: 'workspace-1',
+		command: { ...command, jti: 'a1b2c3d4-0000-4000-8000-000000000004', nonce: 'nonce-5' },
+		commandHash: 'B'.repeat(43),
+	});
+	assert.equal(second.state, 'COMPLETED');
+	const finalCheckpoint = world.checkpoints.get(`${command.operationId}:5`);
+	assert.equal(finalCheckpoint.checkpoint.state, 'COMPLETED');
+	assert.ok(world.appUpdates.some((update) => update.$set?.state === 'REMOVED'));
 });
 
 test('a command naming a different runtime is a replay conflict', async () => {
