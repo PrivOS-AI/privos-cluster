@@ -300,6 +300,23 @@ export const DispatchBodySchema = z.object({
     id: z.union([z.string(), z.number()]).optional(),
 });
 
+/**
+ * Backend-only human credential carried beside (never inside) the signed RPC.
+ * The Master and Agent deliberately treat the compact JWT as opaque; this
+ * schema only makes the rolling wire member atomic and safe to convert into
+ * HTTP headers after the Agent has verified the dispatch assertion.
+ */
+export const CallerCredentialSchema = z.object({
+	token: z.string()
+		.min(1)
+		.max(32_768)
+		.regex(/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/, 'token must be a compact JWT'),
+	assertedUserId: z.string()
+		.min(1)
+		.max(160)
+		.regex(/^[A-Za-z0-9][A-Za-z0-9._:@-]*$/, 'assertedUserId contains unsafe characters'),
+}).strict();
+
 export const McpDispatchBodySchema = z.object({
 	assertion: z.string().min(1),
 	rpc: DispatchBodySchema,
@@ -312,6 +329,7 @@ export const McpDispatchBodyV3Schema = z.discriminatedUnion('authorizationContex
 		authorizationContext: z.literal('workspace'),
 		runtimeInstallationId: z.string().min(1).max(160),
 		runtimeResourceInventoryHash: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+		callerCredential: CallerCredentialSchema.optional(),
 	}).strict(),
 	z.object({
 		assertion: z.string().min(1),
@@ -320,5 +338,6 @@ export const McpDispatchBodyV3Schema = z.discriminatedUnion('authorizationContex
 		runtimeInstallationId: z.string().min(1).max(160),
 		authorizationBindingId: z.string().min(1).max(160),
 		runtimeResourceInventoryHash: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+		callerCredential: CallerCredentialSchema.optional(),
 	}).strict(),
 ]);

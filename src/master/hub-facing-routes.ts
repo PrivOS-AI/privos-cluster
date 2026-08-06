@@ -13,6 +13,7 @@ import { jwkThumbprint, sha256, sha256Base64Url } from '../security/artifacts.js
 import { clusterMcpSafeReason, recordClusterMcpEvent } from '../services/mcp-observability.js';
 import type { ClusterMasterIdentity } from './cluster-master-identity.js';
 import type { McpUninstallServiceV3 } from './mcp-uninstall-service-v3.js';
+import { CallerCredentialSchema } from '../schemas/app-schemas.js';
 
 const DispatchRpcSchema = z.object({
 	jsonrpc: z.string().optional(),
@@ -60,6 +61,7 @@ const McpV3DispatchBodySchema = z.discriminatedUnion('authorizationContext', [
 		rpc: DispatchRpcSchema,
 		authorizationContext: z.literal('workspace'),
 		runtimeInstallationId: z.string().min(1).max(160),
+		callerCredential: CallerCredentialSchema.optional(),
 	}).strict(),
 	z.object({
 		assertion: z.string().min(1),
@@ -67,6 +69,7 @@ const McpV3DispatchBodySchema = z.discriminatedUnion('authorizationContext', [
 		authorizationContext: z.literal('room'),
 		runtimeInstallationId: z.string().min(1).max(160),
 		authorizationBindingId: z.string().min(1).max(160),
+		callerCredential: CallerCredentialSchema.optional(),
 	}).strict(),
 ]);
 
@@ -216,6 +219,16 @@ export function hubFacingRoutes(deps: {
 				if (body.data.runtimeInstallationId !== app.mcpRuntimeInstallationId) {
 					return reply.code(403).send({ error: 'mcp_dispatch_denied', code: 'GENERATION_AFFINITY_MISMATCH' });
 				}
+				const dispatchAuthorization = body.data.authorizationContext === 'room'
+					? {
+							authorizationContext: 'room' as const,
+							runtimeInstallationId: body.data.runtimeInstallationId,
+							authorizationBindingId: body.data.authorizationBindingId,
+						}
+					: {
+							authorizationContext: 'workspace' as const,
+							runtimeInstallationId: body.data.runtimeInstallationId,
+						};
 				try {
 					await deps.mcpSecurity.consumeDispatchAssertionV3({
 						compact: body.data.assertion,
@@ -235,7 +248,7 @@ export function hubFacingRoutes(deps: {
 							mcpAppId: app.mcpAppId!,
 							clusterAppId: app.appId,
 						},
-						authorization: body.data,
+						authorization: dispatchAuthorization,
 					});
 				} catch (error) {
 					const reason = clusterMcpSafeReason(error, 'dispatch_assertion_invalid');

@@ -58,3 +58,30 @@ test('room dispatch requires both the exact runtime parent and authorization chi
 		authorizationBindingId: 'binding-1', runtimeResourceInventoryHash: 'i'.repeat(43),
 	}).success, false);
 });
+
+test('v3 caller credential is atomic, strict, bounded, and header-safe', () => {
+	const base = {
+		assertion: 'signed',
+		rpc: { method: 'tools/call' },
+		authorizationContext: 'room' as const,
+		runtimeInstallationId: 'runtime-1',
+		authorizationBindingId: 'binding-1',
+		runtimeResourceInventoryHash: 'i'.repeat(43),
+	};
+	const valid = { token: 'header.payload.signature', assertedUserId: 'user-1' };
+	assert.equal(McpDispatchBodyV3Schema.safeParse({ ...base, callerCredential: valid }).success, true);
+	for (const callerCredential of [
+		{ token: valid.token },
+		{ assertedUserId: valid.assertedUserId },
+		{ ...valid, extra: true },
+		{ ...valid, token: 'not-compact' },
+		{ ...valid, token: `header.${'x'.repeat(32_769)}.signature` },
+		{ ...valid, token: 'header.payload.signature\r\nInjected: yes' },
+		{ ...valid, token: 'header.payload.signature\0' },
+		{ ...valid, assertedUserId: 'user\nInjected' },
+		{ ...valid, assertedUserId: 'user\0Injected' },
+		{ ...valid, assertedUserId: `u${'x'.repeat(160)}` },
+	]) {
+		assert.equal(McpDispatchBodyV3Schema.safeParse({ ...base, callerCredential }).success, false);
+	}
+});

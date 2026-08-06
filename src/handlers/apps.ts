@@ -446,18 +446,31 @@ const appsHandler: FastifyPluginAsync = async (fastify) => {
 			const labels = (info.Config?.Labels ?? {}) as Record<string, string>;
 			let rpc: unknown;
 			let dispatchAssertion: string | undefined;
+			let callerCredential: { token: string; assertedUserId: string } | undefined;
 			if (labels['privos.mcp.schema'] === '3') {
 				if (config.APP_CLUSTER_MCP_INSTALL_V3 !== 'on') {
 					return reply.code(403).send({ error: 'mcp_dispatch_denied', code: 'mcp_install_v3_disabled' });
 				}
 				const body = McpDispatchBodyV3Schema.safeParse(req.body);
 				if (!body.success) return reply.code(400).send({ error: 'validation_error', details: body.error.issues });
+				const dispatchAuthorization = body.data.authorizationContext === 'room'
+					? {
+							authorizationContext: 'room' as const,
+							runtimeInstallationId: body.data.runtimeInstallationId,
+							authorizationBindingId: body.data.authorizationBindingId,
+							runtimeResourceInventoryHash: body.data.runtimeResourceInventoryHash,
+						}
+					: {
+							authorizationContext: 'workspace' as const,
+							runtimeInstallationId: body.data.runtimeInstallationId,
+							runtimeResourceInventoryHash: body.data.runtimeResourceInventoryHash,
+						};
 				try {
 					verifyAgentDispatchAssertionV3({
 						compact: body.data.assertion,
 						rpc: body.data.rpc,
 						labels,
-						authorization: body.data,
+						authorization: dispatchAuthorization,
 					});
 				} catch (error) {
 					const reason = clusterMcpSafeReason(error, 'dispatch_assertion_invalid');
@@ -466,6 +479,7 @@ const appsHandler: FastifyPluginAsync = async (fastify) => {
 				}
 				rpc = body.data.rpc;
 				dispatchAssertion = body.data.assertion;
+				callerCredential = body.data.callerCredential;
 			} else if (labels['privos.mcp.schema'] === '2') {
 				const body = McpDispatchBodySchema.safeParse(req.body);
 				if (!body.success) return reply.code(400).send({ error: 'validation_error', details: body.error.issues });
@@ -490,6 +504,12 @@ const appsHandler: FastifyPluginAsync = async (fastify) => {
 				headers: {
 					'content-type': 'application/json',
 					...(dispatchAssertion ? { 'x-privos-dispatch-assertion': dispatchAssertion } : {}),
+					...(callerCredential
+						? {
+								authorization: `Bearer ${callerCredential.token}`,
+								'x-mcp-user-id': callerCredential.assertedUserId,
+							}
+						: {}),
 				},
 				body: JSON.stringify(rpc),
                 signal: AbortSignal.timeout(30_000),

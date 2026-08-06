@@ -136,6 +136,10 @@ test('v3 dispatch verifies parent/child affinity before Cluster selects a live H
 				}
 				assert.equal((body as any).runtimeResourceInventoryHash, 'i'.repeat(43));
 				assert.equal((body as any).replicaId, undefined);
+				assert.deepEqual((body as any).callerCredential, {
+					token: 'credential.sentinel.signature',
+					assertedUserId: 'user-1',
+				});
 				return { status: 200, body: { ok: true, selected: 'container-2' } };
 			},
 		} as any,
@@ -160,12 +164,17 @@ test('v3 dispatch verifies parent/child affinity before Cluster selects a live H
 			authorizationContext: 'room',
 			runtimeInstallationId: 'runtime-1',
 			authorizationBindingId: 'binding-1',
+			callerCredential: {
+				token: 'credential.sentinel.signature',
+				assertedUserId: 'user-1',
+			},
 		},
 	});
 	assert.equal(response.statusCode, 200);
 	assert.deepEqual(response.json(), { ok: true, selected: 'container-2' });
 	assert.equal(verifierInput.expected.replicaId, undefined);
 	assert.equal(verifierInput.authorization.authorizationBindingId, 'binding-1');
+	assert.equal(verifierInput.authorization.callerCredential, undefined);
 	assert.deepEqual(agentCalls, [
 		'GET /api/v1/apps/container-1/status',
 		'GET /api/v1/apps/container-2/status',
