@@ -66,6 +66,9 @@ export const McpProtocolV3ErrorCodeSchema = z.enum([
 	'CONFIG_EPOCH_INVALID',
 	'CONFIG_ENVIRONMENT_RESERVED',
 	'RUNTIME_NOT_RECONFIGURABLE',
+	'RUNTIME_NOT_UPGRADABLE',
+	'UPGRADE_EPOCH_INVALID',
+	'UPGRADE_PREVIOUS_DIGEST_MISMATCH',
 ]);
 
 export type McpProtocolV3ErrorCode = z.infer<typeof McpProtocolV3ErrorCodeSchema>;
@@ -264,6 +267,134 @@ export const ClusterReconfigureAcknowledgementPayloadV3Schema = z.object({
 
 export type ClusterReconfigureAcknowledgementPayloadV3 = z.infer<
 	typeof ClusterReconfigureAcknowledgementPayloadV3Schema
+>;
+
+/**
+ * A revision swap of the image already running under an established
+ * generation (D1: the generation, its number, and everything it owns are
+ * untouched — only the image moves).
+ *
+ * Unlike reconfigure, `targetManifestDigest`/`targetImageDigest` are NEW: the
+ * Cluster's manifest-label check runs against the new image before this
+ * command touches the old runtime at all, mirroring the same byte-exact check
+ * that gates installs. `previousManifestDigest`/`previousImageDigest` name the
+ * revert target so a failed upgrade has somewhere named to go back to (D4)
+ * rather than a recomputed guess. `revision` is the generation-scoped image
+ * counter (bumped by every swap, including a rollback, so a retried upgrade
+ * is never mistaken for one already applied); `upgradeEpoch` is spent
+ * one-for-one with `revision` and exists to answer a redelivered command that
+ * reuses an already-applied revision number with `epoch_reused` rather than
+ * silently repeating — or silently skipping — the swap.
+ */
+export const ClusterUpgradeCommandPayloadV3Schema = z.object({
+	...TimedArtifactShape,
+	type: z.literal('cluster-upgrade-command'),
+	aud: z.literal('privos-apps-master'),
+	action: z.literal('UPGRADE_RUNTIME'),
+	operationId: z.string().uuid(),
+	clusterId: Identifier,
+	workspaceId: Identifier,
+	deploymentId: Identifier,
+	generationId: Identifier,
+	generationNumber: z.number().int().positive(),
+	revision: z.number().int().positive(),
+	runtimeInstallationId: Identifier,
+	clusterAppId: Identifier,
+	mcpAppId: Identifier,
+	targetManifestDigest: Digest,
+	targetImageDigest: Digest,
+	previousManifestDigest: Digest,
+	previousImageDigest: Digest,
+	resourceManifestHash: ArtifactHash,
+	runtimeResourceInventoryHash: ArtifactHash,
+	authorizationEpoch: z.number().int().positive(),
+	upgradeEpoch: z.number().int().positive(),
+}).strict().superRefine((value, ctx) => {
+	// v1 spends exactly one upgradeEpoch per revision — see the class comment.
+	// A mismatch can only be a malformed or forged command, never a legitimate
+	// retry, so it is refused at the schema boundary rather than reaching the
+	// business-layer epoch guard.
+	if (value.upgradeEpoch !== value.revision) {
+		ctx.addIssue({
+			code: z.ZodIssueCode.custom,
+			path: ['upgradeEpoch'],
+			message: 'upgradeEpoch must equal revision',
+		});
+	}
+	if (
+		value.targetManifestDigest === value.previousManifestDigest ||
+		value.targetImageDigest === value.previousImageDigest
+	) {
+		// Either alone already means nothing legitimate moved: the two digests
+		// are 1:1 with a single published image, so a command whose manifest
+		// digest matches the previous one but whose image digest doesn't (or
+		// vice versa) is not a smaller version of a real upgrade — it is
+		// malformed or forged, and refusing on either field alone is stricter,
+		// not looser, than requiring both to match.
+		ctx.addIssue({
+			code: z.ZodIssueCode.custom,
+			path: ['targetManifestDigest'],
+			message: 'an upgrade must name a different image than the one it replaces',
+		});
+	}
+});
+
+export type ClusterUpgradeCommandPayloadV3 = z.infer<typeof ClusterUpgradeCommandPayloadV3Schema>;
+
+/**
+ * Cluster evidence of what is now actually serving. `swapStrategy` is reported
+ * here — never recomputed elsewhere — because the Cluster is the only layer
+ * that knows whether the container carries persistent volumes (D1a); the
+ * Portal's downtime disclosure to the workspace owner is driven off this
+ * field. `state` is terminal:
+ *
+ * - `UPGRADED` — new image running.
+ * - `ROLLED_BACK` — a swap was attempted, it failed, and the previous image
+ *   was confirmed restored.
+ * - `FAILED` — a swap was attempted, it failed, and the restore could not be
+ *   confirmed either. Rare, and the only state an operator needs to look at.
+ * - `REFUSED` — **no container was ever touched.** The command was refused
+ *   before the swap started (unknown/stale generation, a stale epoch, the app
+ *   not RUNNING, ...). This is NOT the same as `FAILED`: the installation is
+ *   exactly as it was, and the Hub must treat this as a normal, retryable
+ *   refusal — NOT drive the installation into a stuck cleanup/terminal state.
+ *   Collapsing this into `FAILED` is the specific mistake this variant exists
+ *   to prevent: a Hub that cannot tell "nothing happened" from "something
+ *   broke" has no correct action to take for the former.
+ */
+export const ClusterUpgradeAcknowledgementPayloadV3Schema = z.object({
+	...TimedArtifactShape,
+	type: z.literal('cluster-upgrade-acknowledgement'),
+	aud: z.literal('privos-hub-api'),
+	operationId: z.string().uuid(),
+	clusterId: Identifier,
+	workspaceId: Identifier,
+	deploymentId: Identifier,
+	generationId: Identifier,
+	generationNumber: z.number().int().positive(),
+	revision: z.number().int().positive(),
+	runtimeInstallationId: Identifier,
+	clusterAppId: Identifier,
+	runningManifestDigest: Digest,
+	runningImageDigest: Digest,
+	resourceManifestHash: ArtifactHash,
+	runtimeResourceInventoryHash: ArtifactHash,
+	upgradeEpoch: z.number().int().positive(),
+	swapStrategy: z.enum(['ROLLING', 'STOP_THEN_CREATE']),
+	state: z.enum(['UPGRADED', 'ROLLED_BACK', 'FAILED', 'REFUSED']),
+	upgradedAt: z.string().datetime().nullable(),
+	errorCode: SafeReasonCode.nullable(),
+}).strict().superRefine((value, ctx) => {
+	if (value.state === 'UPGRADED' && value.upgradedAt === null) {
+		ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['upgradedAt'], message: 'an upgraded revision must carry its timestamp' });
+	}
+	if (value.state !== 'UPGRADED' && value.upgradedAt !== null) {
+		ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['upgradedAt'], message: 'only an upgraded revision carries a timestamp' });
+	}
+});
+
+export type ClusterUpgradeAcknowledgementPayloadV3 = z.infer<
+	typeof ClusterUpgradeAcknowledgementPayloadV3Schema
 >;
 
 /**
@@ -854,6 +985,32 @@ export function verifyReconfigureCommandV3(input: {
 	if (
 		payload.clusterAppId !== input.expected.clusterAppId ||
 		payload.manifestDigest !== input.expected.manifestDigest
+	) throw new McpProtocolV3Error('GENERATION_AFFINITY_MISMATCH');
+	return payload;
+}
+
+/**
+ * Unlike reconfigure, the command's own `manifestDigest`-equivalent
+ * (`targetManifestDigest`) is NEW by design, so it cannot be checked against
+ * what the Cluster already holds the way reconfigure's is. `mcpAppId` stands
+ * in as the identity field that must stay fixed across a revision.
+ */
+export function verifyUpgradeCommandV3(input: {
+	compact: string;
+	publicJwk: JsonWebKey;
+	kid: string;
+	expected: GenerationAffinityV3 & { clusterAppId: string; mcpAppId: string };
+}): ClusterUpgradeCommandPayloadV3 {
+	const payload = verifySignedV3({
+		...input,
+		typ: 'privos-cluster-upgrade-command+jws',
+		schema: ClusterUpgradeCommandPayloadV3Schema,
+		maximumLifetimeSeconds: 300,
+	});
+	assertGenerationAffinityV3(payload, input.expected);
+	if (
+		payload.clusterAppId !== input.expected.clusterAppId ||
+		payload.mcpAppId !== input.expected.mcpAppId
 	) throw new McpProtocolV3Error('GENERATION_AFFINITY_MISMATCH');
 	return payload;
 }

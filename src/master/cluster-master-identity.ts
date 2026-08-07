@@ -12,11 +12,13 @@ import {
 	ClusterFinalAcknowledgementPayloadV3Schema,
 	ClusterReconfigureAcknowledgementPayloadV3Schema,
 	ClusterRuntimeInventoryAttestationPayloadV3Schema,
+	ClusterUpgradeAcknowledgementPayloadV3Schema,
 	MCP_PROTOCOL_V3,
 	verifyClusterRuntimeInventoryAttestationV3,
 	type ClusterFinalAcknowledgementPayloadV3,
 	type ClusterReconfigureAcknowledgementPayloadV3,
 	type ClusterRuntimeInventoryAttestationPayloadV3,
+	type ClusterUpgradeAcknowledgementPayloadV3,
 } from './protocol-v3.js';
 import { runtimeResourceInventoryHashV3 } from './runtime-resource-inventory.js';
 import type {
@@ -37,6 +39,11 @@ type FinalAcknowledgementInput = Omit<
 
 type ReconfigureAcknowledgementInput = Omit<
 	ClusterReconfigureAcknowledgementPayloadV3,
+	'protocolVersion' | 'type' | 'aud' | 'iss' | 'jti' | 'nonce' | 'iat' | 'exp'
+>;
+
+type UpgradeAcknowledgementInput = Omit<
+	ClusterUpgradeAcknowledgementPayloadV3,
 	'protocolVersion' | 'type' | 'aud' | 'iss' | 'jti' | 'nonce' | 'iat' | 'exp'
 >;
 
@@ -71,6 +78,7 @@ export class ClusterMasterIdentity {
 			'privos-cluster-runtime-inventory-attestation+jws',
 			'privos-cluster-final-cleanup-ack+jws',
 			'privos-cluster-reconfigure-ack+jws',
+			'privos-cluster-upgrade-ack+jws',
 		];
 		kid: string;
 		publicJwk: JsonWebKey;
@@ -86,6 +94,7 @@ export class ClusterMasterIdentity {
 				'privos-cluster-runtime-inventory-attestation+jws',
 				'privos-cluster-final-cleanup-ack+jws',
 				'privos-cluster-reconfigure-ack+jws',
+				'privos-cluster-upgrade-ack+jws',
 			],
 			kid: record.kid,
 			publicJwk: record.publicJwk,
@@ -304,6 +313,42 @@ export class ClusterMasterIdentity {
 			privateJwk: material.privateJwk,
 			kid: material.record.kid,
 			typ: 'privos-cluster-reconfigure-ack+jws',
+			protocolVersion: MCP_PROTOCOL_V3,
+		});
+		return { payload, compact, artifactHash: sha256Base64Url(compact), kid: material.record.kid };
+	}
+
+	async signUpgradeAcknowledgement(
+		input: UpgradeAcknowledgementInput,
+		lifetimeSeconds = 300,
+	): Promise<{
+		payload: ClusterUpgradeAcknowledgementPayloadV3;
+		compact: string;
+		artifactHash: string;
+		kid: string;
+	}> {
+		if (input.clusterId !== this.clusterId) throw new Error('cluster_acknowledgement_affinity_mismatch');
+		if (!Number.isInteger(lifetimeSeconds) || lifetimeSeconds < 1 || lifetimeSeconds > 300) {
+			throw new Error('cluster_acknowledgement_lifetime_invalid');
+		}
+		const material = await this.load();
+		const now = Math.floor(Date.now() / 1000);
+		const payload = ClusterUpgradeAcknowledgementPayloadV3Schema.parse({
+			...input,
+			protocolVersion: MCP_PROTOCOL_V3,
+			type: 'cluster-upgrade-acknowledgement',
+			iss: this.issuer,
+			aud: 'privos-hub-api',
+			jti: crypto.randomUUID(),
+			nonce: crypto.randomBytes(24).toString('base64url'),
+			iat: now,
+			exp: now + lifetimeSeconds,
+		});
+		const compact = signEs256Jws({
+			payload,
+			privateJwk: material.privateJwk,
+			kid: material.record.kid,
+			typ: 'privos-cluster-upgrade-ack+jws',
 			protocolVersion: MCP_PROTOCOL_V3,
 		});
 		return { payload, compact, artifactHash: sha256Base64Url(compact), kid: material.record.kid };

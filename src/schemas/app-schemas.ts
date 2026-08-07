@@ -253,9 +253,14 @@ export const RedeployRequestSchema = z.object({
     rolling: z.boolean().optional(),
     subdomain: SubdomainLabelSchema.nullable().optional(),
     domain: z.string().trim().max(253).nullable().optional(),
-}).superRefine((value, ctx) => {
+    // Present only for a signed v3 upgrade swap — see RedeployRequest's comment.
+    mcpV3Binding: McpRuntimeReconfigureBindingV3Schema.optional(),
+    runtimeResourceInventoryHash: z.string().regex(/^[A-Za-z0-9_-]{43}$/).optional(),
+    platformEnvVars: z.record(PlatformEnvNameSchema, z.string().max(4096)).optional(),
+    secretEnvKeys: z.array(EnvNameSchema).max(32).optional(),
+}).strict().superRefine((value, ctx) => {
     const requiresDigest = config.FLEET_MODE || value.image?.split('/').includes('marketplace');
-    if (requiresDigest && !value.digest) {
+    if ((requiresDigest || value.mcpV3Binding) && !value.digest) {
         ctx.addIssue({
             code: z.ZodIssueCode.custom,
             path: ['digest'],
@@ -270,6 +275,60 @@ export const RedeployRequestSchema = z.object({
             path: ['workspaceId'],
             message: 'workspaceId is required in fleet mode',
         });
+    }
+    // Symmetric with McpDeployRequestV3Schema and McpReconfigureRequestV3Schema:
+    // the PRIVOS_ namespace is platform-only on every path that accepts envVars,
+    // not just the ones that were written with an MCP v3 binding in mind.
+    for (const key of Object.keys(value.envVars ?? {})) {
+        if (key.toUpperCase().startsWith('PRIVOS_')) {
+            ctx.addIssue({
+                code: z.ZodIssueCode.custom,
+                path: ['envVars', key],
+                message: 'PRIVOS_* environment names are reserved for the platform',
+            });
+        }
+    }
+    if (value.mcpV3Binding) {
+        if (value.digest !== value.mcpV3Binding.imageDigest) {
+            ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['digest'], message: 'image digest binding mismatch' });
+        }
+        if (value.workspaceId !== value.mcpV3Binding.workspaceId) {
+            ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['workspaceId'], message: 'workspace binding mismatch' });
+        }
+        if (!value.runtimeResourceInventoryHash) {
+            ctx.addIssue({
+                code: z.ZodIssueCode.custom,
+                path: ['runtimeResourceInventoryHash'],
+                message: 'runtimeResourceInventoryHash is required alongside mcpV3Binding',
+            });
+        }
+        if (!value.envVars) {
+            ctx.addIssue({
+                code: z.ZodIssueCode.custom,
+                path: ['envVars'],
+                message: 'envVars is required alongside mcpV3Binding — an upgrade rebuilds the container, so its full environment travels with it',
+            });
+        }
+        // Both required explicitly (no default([])) — an upgrade caller must
+        // state its platform environment and secret-key names, not rely on an
+        // absent field silently reducing to "none". The agent's redeploy-secret
+        // guard separately proves these actually cover what the OLD container
+        // already had before trusting any of it.
+        if (value.secretEnvKeys === undefined) {
+            ctx.addIssue({
+                code: z.ZodIssueCode.custom,
+                path: ['secretEnvKeys'],
+                message: 'secretEnvKeys is required alongside mcpV3Binding (an empty array is fine; absent is not)',
+            });
+        }
+        if (value.platformEnvVars === undefined) {
+            ctx.addIssue({
+                code: z.ZodIssueCode.custom,
+                path: ['platformEnvVars'],
+                message: 'platformEnvVars is required alongside mcpV3Binding',
+            });
+        }
+        validateSecretEnvKeys(value, ctx);
     }
 });
 

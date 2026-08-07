@@ -62,6 +62,7 @@ export function buildMasterServer(config: MasterConfig, repositories: MasterRepo
 		mcpV2Enabled: config.APP_CLUSTER_MCP_INSTALL_V2 === 'on',
 		mcpV3Enabled: config.APP_CLUSTER_MCP_INSTALL_V3 === 'on',
 		mcpReconfigureEnabled: config.APP_CLUSTER_MCP_RECONFIGURE_V3 === 'on',
+		mcpUpgradeEnabled: config.APP_CLUSTER_MCP_UPGRADE_V3 === 'on',
 		clusterMasterIdentity,
 		mcpUninstall: config.APP_CLUSTER_MCP_INSTALL_V3 === 'on'
 			? new McpUninstallServiceV3({

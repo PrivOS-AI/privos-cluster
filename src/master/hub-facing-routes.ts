@@ -47,6 +47,18 @@ const McpV3ReconfigureBodySchema = z.object({
 	runtimeResourceInventoryHash: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
 }).strict();
 
+const McpV3UpgradeBodySchema = z.object({
+	upgradeCommandJws: z.string().min(1),
+	issuer: z.string().min(1).max(200),
+	deploymentId: z.string().min(1).max(160),
+	generationId: z.string().min(1).max(160),
+	generationNumber: z.number().int().positive(),
+	clusterAppId: z.string().min(1).max(160),
+	mcpAppId: z.string().min(1).max(160),
+	resourceManifestHash: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+	runtimeResourceInventoryHash: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+}).strict();
+
 const McpV3ActivationBodySchema = z.object({
 	runtimeInventoryAttestation: z.object({
 		compact: z.string().min(1),
@@ -100,6 +112,8 @@ export function hubFacingRoutes(deps: {
 	mcpV3Enabled: boolean;
 	/** Kill switch for the configuration-redeploy route; installs are unaffected. */
 	mcpReconfigureEnabled: boolean;
+	/** Kill switch for the in-place image-upgrade route; installs/reconfigures are unaffected. */
+	mcpUpgradeEnabled: boolean;
 	clusterMasterIdentity: ClusterMasterIdentity;
 	mcpUninstall?: McpUninstallServiceV3;
 	mcpReleaseAuthorityJwks: JsonWebKey[];
@@ -676,6 +690,221 @@ export function hubFacingRoutes(deps: {
 				clusterAppId: applied.app.appId,
 				runtimeInstallationId,
 				configEpoch: command.configEpoch,
+				publicUrl: deps.deployment.publicUrlFor(applied.app.subdomain),
+				acknowledgement: {
+					compact: acknowledgement.compact,
+					artifactHash: acknowledgement.artifactHash,
+					kid: acknowledgement.kid,
+				},
+			});
+		});
+
+		/**
+		 * Swap a running v3 generation to a new image under a signed, single-use
+		 * Hub command. Unlike reconfigure, the target image is NEW, so its manifest
+		 * label is verified against the pinned digest here — via the same
+		 * `/mcp/images/inspect` check that gates installs — before the old runtime
+		 * is touched at all. Only after that passes does the swap reach the agent.
+		 */
+		fastify.post(`${root}/mcp/v3/apps/:runtimeInstallationId/upgrade`, { preHandler: authenticate }, async (req, reply) => {
+			if (!deps.mcpV3Enabled || !deps.mcpSecurity || !deps.mcpUpgradeEnabled) {
+				return reply.code(404).send({ error: 'mcp_upgrade_v3_disabled' });
+			}
+			const body = McpV3UpgradeBodySchema.safeParse(req.body);
+			if (!body.success) return reply.code(400).send({ error: 'validation_error', details: body.error.issues });
+			const runtimeInstallationId = (req.params as { runtimeInstallationId: string }).runtimeInstallationId;
+			let command;
+			try {
+				command = await deps.mcpSecurity.consumeUpgradeCommandV3({
+					compact: body.data.upgradeCommandJws,
+					workspaceId: workspaceId(req),
+					expected: {
+						deploymentId: body.data.deploymentId,
+						generationId: body.data.generationId,
+						generationNumber: body.data.generationNumber,
+						runtimeInstallationId,
+						resourceManifestHash: body.data.resourceManifestHash,
+						runtimeResourceInventoryHash: body.data.runtimeResourceInventoryHash,
+						issuer: body.data.issuer,
+						clusterAppId: body.data.clusterAppId,
+						mcpAppId: body.data.mcpAppId,
+					},
+				});
+			} catch (error) {
+				return reply.code(403).send({
+					error: 'upgrade_command_invalid',
+					code: clusterMcpSafeReason(error, 'upgrade_command_invalid'),
+				});
+			}
+
+			const app = await deps.repositories.apps.findOne({
+				workspaceId: workspaceId(req),
+				kind: 'mcp-v3',
+				mcpRuntimeInstallationId: runtimeInstallationId,
+				state: { $ne: 'REMOVED' },
+			});
+			if (!app) return reply.code(404).send({ error: 'mcp_v3_runtime_not_found' });
+
+			// Every refusal/failure past this point signs an acknowledgement — the
+			// Hub parses 409 bodies looking for one, and a bare `{error}` here
+			// makes it dereference a missing field. `currentApp` is re-read rather
+			// than trusting a snapshot taken before a slow operation (the swap
+			// path especially — see the call below), falling back to it only if
+			// the generation has genuinely disappeared between reads.
+			const signRefusalAcknowledgement = async (
+				state: 'REFUSED' | 'ROLLED_BACK' | 'FAILED',
+				errorCode: string,
+			) => {
+				const currentApp = await deps.repositories.apps.findOne({
+					workspaceId: workspaceId(req),
+					kind: 'mcp-v3',
+					mcpRuntimeInstallationId: runtimeInstallationId,
+					state: { $ne: 'REMOVED' },
+				}) ?? app;
+				return deps.clusterMasterIdentity.signUpgradeAcknowledgement({
+					operationId: command.operationId,
+					clusterId: command.clusterId,
+					workspaceId: command.workspaceId,
+					deploymentId: command.deploymentId,
+					generationId: command.generationId,
+					generationNumber: command.generationNumber,
+					revision: command.revision,
+					runtimeInstallationId: command.runtimeInstallationId,
+					clusterAppId: command.clusterAppId,
+					runningManifestDigest: currentApp.manifestDigest ?? command.previousManifestDigest,
+					runningImageDigest: currentApp.imageDigest ?? command.previousImageDigest,
+					resourceManifestHash: command.resourceManifestHash,
+					runtimeResourceInventoryHash: command.runtimeResourceInventoryHash,
+					upgradeEpoch: command.upgradeEpoch,
+					swapStrategy: currentApp.mcpLastSwapStrategy ?? 'STOP_THEN_CREATE',
+					state,
+					upgradedAt: null,
+					errorCode,
+				});
+			};
+
+			// The byte-exact check that gates installs, reused unchanged: pull +
+			// inspect the NEW image and confirm its manifest label reduces to the
+			// pinned digest before anything about the running container moves.
+			// Neither branch below has touched a container — both are REFUSED.
+			const node = await deps.repositories.nodes.findOne({ status: 'ACTIVE' });
+			if (!node) {
+				const acknowledgement = await signRefusalAcknowledgement('REFUSED', 'CAPACITY_UNAVAILABLE');
+				return reply.code(409).send({
+					state: 'REFUSED',
+					error: 'CAPACITY_UNAVAILABLE',
+					clusterAppId: command.clusterAppId,
+					runtimeInstallationId: command.runtimeInstallationId,
+					revision: command.revision,
+					acknowledgement: {
+						compact: acknowledgement.compact,
+						artifactHash: acknowledgement.artifactHash,
+						kid: acknowledgement.kid,
+					},
+				});
+			}
+			const inspectedResponse = await deps.agentClient.request(node, workspaceId(req), 'POST', '/api/v1/mcp/images/inspect', {
+				image: app.image,
+				digest: command.targetImageDigest,
+			});
+			// A passthrough of the agent's own inspect failure (e.g. a missing
+			// manifest label) — unchanged from the install path's identical
+			// pattern, which the Hub already knows how to handle without an
+			// acknowledgement.
+			if (inspectedResponse.status >= 300) return sendAgent(reply, inspectedResponse);
+			const inspected = inspectedResponse.body as { imageDigest: string; manifestDigest: string };
+			if (
+				inspected.imageDigest !== command.targetImageDigest ||
+				inspected.manifestDigest !== command.targetManifestDigest
+			) {
+				const acknowledgement = await signRefusalAcknowledgement('REFUSED', 'INSPECTED_ARTIFACT_BINDING_MISMATCH');
+				return reply.code(409).send({
+					state: 'REFUSED',
+					error: 'inspected_artifact_binding_mismatch',
+					clusterAppId: command.clusterAppId,
+					runtimeInstallationId: command.runtimeInstallationId,
+					revision: command.revision,
+					acknowledgement: {
+						compact: acknowledgement.compact,
+						artifactHash: acknowledgement.artifactHash,
+						kid: acknowledgement.kid,
+					},
+				});
+			}
+
+			let applied;
+			try {
+				applied = await deps.deployment.upgradeMcpV3(workspaceId(req), command);
+			} catch (error) {
+				const errorCode = clusterMcpSafeReason(error, 'upgrade_failed');
+				recordClusterMcpEvent({
+					event: 'provisioning',
+					outcome: 'denied',
+					boundary: 'master_upgrade',
+					reason: errorCode,
+					correlationId: runtimeInstallationId,
+				});
+				// `upgradeMcpV3` tags an error with this code ONLY from inside the
+				// try/catch that wraps the per-replica agent loop and the
+				// persistence write — i.e. only once a container was actually
+				// touched (or Mongo was). Every guard before that point (unknown
+				// generation, stale epoch, app not RUNNING, ...) throws a plain or
+				// McpProtocolV3Error with no such code, so this is an exact,
+				// non-inferred signal that nothing was touched — not a guess based
+				// on the error's message. See the schema doc on `state: 'REFUSED'`.
+				const swapErrorCode = (error as { code?: unknown } | undefined)?.code;
+				const touchedContainer =
+					swapErrorCode === 'MCP_V3_UPGRADE_SWAP_FAILED' || swapErrorCode === 'MCP_V3_UPGRADE_PERSISTENCE_FAILED';
+				const rolledBack = (error as { rolledBack?: unknown } | undefined)?.rolledBack === true;
+				const state = !touchedContainer ? 'REFUSED' : rolledBack ? 'ROLLED_BACK' : 'FAILED';
+				const acknowledgement = await signRefusalAcknowledgement(
+					state,
+					errorCode.toUpperCase().replace(/[^A-Z0-9_]/g, '_'),
+				);
+				return reply.code(409).send({
+					state,
+					clusterAppId: command.clusterAppId,
+					runtimeInstallationId: command.runtimeInstallationId,
+					revision: command.revision,
+					acknowledgement: {
+						compact: acknowledgement.compact,
+						artifactHash: acknowledgement.artifactHash,
+						kid: acknowledgement.kid,
+					},
+				});
+			}
+			const acknowledgement = await deps.clusterMasterIdentity.signUpgradeAcknowledgement({
+				operationId: command.operationId,
+				clusterId: command.clusterId,
+				workspaceId: command.workspaceId,
+				deploymentId: command.deploymentId,
+				generationId: command.generationId,
+				generationNumber: command.generationNumber,
+				revision: command.revision,
+				runtimeInstallationId: command.runtimeInstallationId,
+				clusterAppId: command.clusterAppId,
+				runningManifestDigest: applied.app.manifestDigest ?? command.targetManifestDigest,
+				runningImageDigest: applied.app.imageDigest,
+				resourceManifestHash: command.resourceManifestHash,
+				runtimeResourceInventoryHash: command.runtimeResourceInventoryHash,
+				upgradeEpoch: command.upgradeEpoch,
+				swapStrategy: applied.swapStrategy,
+				state: 'UPGRADED',
+				upgradedAt: applied.app.updatedAt.toISOString(),
+				errorCode: null,
+			});
+			recordClusterMcpEvent({
+				event: 'provisioning',
+				outcome: 'changed',
+				boundary: 'master_upgrade',
+				reason: 'upgraded',
+				correlationId: runtimeInstallationId,
+			});
+			return reply.code(200).send({
+				state: 'UPGRADED',
+				clusterAppId: applied.app.appId,
+				runtimeInstallationId,
+				revision: command.revision,
 				publicUrl: deps.deployment.publicUrlFor(applied.app.subdomain),
 				acknowledgement: {
 					compact: acknowledgement.compact,

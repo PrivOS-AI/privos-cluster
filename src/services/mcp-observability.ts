@@ -18,7 +18,12 @@ const requestedLogLevel = process.env.LOG_LEVEL ?? 'info';
 const logger = pino({ level: LOG_LEVELS.has(requestedLogLevel) ? requestedLogLevel : 'info' })
 	.child({ component: 'mcp-security' });
 const counters = new Map<string, number>();
-const SAFE_CODE = /^[a-z][a-z0-9_]{0,63}$/;
+// Minimum length 2: callers that upper-case this into a signed acknowledgement
+// errorCode (e.g. the upgrade and reconfigure routes) feed it into
+// `SafeReasonCode` (`^[A-Z][A-Z0-9_]{1,95}$`, minimum length 2). A 1-char
+// error message (or a value that reduces to one after lower-casing) must fall
+// back here rather than pass through and fail that later, unhandled, `.parse()`.
+const SAFE_CODE = /^[a-z][a-z0-9_]{1,63}$/;
 
 function safeCode(value: unknown, fallback: string): string {
 	const candidate = typeof value === 'string' ? value.toLowerCase() : '';

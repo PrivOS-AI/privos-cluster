@@ -636,9 +636,203 @@ export async function restartContainer(containerId: string, workspaceId?: string
 // ---------------------------------------------------------------------------
 
 /** Inspect a container and apply the raw-redeploy secret guard to its labels. */
-async function assertRawRedeployAllowed(dockerContainerId: string): Promise<void> {
+async function assertRawRedeployAllowed(
+	dockerContainerId: string,
+	upgrade?: { envVars: Record<string, string>; secretEnvKeys: string[]; platformEnvVars: Record<string, string> },
+): Promise<void> {
 	const info = await containerManager.inspectContainer(dockerContainerId);
-	assertRawRedeployAllowedForLabels((info.Config?.Labels ?? {}) as Record<string, string>);
+	assertRawRedeployAllowedForLabels((info.Config?.Labels ?? {}) as Record<string, string>, upgrade);
+}
+
+/**
+ * Everything an upgrade must find UNCHANGED on the container it is about to
+ * replace, checked against the OLD container's own labels before anything is
+ * pulled or torn down. Image and manifest digest are deliberately excluded —
+ * those are the one thing this call is allowed to move (D1).
+ */
+function assertMcpV3UpgradeAffinity(
+	labels: Record<string, string>,
+	containerId: string,
+	binding: NonNullable<RedeployRequest['mcpV3Binding']>,
+): void {
+	const expected: Record<string, string> = {
+		'privos.id': containerId,
+		'privos.workspace': binding.workspaceId,
+		'privos.mcp.schema': '3',
+		'privos.mcp.cluster': binding.clusterId,
+		'privos.mcp.node': binding.nodeId,
+		'privos.mcp.deployment': binding.deploymentId,
+		'privos.mcp.generation': binding.generationId,
+		'privos.mcp.generation-number': String(binding.generationNumber),
+		'privos.mcp.runtime-installation': binding.runtimeInstallationId,
+		'privos.mcp.app': binding.mcpAppId,
+		'privos.mcp.replica': binding.replicaId,
+		'privos.mcp.resource-manifest-hash': binding.resourceManifestHash,
+		'privos.mcp.approval-receipt': binding.approvalReceiptHash,
+		'privos.mcp.authorization-epoch': String(binding.authorizationEpoch),
+		'privos.mcp.deployment-grant-hash': binding.deploymentGrantHash,
+	};
+	if (Object.entries(expected).some(([key, value]) => labels[key] !== value)) {
+		throw new Error('mcp_v3_upgrade_binding_mismatch');
+	}
+}
+
+/**
+ * Reconstruct the full v3 binding for the container's NEW image, reusing the
+ * Hub identity the generation was provisioned under — immutable, read from the
+ * OLD container's own labels, never restated by an upgrade (mirrors
+ * reconfigureManagedAppV3's identical reasoning).
+ */
+function buildMcpV3UpgradeBinding(
+	labels: Record<string, string>,
+	binding: NonNullable<RedeployRequest['mcpV3Binding']>,
+): McpRuntimeBindingV3 {
+	let hubPublicJwk: JsonWebKey;
+	try {
+		hubPublicJwk = JSON.parse(labels['privos.mcp.hub-jwk'] ?? '') as JsonWebKey;
+	} catch {
+		throw new Error('mcp_v3_upgrade_binding_mismatch');
+	}
+	return {
+		...binding,
+		hubOrigin: labels['privos.mcp.hub-origin']!,
+		hubKid: labels['privos.mcp.hub-kid']!,
+		hubPublicJwk,
+	};
+}
+
+// Exported for direct testing (see lifecycle-service-mcp-v3-swap.test.ts) — the
+// forward-then-recover sequence this function makes safe is exactly the
+// scenario that needs proving with a real (Docker-mocked) failure, not just a
+// type check.
+export type McpV3SwapContext = {
+    binding: McpRuntimeBindingV3;
+    runtimeResourceInventoryHash: string;
+    platformEnvVars: Record<string, string> | undefined;
+    secretEnvKeys: string[] | undefined;
+};
+
+/**
+ * One create + (broker register) + start + health-poll attempt. Shared by the
+ * forward swap and its failure recovery below so there is exactly one place
+ * that knows how to stand a redeployed container up.
+ *
+ * Self-cleaning on failure: if anything after `createAppContainer` throws, the
+ * container this attempt just created is stopped and removed, and (for an MCP
+ * v3 attempt) the broker directory this attempt just wrote to is cleared —
+ * mirroring rollingRedeployContainer's own new-container cleanup on failure.
+ * This is what makes a SECOND attempt (recovery) safe to run immediately
+ * after: without it, a failed attempt that got as far as `register()` leaves
+ * `binding-v3.json` holding THIS attempt's digest, and the next attempt's own
+ * `register()` call refuses to overwrite a binding that disagrees with what
+ * it's given (`persisted_mcp_v3_broker_binding_conflict`) — the revert would
+ * throw every time a failure happened after the broker was written. And
+ * without removing the orphaned container, a second create for the same
+ * `privos.id` produces TWO live containers sharing one volume set — the exact
+ * corruption class the volume check exists to prevent, just reached through
+ * the recovery path instead of a rolling overlap.
+ */
+export async function createAndStartRedeployedContainer(params: {
+    containerId: string;
+    appId: string | null;
+    containerName: string;
+    image: string;
+    tag: string;
+    digest: string | undefined;
+    workspaceId: string | undefined;
+    listingId: string | undefined;
+    versionDigest: string | undefined;
+    port: number;
+    resources: ContainerResources;
+    envVars: Record<string, string>;
+    mounts: Array<{ dockerVolumeName: string; mountPath: string }>;
+    subdomain: string | null;
+    baseDomain: string | null;
+    createdAt: number;
+    mcp?: McpV3SwapContext;
+}): Promise<Container> {
+    const brokerMount = params.mcp ? await mcpBrokerManager.prepare(params.mcp.binding.replicaId) : undefined;
+    let created: { containerId: string; containerName: string; hostPort: number } | undefined;
+    try {
+        created = await containerManager.createAppContainer({
+            id: params.containerId,
+            appId: params.appId ?? params.containerId.slice(0, 12),
+            containerName: params.containerName,
+            image: params.image,
+            tag: params.tag,
+            digest: params.digest,
+            workspaceId: params.workspaceId,
+            listingId: params.listingId,
+            versionDigest: params.versionDigest,
+            port: params.port,
+            resources: params.resources,
+            envVars: params.envVars,
+            platformEnvVars: params.mcp?.platformEnvVars,
+            secretEnvKeys: params.mcp?.secretEnvKeys,
+            mounts: params.mounts,
+            subdomain: params.subdomain,
+            baseDomain: params.baseDomain,
+            createdAt: params.createdAt,
+            mcpV3Binding: params.mcp?.binding,
+            brokerMount,
+        });
+        if (params.mcp) {
+            // Re-establish the finalized broker binding: the socket was torn down
+            // with the container it replaces, and dispatch stays refused until the
+            // inventory hash the generation was attested under is restored.
+            await mcpBrokerManager.register({
+                ...params.mcp.binding,
+                dockerContainerId: created.containerId,
+                networkName: getAppNetworkName(params.workspaceId),
+                runtimeResourceInventoryHash: params.mcp.runtimeResourceInventoryHash,
+            });
+        }
+        await containerManager.startContainer(created.containerId);
+        const internalUrl = await getInternalUrl(created.containerId, params.port);
+        const healthy = await waitForHealthy(internalUrl, 30_000);
+        if (!healthy) {
+            logger.warn({ containerId: params.containerId, internalUrl }, 'container did not become healthy within 30s after redeploy');
+        }
+        if (params.mcp) {
+            // The readiness bar for an MCP v3 upgrade is deliberately NOT the
+            // /health HTTP endpoint above (D4) — it is known to report unhealthy
+            // for a genuinely correct app (SDK-vs-broker version skew). But
+            // "started, then exited" is a DIFFERENT, unambiguous signal: Docker's
+            // own process state, not the app's opinion of itself, and this
+            // container's RestartPolicy is 'no' so a crash shows up as a durable
+            // `exited` status rather than a transient blip. Install/reconfigure
+            // have no equivalent check today either — this is additive, not a
+            // narrowing of what already passed for them.
+            const postStart = await containerManager.inspectContainer(created.containerId);
+            if (postStart.State?.Status !== 'running') {
+                throw new Error(`container exited after start (state=${postStart.State?.Status ?? 'unknown'}) — new image did not come up`);
+            }
+        }
+        const updated = await dockerState.getById(params.containerId, getHealth, params.workspaceId);
+        if (!updated) throw new Error(`Container not found after redeploy: ${params.containerId}`);
+        return updated;
+    } catch (err: any) {
+        logger.error({ containerId: params.containerId, err: err.message }, 'container create/start attempt failed — cleaning up before any retry');
+        if (created) {
+            try {
+                await containerManager.stopContainer(created.containerId, 5);
+            } catch {
+                // best-effort
+            }
+            try {
+                await containerManager.removeContainer(created.containerId, true);
+            } catch {
+                // best-effort
+            }
+        }
+        if (params.mcp) {
+            // Clears the socket AND binding-v3.json so the next attempt for this
+            // replicaId — a recovery included — registers fresh instead of
+            // conflicting with what this failed attempt already wrote.
+            await mcpBrokerManager.cleanup(params.mcp.binding.replicaId).catch(() => undefined);
+        }
+        throw err;
+    }
 }
 
 export async function redeployContainer(
@@ -647,7 +841,11 @@ export async function redeployContainer(
     workspaceId?: string,
 ): Promise<Container> {
     const c = await getContainerOr404(containerId, workspaceId);
-    await assertRawRedeployAllowed(c.dockerContainerId);
+    await assertRawRedeployAllowed(c.dockerContainerId, req.mcpV3Binding ? {
+        envVars: req.envVars ?? {},
+        secretEnvKeys: req.secretEnvKeys ?? [],
+        platformEnvVars: req.platformEnvVars ?? {},
+    } : undefined);
 
     const newImage = req.image ?? c.image;
     const newTag = req.tag ?? c.tag;
@@ -674,15 +872,66 @@ export async function redeployContainer(
     // it's removed — there is no volumes table to query anymore.
     const mounts = await getExistingMounts(c.dockerContainerId);
 
+    // An MCP v3 upgrade must find the container it is about to replace exactly
+    // where the signed command expects it, verified against the OLD container's
+    // own labels before anything downstream is touched. The OLD image/manifest
+    // digest is captured here too — read off this same inspect, never
+    // recomputed — so a failed swap has a named way back (D4).
+    let mcpV3Binding: McpRuntimeBindingV3 | undefined;
+    let mcpV3PreviousBinding: McpRuntimeBindingV3 | undefined;
+    let runtimeResourceInventoryHash: string | undefined;
+    if (req.mcpV3Binding) {
+        const inspected = await containerManager.inspectContainer(c.dockerContainerId);
+        const labels = (inspected.Config?.Labels ?? {}) as Record<string, string>;
+        assertMcpV3UpgradeAffinity(labels, containerId, req.mcpV3Binding);
+        mcpV3Binding = buildMcpV3UpgradeBinding(labels, req.mcpV3Binding);
+        mcpV3PreviousBinding = {
+            ...mcpV3Binding,
+            imageDigest: labels['privos.mcp.image.digest']!,
+            manifestDigest: labels['privos.mcp.manifest.digest']!,
+        };
+        runtimeResourceInventoryHash = req.runtimeResourceInventoryHash;
+        if (!runtimeResourceInventoryHash) throw new Error('mcp_v3_upgrade_inventory_hash_required');
+    }
+    const mcpContext: McpV3SwapContext | undefined = mcpV3Binding ? {
+        binding: mcpV3Binding,
+        // Guaranteed set: mcpV3Binding is only assigned once
+        // runtimeResourceInventoryHash has already been checked truthy above.
+        runtimeResourceInventoryHash: runtimeResourceInventoryHash!,
+        platformEnvVars: req.platformEnvVars,
+        secretEnvKeys: req.secretEnvKeys,
+    } : undefined;
+
     // Pull the new image FIRST — it's the most likely failure (bad tag, registry
     // down/auth) and is non-destructive. Only tear down the old container once we
     // know the new image is available; otherwise a pull failure would leave the
     // app with no container carrying its privos.id (gone from GET /apps, no rollback).
     await containerManager.pullImage(newImage, newTag, newDigest);
 
-    // Stop + remove old Docker container
+    // For an MCP v3 upgrade, ALSO pre-pull the PREVIOUS image now, before the old
+    // container is touched — not only after a failure. The old container being
+    // currently up does not guarantee its image stays resident: it can be
+    // pruned, and on an HA replica running on a node that only recently joined
+    // the set, it may never have been pulled there at all. If recovery ever
+    // needs it and this pull is missing, the restore itself fails — the exact
+    // way a benign refusal turns into a permanently bricked installation. This
+    // is non-destructive, same as the forward pull above.
+    if (mcpV3PreviousBinding) {
+        await containerManager.pullImage(c.image, c.tag, mcpV3PreviousBinding.imageDigest);
+    }
+
+    // Stop + remove the OLD Docker container FIRST, and only clear its broker
+    // binding once that has actually succeeded. Doing it in the other order
+    // (as an earlier version of this function did) leaves a window where a
+    // stop/remove failure is thrown with the broker socket ALREADY torn down:
+    // the old container would still be running — GET /apps, docker ps, and
+    // Mongo all still show it healthy — but every dispatch into it fails
+    // permanently, with nothing to notice or recover it (the reconciler skips
+    // mcp-v3 containers). Clearing the broker only after removal is confirmed
+    // means that window cannot open.
     await containerManager.stopContainer(c.dockerContainerId, 10);
     await containerManager.removeContainer(c.dockerContainerId, true);
+    if (mcpV3Binding) await mcpBrokerManager.cleanup(mcpV3Binding.replicaId);
 
     // Create + start new Docker container (preserve cluster id via the id label)
     const newContainerName = buildContainerName({
@@ -690,39 +939,79 @@ export async function redeployContainer(
         subdomain: newSubdomain,
         image: newImage,
     });
-    const created = await containerManager.createAppContainer({
-        id: containerId,
-        appId: c.appId ?? c.id.slice(0, 12),
-        containerName: newContainerName,
-        image: newImage,
-        tag: newTag,
-        digest: newDigest,
-        workspaceId: c.workspaceId ?? undefined,
-        listingId: c.listingId ?? undefined,
-        versionDigest: req.versionDigest ?? c.versionDigest ?? undefined,
-        port: c.port,
-        resources: newResources,
-        envVars: c.envVars,
-        mounts,
-        subdomain: newSubdomain,
-        baseDomain,
-        createdAt: c.createdAt,
-    });
+    // A generic (non-MCP) redeploy never changes env, so the label's
+    // non-secret reconstruction is safe to reuse. An MCP v3 upgrade instead
+    // uses the FULL environment the master sent alongside the signed command —
+    // see RedeployRequest's comment on why that is required.
+    const swapEnvVars = mcpV3Binding ? (req.envVars ?? {}) : c.envVars;
 
-    await containerManager.startContainer(created.containerId);
-
-    const internalUrl = await getInternalUrl(created.containerId, c.port);
-
-    const healthy = await waitForHealthy(internalUrl, 30_000);
-    if (!healthy) {
-        logger.warn({ containerId, internalUrl }, 'container did not become healthy within 30s after redeploy');
+    try {
+        const updated = await createAndStartRedeployedContainer({
+            containerId,
+            appId: c.appId,
+            containerName: newContainerName,
+            image: newImage,
+            tag: newTag,
+            digest: newDigest,
+            workspaceId: c.workspaceId ?? undefined,
+            listingId: c.listingId ?? undefined,
+            versionDigest: req.versionDigest ?? c.versionDigest ?? undefined,
+            port: c.port,
+            resources: newResources,
+            envVars: swapEnvVars,
+            mounts,
+            subdomain: newSubdomain,
+            baseDomain,
+            createdAt: c.createdAt,
+            mcp: mcpContext,
+        });
+        logger.info({ containerId, newDockerContainerId: updated.dockerContainerId }, 'redeploy complete');
+        refreshRoutes(); // new container id / host port — invalidate the cached target
+        return updated;
+    } catch (err: any) {
+        logger.error({ containerId, err: err.message }, 'redeploy failed after the old container was removed');
+        // Only an MCP v3 upgrade carries a named revert target (D4) — a plain
+        // redeploy has never had one, and inventing a guess here would be worse
+        // than propagating the failure as-is.
+        if (!mcpV3PreviousBinding || !mcpContext) throw err;
+        try {
+            await createAndStartRedeployedContainer({
+                containerId,
+                appId: c.appId,
+                containerName: buildContainerName({ appId: c.appId, subdomain: newSubdomain, image: c.image }),
+                image: c.image,
+                tag: c.tag,
+                // From the binding (privos.mcp.image.digest), not c.imageDigest
+                // (the generic privos.image.digest label) — both are set from the
+                // same value at container-create time, but the binding is the
+                // single value this same recovery call also puts into the new
+                // container's mcpV3Binding label, so there is exactly one source
+                // of truth for what image the restored container actually runs.
+                digest: mcpV3PreviousBinding.imageDigest,
+                workspaceId: c.workspaceId ?? undefined,
+                listingId: c.listingId ?? undefined,
+                versionDigest: c.versionDigest ?? undefined,
+                port: c.port,
+                resources: c.resources,
+                envVars: swapEnvVars,
+                mounts,
+                subdomain: newSubdomain,
+                baseDomain,
+                createdAt: c.createdAt,
+                mcp: { ...mcpContext, binding: mcpV3PreviousBinding },
+            });
+            logger.warn({ containerId }, 'redeploy failed — previous image restored, upgrade rolled back');
+            refreshRoutes();
+            (err as Error & { recovered?: boolean }).recovered = true;
+        } catch (restoreErr: any) {
+            logger.error(
+                { containerId, err: restoreErr.message },
+                'redeploy failed AND restoring the previous image also failed — operator attention required',
+            );
+            (err as Error & { recovered?: boolean }).recovered = false;
+        }
+        throw err;
     }
-
-    const updated = await dockerState.getById(containerId, getHealth, workspaceId);
-    if (!updated) throw new Error(`Container not found after redeploy: ${containerId}`);
-    logger.info({ containerId, newDockerContainerId: created.containerId, internalUrl }, 'redeploy complete');
-    refreshRoutes(); // new container id / host port — invalidate the cached target
-    return updated;
 }
 
 // ---------------------------------------------------------------------------
@@ -744,6 +1033,15 @@ export async function rollingRedeployContainer(
     req: RedeployRequest,
     workspaceId?: string,
 ): Promise<Container> {
+    // MCP v3's broker binding is a single named socket per replica, torn down
+    // and recreated by mcpBrokerManager.register() — safe for a stop-then-create
+    // swap (the old container is already gone by the time the new one
+    // registers), unsafe for a rolling overlap (it would sever the still-serving
+    // old container's private channel mid-flight). redeployContainerSmart never
+    // selects this path for an MCP v3 upgrade; this guard is defense in depth
+    // for any other caller of this exported function.
+    if (req.mcpV3Binding) throw new Error('mcp_v3_rolling_redeploy_unsupported');
+
     const old = await getContainerOr404(containerId, workspaceId);
     await assertRawRedeployAllowed(old.dockerContainerId);
 
@@ -851,29 +1149,49 @@ export async function rollingRedeployContainer(
 // ---------------------------------------------------------------------------
 
 /**
+ * Which of the two swap primitives a redeploy will actually use. Exported and
+ * pure so the decision is independently testable without Docker: rolling
+ * requires the caller to want it, the container to already be running, no
+ * persistent Docker volumes (two writers → corruption), and — an MCP v3
+ * broker binding is a single named socket per replica, a resource
+ * `old.volumes` cannot see (it is a bind mount, not a Docker named volume),
+ * which is why it is disqualified explicitly here rather than being caught
+ * incidentally by the volume check. See rollingRedeployContainer's comment.
+ */
+export function selectRedeploySwapStrategy(
+    old: Pick<Container, 'volumes' | 'state'>,
+    req: Pick<RedeployRequest, 'rolling' | 'mcpV3Binding'>,
+): 'ROLLING' | 'STOP_THEN_CREATE' {
+    const wantRolling = req.rolling !== false;
+    const eligible = wantRolling && old.volumes.length === 0 && old.state === 'running' && !req.mcpV3Binding;
+    return eligible ? 'ROLLING' : 'STOP_THEN_CREATE';
+}
+
+/**
  * Prefer zero-downtime rolling; fall back to stop-then-create when rolling is
- * unsafe/inapplicable: caller passed `rolling:false`, the app has persistent
- * volumes (two writers → corruption), or the container isn't running. On a
- * rolling failure the error propagates — no silent downtime fallback.
+ * unsafe/inapplicable (see selectRedeploySwapStrategy). On a rolling failure
+ * the error propagates — no silent downtime fallback. The chosen strategy is
+ * returned alongside the result rather than left for a caller to re-derive:
+ * this is the only layer that knows why rolling was or wasn't used.
  */
 export async function redeployContainerSmart(
     containerId: string,
     req: RedeployRequest,
     workspaceId?: string,
-): Promise<Container> {
+): Promise<{ container: Container; swapStrategy: 'ROLLING' | 'STOP_THEN_CREATE' }> {
     const old = await getContainerOr404(containerId, workspaceId);
-    const wantRolling = req.rolling !== false;
+    const swapStrategy = selectRedeploySwapStrategy(old, req);
 
-    if (wantRolling && old.volumes.length === 0 && old.state === 'running') {
-        return rollingRedeployContainer(containerId, req, workspaceId);
+    if (swapStrategy === 'ROLLING') {
+        return { container: await rollingRedeployContainer(containerId, req, workspaceId), swapStrategy };
     }
 
-    if (wantRolling) {
+    if (req.rolling !== false && !req.mcpV3Binding) {
         const reason =
             old.volumes.length > 0 ? `has ${old.volumes.length} persistent volume(s)` : `not running (state=${old.state})`;
         logger.info({ containerId, reason }, 'rolling unavailable, using stop-then-create redeploy');
     }
-    return redeployContainer(containerId, req, workspaceId);
+    return { container: await redeployContainer(containerId, req, workspaceId), swapStrategy };
 }
 
 // ---------------------------------------------------------------------------

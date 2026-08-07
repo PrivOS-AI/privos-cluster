@@ -20,8 +20,10 @@ import {
 	verifyDispatchAssertionV3,
 	verifyLifecycleCommandV3,
 	verifyReconfigureCommandV3,
+	verifyUpgradeCommandV3,
 	type ClusterLifecycleCommandPayloadV3,
 	type ClusterReconfigureCommandPayloadV3,
+	type ClusterUpgradeCommandPayloadV3,
 	type DeploymentGrantAffinityV3,
 	type GenerationAffinityV3,
 	type McpDeploymentGrantPayloadV3,
@@ -699,6 +701,118 @@ export class McpSecurityVerifier {
 			if ((error as { code?: number }).code !== 11000) throw error;
 			const consumed = await this.repositories.mcpProtocolV3ArtifactUses.findOne({
 				kind: 'reconfigure-command',
+				$or: [{ _id: record._id }, { nonce: record.nonce }],
+			});
+			if (
+				consumed?.canonicalPayloadHash === canonicalPayloadHash &&
+				consumed.compactArtifactHash === compactArtifactHash &&
+				consumed.jti === payload.jti &&
+				consumed.nonce === payload.nonce &&
+				consumed.operationId === payload.operationId &&
+				consumed.clusterId === payload.clusterId &&
+				consumed.workspaceId === payload.workspaceId &&
+				consumed.deploymentId === payload.deploymentId &&
+				consumed.generationId === payload.generationId &&
+				consumed.generationNumber === payload.generationNumber &&
+				consumed.runtimeInstallationId === payload.runtimeInstallationId &&
+				consumed.resourceManifestHash === payload.resourceManifestHash &&
+				consumed.runtimeResourceInventoryHash === payload.runtimeResourceInventoryHash &&
+				consumed.issuer === payload.iss
+			) return payload;
+			throw new McpProtocolV3Error('ARTIFACT_REPLAYED');
+		}
+		return payload;
+	}
+
+	/**
+	 * Verify and durably consume a Hub upgrade command.
+	 *
+	 * Modelled on `consumeReconfigureCommandV3`: the generation must already be
+	 * provisioned and attested, replay is refused on either JTI or nonce, and an
+	 * identical redelivery of the same signed bytes is an idempotent transport
+	 * retry. The revision/epoch guard against an already-applied swap lives in
+	 * `DeploymentService.upgradeMcpV3`, exactly where reconfigure's config-epoch
+	 * guard lives — this layer only proves the command is genuine and generation
+	 * affine.
+	 */
+	async consumeUpgradeCommandV3(input: {
+		compact: string;
+		workspaceId: string;
+		expected: Omit<GenerationAffinityV3, 'clusterId' | 'workspaceId'> & {
+			issuer: string;
+			clusterAppId: string;
+			mcpAppId: string;
+		};
+	}): Promise<ClusterUpgradeCommandPayloadV3> {
+		const identity = await this.requirePublicInfo(input.workspaceId);
+		const payload = verifyUpgradeCommandV3({
+			compact: input.compact,
+			publicJwk: identity.publicJwk,
+			kid: identity.kid,
+			expected: {
+				...input.expected,
+				clusterId: this.clusterId,
+				workspaceId: input.workspaceId,
+			},
+		});
+		const inventory = await this.repositories.runtimeResourceInventories.findOne({
+			clusterId: payload.clusterId,
+			workspaceId: payload.workspaceId,
+			deploymentId: payload.deploymentId,
+			generationId: payload.generationId,
+			runtimeInstallationId: payload.runtimeInstallationId,
+		});
+		if (!inventory) throw new McpProtocolV3Error('RUNTIME_NOT_UPGRADABLE');
+		if (inventory.state !== 'READY' && inventory.state !== 'COMPACTED') {
+			throw new McpProtocolV3Error('RUNTIME_NOT_UPGRADABLE');
+		}
+		if (inventory.resourceManifestHash !== payload.resourceManifestHash) {
+			throw new McpProtocolV3Error('RESOURCE_MANIFEST_HASH_MISMATCH');
+		}
+		const persistedInventoryHash = runtimeResourceInventoryHashV3({
+			clusterId: inventory.clusterId,
+			workspaceId: inventory.workspaceId,
+			deploymentId: inventory.deploymentId,
+			generationId: inventory.generationId,
+			generationNumber: inventory.generationNumber,
+			runtimeInstallationId: inventory.runtimeInstallationId,
+			clusterAppId: inventory.clusterAppId,
+			manifestDigest: inventory.manifestDigest,
+			resourceManifestHash: inventory.resourceManifestHash,
+		}, inventory.expectedResources);
+		if (
+			persistedInventoryHash !== inventory.runtimeResourceInventoryHash ||
+			persistedInventoryHash !== payload.runtimeResourceInventoryHash
+		) throw new McpProtocolV3Error('RUNTIME_RESOURCE_INVENTORY_HASH_MISMATCH');
+		const canonicalPayloadHash = sha256Base64Url(canonicalJson(payload));
+		const compactArtifactHash = sha256Base64Url(input.compact);
+		const record = {
+			_id: `upgrade-command:${payload.jti}`,
+			protocolVersion: 3 as const,
+			kind: 'upgrade-command' as const,
+			jti: payload.jti,
+			nonce: payload.nonce,
+			clusterId: payload.clusterId,
+			workspaceId: payload.workspaceId,
+			deploymentId: payload.deploymentId,
+			generationId: payload.generationId,
+			generationNumber: payload.generationNumber,
+			runtimeInstallationId: payload.runtimeInstallationId,
+			operationId: payload.operationId,
+			resourceManifestHash: payload.resourceManifestHash,
+			runtimeResourceInventoryHash: payload.runtimeResourceInventoryHash,
+			issuer: payload.iss,
+			canonicalPayloadHash,
+			compactArtifactHash,
+			expiresAt: new Date(payload.exp * 1000),
+			createdAt: new Date(),
+		};
+		try {
+			await this.repositories.mcpProtocolV3ArtifactUses.insertOne(record);
+		} catch (error: unknown) {
+			if ((error as { code?: number }).code !== 11000) throw error;
+			const consumed = await this.repositories.mcpProtocolV3ArtifactUses.findOne({
+				kind: 'upgrade-command',
 				$or: [{ _id: record._id }, { nonce: record.nonce }],
 			});
 			if (

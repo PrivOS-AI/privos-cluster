@@ -124,6 +124,15 @@ export interface MasterApp {
 	manifestDigest?: string;
 	receiptHash?: string;
 	grantEpoch?: number;
+	/** Image revision currently running (D1: bumped by every swap, including a rollback). */
+	mcpAppliedRevision?: number;
+	/** The redelivery guard spent to reach `mcpAppliedRevision`; always equal to it (see protocol-v3.ts). */
+	mcpAppliedUpgradeEpoch?: number;
+	/** Named revert target for the currently-applied revision (D4) — NOT recomputed. */
+	mcpPreviousManifestDigest?: string;
+	mcpPreviousImageDigest?: string;
+	/** How the most recent upgrade actually swapped the container; echoed on an idempotent replay. */
+	mcpLastSwapStrategy?: 'ROLLING' | 'STOP_THEN_CREATE';
 }
 
 export interface McpArtifactUse {
@@ -278,6 +287,7 @@ export interface McpProtocolV3ArtifactUse {
 		| 'dispatch-assertion'
 		| 'lifecycle-command'
 		| 'reconfigure-command'
+		| 'upgrade-command'
 		| 'node-cleanup-result'
 		| 'cluster-final-acknowledgement';
 	jti: string;

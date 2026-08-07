@@ -341,15 +341,20 @@ const appsHandler: FastifyPluginAsync = async (fastify) => {
             if (!workspaceMatches(body.data.workspaceId, workspaceId)) {
                 return reply.code(403).send({ error: 'workspace_scope_mismatch' });
             }
-            const container = await redeployContainerSmart(
+            const { container, swapStrategy } = await redeployContainerSmart(
                 params.data.containerId,
                 body.data,
                 workspaceId,
             );
-            return reply.send(container);
+            return reply.send({ ...container, swapStrategy });
         } catch (err: any) {
             fastify.log.error({ err }, 'redeploy error');
-            return reply.code(err.statusCode || 500).send({ error: err.message });
+            return reply.code(err.statusCode || 500).send({
+                error: err.message,
+                // Set only for a v3 upgrade swap failure — tells the caller
+                // whether the previous image is confirmed serving again (D4).
+                ...(typeof err.recovered === 'boolean' ? { recovered: err.recovered } : {}),
+            });
         }
     });
 

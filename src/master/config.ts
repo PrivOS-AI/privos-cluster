@@ -20,6 +20,9 @@ const MasterConfigSchema = z.object({
 	// Configuration-redeploy kill switch. Defaults on wherever v3 installs are
 	// on: the route is additive and disabling it leaves installs untouched.
 	APP_CLUSTER_MCP_RECONFIGURE_V3: z.enum(['on', 'off']).default('on'),
+	// In-place image upgrade kill switch. Same reasoning as reconfigure: additive
+	// route, installs/uninstalls/reconfigures are untouched when this is off.
+	APP_CLUSTER_MCP_UPGRADE_V3: z.enum(['on', 'off']).default('on'),
 	MCP_RELEASE_AUTHORITY_JWKS_JSON: z.string().default('{"keys":[]}'),
 }).superRefine((config, ctx) => {
 	let key: Buffer | null = null;

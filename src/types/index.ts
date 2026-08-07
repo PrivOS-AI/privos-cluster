@@ -167,6 +167,22 @@ export interface RedeployRequest {
 	rolling?: boolean; // default true — use rolling (zero-downtime) redeploy when safe
 	subdomain?: string | null;
 	domain?: string | null;
+	/**
+	 * Present only for a signed managed-runtime (v3) upgrade swap. Its presence
+	 * is what tells the raw-redeploy secret guard this call is upgrade-aware
+	 * (rebuilds the container with the full env + labels + broker binding the
+	 * master already holds for this generation) rather than the naive path the
+	 * guard exists to block. `imageDigest` here is the NEW target digest; every
+	 * other binding field is restated unchanged (D1 — an upgrade rotates only
+	 * the image, never permissions, resources, or env).
+	 */
+	mcpV3Binding?: Omit<McpRuntimeBindingV3, 'hubOrigin' | 'hubKid' | 'hubPublicJwk'>;
+	/** Required alongside `mcpV3Binding` — restated unchanged, needed to re-finalize the broker binding. */
+	runtimeResourceInventoryHash?: string;
+	/** Full operator environment (the master's decrypted copy), required alongside `mcpV3Binding`. */
+	envVars?: Record<string, string>;
+	platformEnvVars?: Record<string, string>;
+	secretEnvKeys?: string[];
 }
 
 export interface ContainerStatus {

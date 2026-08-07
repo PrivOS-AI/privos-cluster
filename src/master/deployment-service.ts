@@ -16,6 +16,7 @@ import {
 	McpProtocolV3Error,
 	RuntimeResourceDescriptorV3Schema,
 	type ClusterReconfigureCommandPayloadV3,
+	type ClusterUpgradeCommandPayloadV3,
 	type McpDeploymentGrantPayloadV3,
 	type RuntimeResourceDescriptorV3,
 } from './protocol-v3.js';
@@ -276,6 +277,11 @@ export class DeploymentService {
 						containerId: crypto.randomUUID(),
 					})),
 					mcpRoomBindingCount: 0,
+					// Seeded explicitly (not left absent) so the upgrade path's `$lt`
+					// persistence guard has a real field to compare against — Mongo's
+					// comparison operators do not match a field that does not exist,
+					// unlike `??` at read time. See upgradeMcpV3's persistence filter.
+					mcpAppliedRevision: 0,
 					createdAt: now,
 					updatedAt: now,
 				};
@@ -696,6 +702,232 @@ export class DeploymentService {
 				throw new Error('mcp_v3_reconfigure_persistence_conflict');
 			}
 			return { app: reconfigured, appliedKeys: Object.keys(command.envVars).sort() };
+		});
+	}
+
+	/**
+	 * Swap a running v3 generation to a new image while leaving everything the
+	 * generation owns untouched (D1 — a revision, not a new generation).
+	 *
+	 * The manifest-label check on the new image is the ROUTE's job, run before
+	 * this is ever called (mirrors how install verifies the image before
+	 * `deployMcpV3` runs). This method only proves the command is bound to the
+	 * generation the Cluster already holds, guards the revision/epoch the way
+	 * reconfigure guards `configEpoch`, and delegates the actual swap to the
+	 * agent's existing redeploy primitive — never a second container-replacement
+	 * code path. On a swap failure it reverts every replica that already moved
+	 * forward back to the named previous digest (D4) before propagating the
+	 * error, so the generation never persists a HALF-upgraded state.
+	 */
+	async upgradeMcpV3(
+		workspaceId: string,
+		command: ClusterUpgradeCommandPayloadV3,
+	): Promise<{ app: MasterApp; swapStrategy: 'ROLLING' | 'STOP_THEN_CREATE' }> {
+		return this.deps.locks.run(workspaceId, async () => {
+			const app = await this.deps.repositories.apps.findOne({
+				workspaceId,
+				kind: 'mcp-v3',
+				mcpRuntimeInstallationId: command.runtimeInstallationId,
+				state: { $ne: 'REMOVED' },
+			});
+			if (!app) throw new McpProtocolV3Error('RUNTIME_NOT_UPGRADABLE', 'app_not_found');
+			if (app.state !== 'RUNNING') throw new McpProtocolV3Error('RUNTIME_NOT_UPGRADABLE', `state_${app.state}`);
+			if (
+				app.appId !== command.clusterAppId ||
+				app.mcpDeploymentId !== command.deploymentId ||
+				app.mcpGenerationId !== command.generationId ||
+				app.mcpGenerationNumber !== command.generationNumber ||
+				app.mcpAppId !== command.mcpAppId ||
+				app.resourceManifestHash !== command.resourceManifestHash ||
+				app.runtimeResourceInventoryHash !== command.runtimeResourceInventoryHash ||
+				app.mcpAuthorizationEpoch !== command.authorizationEpoch
+			) throw new McpProtocolV3Error('GENERATION_AFFINITY_MISMATCH');
+
+			// No revision applied yet (a fresh install) reads as 0. The Hub's own
+			// generation.revision defaults to 1 (as-installed) and sets
+			// targetRevision = generation.revision + 1, so the generation's first
+			// REAL upgrade command carries revision 2, not 1 — this seed only has
+			// to be strictly less than that, which 0 satisfies with headroom.
+			const applied = app.mcpAppliedRevision ?? 0;
+			if (command.revision < applied) throw new McpProtocolV3Error('UPGRADE_EPOCH_INVALID', 'revision_downgrade');
+			if (command.revision === applied) {
+				const alreadyApplied =
+					applied > 0 &&
+					app.manifestDigest === command.targetManifestDigest &&
+					app.imageDigest === command.targetImageDigest &&
+					app.mcpAppliedUpgradeEpoch === command.upgradeEpoch;
+				if (!alreadyApplied) throw new McpProtocolV3Error('UPGRADE_EPOCH_INVALID', 'epoch_reused');
+				return { app, swapStrategy: app.mcpLastSwapStrategy ?? 'STOP_THEN_CREATE' };
+			}
+
+			// A fresh swap (command.revision > applied): the command must name
+			// exactly what the Cluster currently runs as its revert target, or the
+			// Hub and Cluster disagree about which image is live right now.
+			if (
+				app.manifestDigest !== command.previousManifestDigest ||
+				app.imageDigest !== command.previousImageDigest
+			) throw new McpProtocolV3Error('UPGRADE_PREVIOUS_DIGEST_MISMATCH');
+			// A RUNNING mcp-v3 generation must already carry both — the affinity
+			// check above already proved this app matches a real generation, so a
+			// missing value here means the persisted record itself is corrupt, not
+			// something safe to paper over with a non-null assertion.
+			if (!app.mcpApprovalReceiptHash || !app.mcpDeploymentGrantHash) {
+				throw new Error('mcp_v3_upgrade_generation_record_incomplete');
+			}
+			const approvalReceiptHash = app.mcpApprovalReceiptHash;
+			const deploymentGrantHash = app.mcpDeploymentGrantHash;
+
+			const nodes = await this.deps.repositories.nodes.find({
+				nodeId: { $in: [...new Set(app.replicas.map((replica) => replica.nodeId))] },
+				status: 'ACTIVE',
+			}).toArray();
+			if (app.replicas.some((replica) => !nodes.some((node) => node.nodeId === replica.nodeId))) {
+				throw new Error('mcp_replica_node_missing');
+			}
+
+			const envVars = this.operatorEnvOf(app);
+			const platformEnvVars = this.platformEnvVarsV3(app.subdomain);
+			const secretEnvKeys = app.secretEnvKeys ?? [];
+
+			const redeployBody = (node: MasterNode, replica: AppReplica, digest: string, manifestDigest: string) => ({
+				workspaceId,
+				image: app.image,
+				digest,
+				versionDigest: app.versionDigest,
+				resources: app.resources,
+				envVars,
+				platformEnvVars,
+				secretEnvKeys,
+				runtimeResourceInventoryHash: command.runtimeResourceInventoryHash,
+				mcpV3Binding: {
+					protocolVersion: 3 as const,
+					clusterId: command.clusterId,
+					nodeId: node.nodeId,
+					workspaceId,
+					deploymentId: command.deploymentId,
+					generationId: command.generationId,
+					generationNumber: command.generationNumber,
+					runtimeInstallationId: command.runtimeInstallationId,
+					mcpAppId: command.mcpAppId,
+					replicaId: replica.replicaId,
+					containerId: replica.containerId,
+					imageDigest: digest,
+					manifestDigest,
+					approvalReceiptHash,
+					authorizationEpoch: command.authorizationEpoch,
+					deploymentGrantHash,
+					resourceManifestHash: command.resourceManifestHash,
+				},
+			});
+
+			// HA runs one replica at a time so the ingress always has a healthy
+			// upstream — same reasoning reconfigure already applies.
+			//
+			// Persistence lives INSIDE this same try: a container-level success
+			// followed by a persistence failure (stale filter, lost race, ...) is
+			// exactly as dangerous as a mid-loop swap failure — the containers would
+			// be on the new image while Mongo still claims the old one — so it must
+			// go through the identical revert path, never a separate unprotected
+			// throw after the loop.
+			const succeeded: Array<{ replica: AppReplica; node: MasterNode; swapStrategy: 'ROLLING' | 'STOP_THEN_CREATE' }> = [];
+			let failedReplicaRecovered: boolean | undefined;
+			let persistenceFailed = false;
+			try {
+				for (const replica of app.replicas) {
+					const node = nodes.find((candidate) => candidate.nodeId === replica.nodeId)!;
+					const response = await this.deps.agentClient.request(
+						node,
+						workspaceId,
+						'POST',
+						`/api/v1/apps/${replica.containerId}/redeploy`,
+						redeployBody(node, replica, command.targetImageDigest, command.targetManifestDigest),
+					);
+					if (response.status >= 300) {
+						const body = response.body as { recovered?: unknown } | undefined;
+						failedReplicaRecovered = typeof body?.recovered === 'boolean' ? body.recovered : undefined;
+						throw new Error(`agent MCP v3 upgrade failed: ${JSON.stringify(response.body)}`);
+					}
+					const body = response.body as { swapStrategy?: unknown };
+					if (body.swapStrategy !== 'ROLLING' && body.swapStrategy !== 'STOP_THEN_CREATE') {
+						throw new Error('agent_mcp_v3_upgrade_response_invalid');
+					}
+					succeeded.push({ replica, node, swapStrategy: body.swapStrategy });
+				}
+
+				const [swapStrategy, ...rest] = succeeded.map((entry) => entry.swapStrategy);
+				if (!swapStrategy || rest.some((strategy) => strategy !== swapStrategy)) {
+					throw new Error('mcp_v3_upgrade_swap_strategy_inconsistent');
+				}
+
+				const appliedAt = new Date();
+				// `mcpAppliedRevision` is seeded to 0 at install (see deployMcpV3), so
+				// every current-code generation has the field. The `$exists: false`
+				// arm exists only for a generation installed before this field existed
+				// — Mongo's comparison operators do not match a MISSING field the way
+				// `?? 0` does at read time, so relying on `$lt` alone here would refuse
+				// every such generation's first upgrade forever.
+				const persisted = await this.deps.repositories.apps.updateOne(
+					{
+						appId: app.appId,
+						workspaceId,
+						$or: [
+							{ mcpAppliedRevision: { $exists: false } },
+							{ mcpAppliedRevision: { $lt: command.revision } },
+						],
+					},
+					{
+						$set: {
+							manifestDigest: command.targetManifestDigest,
+							imageDigest: command.targetImageDigest,
+							mcpPreviousManifestDigest: command.previousManifestDigest,
+							mcpPreviousImageDigest: command.previousImageDigest,
+							mcpAppliedRevision: command.revision,
+							mcpAppliedUpgradeEpoch: command.upgradeEpoch,
+							mcpLastSwapStrategy: swapStrategy,
+							updatedAt: appliedAt,
+							'replicas.$[].state': 'running',
+						},
+					},
+				);
+				if (persisted.matchedCount !== 1) {
+					persistenceFailed = true;
+					throw new Error('mcp_v3_upgrade_persistence_conflict');
+				}
+				const upgraded = await this.deps.repositories.apps.findOne({ appId: app.appId, workspaceId });
+				if (!upgraded || upgraded.mcpAppliedRevision !== command.revision) {
+					persistenceFailed = true;
+					throw new Error('mcp_v3_upgrade_persistence_conflict');
+				}
+				return { app: upgraded, swapStrategy };
+			} catch (error) {
+				// Revert every replica that already swapped forward, through the
+				// IDENTICAL redeploy primitive, targeting the named previous digest.
+				let allReverted = true;
+				for (const { replica, node } of succeeded) {
+					try {
+						const revertResponse = await this.deps.agentClient.request(
+							node,
+							workspaceId,
+							'POST',
+							`/api/v1/apps/${replica.containerId}/redeploy`,
+							redeployBody(node, replica, command.previousImageDigest, command.previousManifestDigest),
+						);
+						if (revertResponse.status >= 300) allReverted = false;
+					} catch {
+						allReverted = false;
+					}
+				}
+				throw Object.assign(error instanceof Error ? error : new Error(String(error)), {
+					code: persistenceFailed ? 'MCP_V3_UPGRADE_PERSISTENCE_FAILED' : 'MCP_V3_UPGRADE_SWAP_FAILED',
+					// True only when every touched replica is CONFIRMED back on the
+					// previous image. A persistence failure means every replica in
+					// `succeeded` swapped forward and needs reverting; a mid-loop swap
+					// failure additionally needs the failing replica's own agent-side
+					// recovery confirmed. Anything less reports FAILED, not a false
+					// ROLLED_BACK.
+					rolledBack: allReverted && (persistenceFailed || failedReplicaRecovered === true),
+				});
+			}
 		});
 	}
 

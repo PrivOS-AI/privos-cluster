@@ -8,6 +8,7 @@ import {
 	signEs256Jws,
 } from '../security/artifacts.js';
 import {
+	ClusterUpgradeCommandPayloadV3Schema,
 	McpProtocolV3Error,
 	acquisitionAffinityHashV3,
 	assertClusterLifecycleTransitionV3,
@@ -19,6 +20,7 @@ import {
 	verifyDispatchAssertionV3,
 	verifyLifecycleCommandV3,
 	verifyNodeCleanupResultV3,
+	verifyUpgradeCommandV3,
 } from './protocol-v3.js';
 
 const contentDigest = (character: string) => `sha256:${character.repeat(64)}`;
@@ -136,6 +138,34 @@ function lifecyclePayload(overrides: Record<string, unknown> = {}) {
 		runtimeResourceInventoryHash: affinity.runtimeResourceInventoryHash,
 		reasonCode: 'ADMIN_UNINSTALL',
 		expectedResourceCount: 4,
+		...overrides,
+	};
+}
+
+function upgradePayload(overrides: Record<string, unknown> = {}) {
+	return {
+		...timed(affinity.issuer),
+		type: 'cluster-upgrade-command',
+		aud: 'privos-apps-master',
+		action: 'UPGRADE_RUNTIME',
+		operationId: '11111111-1111-4111-8111-111111111111',
+		clusterId: affinity.clusterId,
+		workspaceId: affinity.workspaceId,
+		deploymentId: affinity.deploymentId,
+		generationId: affinity.generationId,
+		generationNumber: 1,
+		revision: 1,
+		runtimeInstallationId: affinity.runtimeInstallationId,
+		clusterAppId: 'cluster-app-1',
+		mcpAppId: 'mcp-app-1',
+		targetManifestDigest: contentDigest('f'),
+		targetImageDigest: contentDigest('f'),
+		previousManifestDigest: contentDigest('c'),
+		previousImageDigest: contentDigest('b'),
+		resourceManifestHash: affinity.resourceManifestHash,
+		runtimeResourceInventoryHash: affinity.runtimeResourceInventoryHash,
+		authorizationEpoch: 1,
+		upgradeEpoch: 1,
 		...overrides,
 	};
 }
@@ -584,6 +614,80 @@ test('node cleanup evidence is ES256-signed and generation affine', () => {
 		kid: node.kid,
 		expected: { ...affinity, issuer: 'urn:privos:cluster-node:node-1' },
 	}).complete, true);
+});
+
+test('upgrade commands reject tamper, expiry, generation transplant, and an epoch that does not match its revision', () => {
+	const hub = ecIdentity();
+	const sign = (payload: Record<string, unknown>, protocolVersion = 3) => signEs256Jws({
+		payload,
+		privateJwk: hub.privateJwk,
+		kid: hub.kid,
+		typ: 'privos-cluster-upgrade-command+jws',
+		protocolVersion,
+	});
+	const expected = { ...affinity, clusterAppId: 'cluster-app-1', mcpAppId: 'mcp-app-1' };
+	const compact = sign(upgradePayload());
+	const verified = verifyUpgradeCommandV3({ compact, publicJwk: hub.publicJwk, kid: hub.kid, expected });
+	assert.equal(verified.revision, 1);
+	assert.equal(verified.targetManifestDigest, contentDigest('f'));
+	assert.equal(verified.previousManifestDigest, contentDigest('c'));
+
+	assertV3Error(
+		() => verifyUpgradeCommandV3({
+			compact: tamperPayload(compact, (payload) => { payload.generationId = 'generation-2'; }),
+			publicJwk: hub.publicJwk,
+			kid: hub.kid,
+			expected,
+		}),
+		'ARTIFACT_SIGNATURE_INVALID',
+	);
+	const now = Math.floor(Date.now() / 1000);
+	assertV3Error(
+		() => verifyUpgradeCommandV3({
+			compact: sign(upgradePayload({ iat: now - 200, exp: now - 100 })),
+			publicJwk: hub.publicJwk,
+			kid: hub.kid,
+			expected,
+		}),
+		'ARTIFACT_TIME_INVALID',
+	);
+	assertV3Error(
+		() => verifyUpgradeCommandV3({ compact: sign(upgradePayload(), 2), publicJwk: hub.publicJwk, kid: hub.kid, expected }),
+		'PROTOCOL_VERSION_UNSUPPORTED',
+	);
+	assertV3Error(
+		() => verifyUpgradeCommandV3({
+			compact,
+			publicJwk: hub.publicJwk,
+			kid: hub.kid,
+			expected: { ...expected, mcpAppId: 'mcp-app-2' },
+		}),
+		'GENERATION_AFFINITY_MISMATCH',
+	);
+	// A different generationNumber names a different generation entirely — the
+	// same class of refusal a reused generation identity gets at install.
+	assertV3Error(
+		() => verifyUpgradeCommandV3({
+			compact,
+			publicJwk: hub.publicJwk,
+			kid: hub.kid,
+			expected: { ...expected, generationNumber: 2 },
+		}),
+		'GENERATION_AFFINITY_MISMATCH',
+	);
+});
+
+test('the upgrade command schema refuses an upgradeEpoch that does not equal its revision, and a target identical to its previous image', () => {
+	const mismatchedEpoch = ClusterUpgradeCommandPayloadV3Schema.safeParse(upgradePayload({ upgradeEpoch: 2 }));
+	assert.equal(mismatchedEpoch.success, false);
+
+	const noOpTarget = ClusterUpgradeCommandPayloadV3Schema.safeParse(upgradePayload({
+		targetManifestDigest: contentDigest('c'),
+		targetImageDigest: contentDigest('b'),
+	}));
+	assert.equal(noOpTarget.success, false);
+
+	assert.equal(ClusterUpgradeCommandPayloadV3Schema.safeParse(upgradePayload()).success, true);
 });
 
 test('runtime and lifecycle transition graphs allow idempotent delivery but reject regressions', () => {
