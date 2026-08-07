@@ -644,3 +644,68 @@ test('a CAPACITY_UNAVAILABLE refusal (no active node) carries a signed REFUSED a
 	assert.equal(json.error, 'CAPACITY_UNAVAILABLE');
 	assert.ok(json.acknowledgement, 'a 409 refusal must carry a signed acknowledgement, not a bare {error} the Hub would dereference');
 });
+
+test('the inspect reference drops the running digest pin, so an upgrade can name a different image', async (t) => {
+	// A live app row carries `image` pinned to the digest it is RUNNING. An
+	// upgrade exists to move off that digest, and the agent's resolver refuses a
+	// reference whose existing pin disagrees with the requested one. Passing the
+	// row verbatim therefore fails every upgrade before any container is touched
+	// — invisible here until the fixture is pinned the way production is.
+	const fastify = Fastify();
+	t.after(() => fastify.close());
+	const runningDigest = `sha256:${'a'.repeat(64)}`;
+	const targetDigest = `sha256:${'f'.repeat(64)}`;
+	let inspectPayload: any;
+	const command = {
+		operationId: '55555555-5555-4555-8555-555555555555',
+		clusterId: 'cluster-1', workspaceId: 'workspace-1', deploymentId: 'deployment-1',
+		generationId: 'generation-1', generationNumber: 1, revision: 1,
+		runtimeInstallationId: 'runtime-1', clusterAppId: 'cluster-app-1', mcpAppId: 'mcp-app-1',
+		targetManifestDigest: targetDigest, targetImageDigest: targetDigest,
+		previousManifestDigest: runningDigest, previousImageDigest: runningDigest,
+		resourceManifestHash: 'r'.repeat(43), runtimeResourceInventoryHash: 'i'.repeat(43),
+		authorizationEpoch: 7, upgradeEpoch: 1,
+	};
+	await fastify.register(hubFacingRoutes({
+		auth: { verify: async (workspaceId: string) => ({ workspaceId }) } as any,
+		deployment: {
+			publicUrlFor: (s: string) => `https://${s}.apps.example.com`,
+			upgradeMcpV3: async () => ({
+				app: { appId: 'cluster-app-1', subdomain: 'library-app', manifestDigest: targetDigest, imageDigest: targetDigest, updatedAt: new Date() },
+				swapStrategy: 'STOP_THEN_CREATE',
+			}),
+		} as any,
+		lifecycle: {} as any,
+		repositories: {
+			apps: { findOne: async () => ({ image: `registry.example/app@${runningDigest}`, workspaceId: 'workspace-1' }) },
+			nodes: { findOne: async () => ({ nodeId: 'node-1' }) },
+		} as any,
+		agentClient: {
+			request: async (_n: any, _w: any, _m: any, _p: any, body: any) => {
+				inspectPayload = body;
+				return { status: 200, body: { imageDigest: targetDigest, manifestDigest: targetDigest } };
+			},
+		} as any,
+		baseDomain: 'apps.example.com',
+		mcpSecurity: { consumeUpgradeCommandV3: async () => command as any } as any,
+		mcpV2Enabled: false, mcpV3Enabled: true, mcpReconfigureEnabled: true, mcpUpgradeEnabled: true,
+		clusterMasterIdentity: {
+			signUpgradeAcknowledgement: async () => ({ compact: 'h.p.s', artifactHash: 'A'.repeat(43), kid: 'kid-1' }),
+		} as any,
+		mcpReleaseAuthorityJwks: [],
+	}));
+	await fastify.ready();
+	const response = await fastify.inject({
+		method: 'POST', url: '/w/workspace-1/api/v1/mcp/v3/apps/runtime-1/upgrade',
+		headers: { authorization: 'Bearer test' },
+		payload: {
+			upgradeCommandJws: 'signed', issuer: 'urn:privos:hub:deployment-1', deploymentId: 'deployment-1',
+			generationId: 'generation-1', generationNumber: 1, clusterAppId: 'cluster-app-1', mcpAppId: 'mcp-app-1',
+			resourceManifestHash: 'r'.repeat(43), runtimeResourceInventoryHash: 'i'.repeat(43),
+		},
+	});
+	assert.equal(response.statusCode, 200);
+	assert.equal(inspectPayload.image, 'registry.example/app');
+	assert.ok(!inspectPayload.image.includes('@'), 'the inspect reference must carry no digest pin');
+	assert.equal(inspectPayload.digest, targetDigest);
+});

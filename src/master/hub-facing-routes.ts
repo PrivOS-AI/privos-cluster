@@ -803,15 +803,35 @@ export function hubFacingRoutes(deps: {
 					},
 				});
 			}
+			// `app.image` is pinned to the digest currently RUNNING, and an upgrade
+			// exists precisely to move off it. `resolveImmutableImageReference`
+			// refuses a reference whose existing pin disagrees with the requested
+			// digest, so passing it verbatim fails every upgrade before any
+			// container is touched. Install never hits this because the pin it
+			// passes is the digest it is installing. Send the repository and let
+			// the agent compose repository@targetImageDigest; the equality check
+			// below still binds the answer to what the command authorized.
+			const imageRepository = app.image.replace(/@sha256:[a-f0-9]{64}$/, '');
 			const inspectedResponse = await deps.agentClient.request(node, workspaceId(req), 'POST', '/api/v1/mcp/images/inspect', {
-				image: app.image,
+				image: imageRepository,
 				digest: command.targetImageDigest,
 			});
-			// A passthrough of the agent's own inspect failure (e.g. a missing
-			// manifest label) — unchanged from the install path's identical
-			// pattern, which the Hub already knows how to handle without an
-			// acknowledgement.
-			if (inspectedResponse.status >= 300) return sendAgent(reply, inspectedResponse);
+			// An inspect failure happens BEFORE anything is touched, so it is a
+			// refusal, not a failed swap. Signing REFUSED lets the Hub return the
+			// installation to ACTIVE and end the operation retryably; a bare
+			// passthrough leaves the saga stranded in RUNTIME_UPGRADING, where
+			// every dispatch to the app is refused.
+			if (inspectedResponse.status >= 300) {
+				const acknowledgement = await signRefusalAcknowledgement('REFUSED', 'INSPECTED_ARTIFACT_UNAVAILABLE');
+				return reply.code(409).send({
+					error: 'inspected_artifact_unavailable',
+					acknowledgement: {
+						compact: acknowledgement.compact,
+						artifactHash: acknowledgement.artifactHash,
+						kid: acknowledgement.kid,
+					},
+				});
+			}
 			const inspected = inspectedResponse.body as { imageDigest: string; manifestDigest: string };
 			if (
 				inspected.imageDigest !== command.targetImageDigest ||
