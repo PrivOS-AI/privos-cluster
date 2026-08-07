@@ -2,6 +2,7 @@ import crypto from 'crypto';
 import pino from 'pino';
 import { config } from '../config.js';
 import { containerManager, networkManager } from '../docker/index.js';
+import { imageRepositoryOf } from '../docker/image-reference.js';
 import * as dockerState from '../docker/docker-state.js';
 import { getHealth } from './health-monitor.js';
 import { checkResourceRequest } from './resource-check.js';
@@ -847,7 +848,11 @@ export async function redeployContainer(
         platformEnvVars: req.platformEnvVars ?? {},
     } : undefined);
 
-    const newImage = req.image ?? c.image;
+    // A caller supplying a NEW digest is deliberately moving off the digest the
+    // container currently runs, so fall back to the repository rather than the
+    // running pinned reference — otherwise the pull refuses its own disagreeing
+    // pin and the redeploy fails before anything is touched.
+    const newImage = req.image ?? (req.digest ? imageRepositoryOf(c.image) : c.image);
     const newTag = req.tag ?? c.tag;
     const newDigest = req.digest;
     const newResources: ContainerResources = {
@@ -1049,7 +1054,11 @@ export async function rollingRedeployContainer(
         throw new Error(`Cannot rolling-redeploy a non-running container (state=${old.state}) — start it first`);
     }
 
-    const newImage = req.image ?? old.image;
+    // A caller supplying a NEW digest is deliberately moving off the digest the
+    // container currently runs, so fall back to the repository rather than the
+    // running pinned reference — otherwise the pull refuses its own disagreeing
+    // pin and the redeploy fails before anything is touched.
+    const newImage = req.image ?? (req.digest ? imageRepositoryOf(old.image) : old.image);
     const newTag = req.tag ?? old.tag;
     const newDigest = req.digest;
     const newResources: ContainerResources = { ...old.resources, ...req.resources };
