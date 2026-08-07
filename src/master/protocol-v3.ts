@@ -266,8 +266,26 @@ export type ClusterReconfigureAcknowledgementPayloadV3 = z.infer<
 	typeof ClusterReconfigureAcknowledgementPayloadV3Schema
 >;
 
+/**
+ * Who the Hub says initiated this dispatch, when the app declared it can read
+ * one. Opaque to the master: it is forwarded inside the signed assertion for
+ * the app to display or attribute with, and is deliberately excluded from
+ * affinity, routing, replay and logging. Nothing here may become an
+ * authorization input — the room binding remains the only thing that decides
+ * what a dispatch is allowed to reach.
+ *
+ * Absent on every assertion the fleet signs today, and absent forever for an
+ * agent or roomless dispatch, so absence must stay valid.
+ */
+const DispatchActor = z.object({
+	subject: z.string().min(1),
+	username: z.string().optional(),
+	roomId: z.string().optional(),
+}).strict();
+
 const DispatchCommonShape = {
 	...TimedArtifactShape,
+	actor: DispatchActor.optional(),
 	type: z.literal('hub-dispatch-assertion'),
 	aud: z.literal('privos-mcp-app'),
 	clusterId: Identifier,
@@ -308,6 +326,8 @@ export const McpDispatchAssertionPayloadV3Schema = z.discriminatedUnion('authori
 ]);
 
 export type McpDispatchAssertionPayloadV3 = z.infer<typeof McpDispatchAssertionPayloadV3Schema>;
+
+export type McpDispatchActorV3 = z.infer<typeof DispatchActor>;
 
 export function parseDispatchAssertionPayloadV3(value: unknown): McpDispatchAssertionPayloadV3 {
 	if (value && typeof value === 'object') {

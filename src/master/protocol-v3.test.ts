@@ -370,6 +370,112 @@ test('room dispatch requires the runtime parent and exact room-binding child', (
 	assert.equal(verifyDispatchAssertionV3({ compact, publicJwk: hub.publicJwk, kid: hub.kid, expected }).authorizationContext, 'room');
 });
 
+test('an optional actor claim is accepted, ignored by affinity, and never required', () => {
+	const common = {
+		...timed(affinity.issuer, 30),
+		type: 'hub-dispatch-assertion',
+		aud: 'privos-mcp-app',
+		clusterId: affinity.clusterId,
+		workspaceId: affinity.workspaceId,
+		deploymentId: affinity.deploymentId,
+		generationId: affinity.generationId,
+		generationNumber: 1,
+		runtimeInstallationId: affinity.runtimeInstallationId,
+		mcpAppId: 'mcp-app-1',
+		clusterAppId: 'cluster-app-1',
+		htm: 'POST',
+		htu: '/mcp',
+		bodyDigest: artifactHash('rpc-body'),
+		manifestDigest: contentDigest('c'),
+		resourceManifestHash: affinity.resourceManifestHash,
+		runtimeResourceInventoryHash: affinity.runtimeResourceInventoryHash,
+		runtimeApprovalReceiptHash: artifactHash('runtime-approval'),
+		runtimeGrantEpoch: 1,
+	} as const;
+	const roomBinding = {
+		authorizationContext: 'room' as const,
+		roomId: 'room-1',
+		authorizationBindingId: 'binding-1',
+		bindingReceiptHash: artifactHash('binding-receipt'),
+		bindingEpoch: 1,
+	};
+	const expected = {
+		...affinity,
+		...roomBinding,
+		bodyDigest: common.bodyDigest,
+		manifestDigest: common.manifestDigest,
+		runtimeApprovalReceiptHash: common.runtimeApprovalReceiptHash,
+		runtimeGrantEpoch: common.runtimeGrantEpoch,
+	};
+
+	// Every Hub in the fleet signs no actor today, and an agent or roomless
+	// dispatch never will. Absence has to stay valid or the fleet stops.
+	const withoutActor = parseDispatchAssertionPayloadV3({ ...common, ...roomBinding });
+	assert.equal(withoutActor.actor, undefined);
+	assert.doesNotThrow(() => assertDispatchAffinityV3(withoutActor, expected));
+	assert.doesNotThrow(() => parseDispatchAssertionPayloadV3({ ...common, authorizationContext: 'workspace' }));
+
+	const withActor = parseDispatchAssertionPayloadV3({
+		...common,
+		...roomBinding,
+		actor: { subject: 'user-1', username: 'techcomthanh', roomId: 'room-1' },
+	});
+	assert.deepEqual(withActor.actor, { subject: 'user-1', username: 'techcomthanh', roomId: 'room-1' });
+
+	// The claim is opaque metadata: affinity must reach the same verdict with it,
+	// without it, and with a different one. Nothing may key off the actor.
+	assert.doesNotThrow(() => assertDispatchAffinityV3(withActor, expected));
+	assert.doesNotThrow(() => assertDispatchAffinityV3(
+		parseDispatchAssertionPayloadV3({ ...common, ...roomBinding, actor: { subject: 'someone-else' } }),
+		expected,
+	));
+
+	// A workspace-context assertion may carry one too — it is not room affinity.
+	assert.deepEqual(
+		parseDispatchAssertionPayloadV3({
+			...common,
+			authorizationContext: 'workspace',
+			actor: { subject: 'user-1' },
+		}).actor,
+		{ subject: 'user-1' },
+	);
+
+	// Strictness is the property that makes the claim safe to add: the actor is a
+	// well-typed optional key, not a passthrough for anything a signer feels like.
+	for (const malformed of [
+		{ username: 'no-subject' },
+		{ subject: '' },
+		{ subject: 42 },
+		{ subject: 'user-1', username: 7 },
+		{ subject: 'user-1', unexpected: 'x' },
+		'user-1',
+		null,
+	]) {
+		assertV3Error(
+			() => parseDispatchAssertionPayloadV3({ ...common, ...roomBinding, actor: malformed }),
+			'PROTOCOL_ENVELOPE_INVALID',
+		);
+	}
+	assertV3Error(
+		() => parseDispatchAssertionPayloadV3({ ...common, ...roomBinding, unknownClaim: 'x' }),
+		'PROTOCOL_ENVELOPE_INVALID',
+	);
+
+	// The app must receive exactly the bytes the Hub signed, actor included.
+	const hub = ecIdentity();
+	const compact = signEs256Jws({
+		payload: withActor,
+		privateJwk: hub.privateJwk,
+		kid: hub.kid,
+		typ: 'privos-hub-dispatch+jws',
+		protocolVersion: 3,
+	});
+	assert.deepEqual(
+		verifyDispatchAssertionV3({ compact, publicJwk: hub.publicJwk, kid: hub.kid, expected }).actor,
+		{ subject: 'user-1', username: 'techcomthanh', roomId: 'room-1' },
+	);
+});
+
 test('lifecycle commands reject tamper, expiry, protocol downgrade, and generation transplant', () => {
 	const hub = ecIdentity();
 	const sign = (payload: Record<string, unknown>, protocolVersion = 3) => signEs256Jws({
