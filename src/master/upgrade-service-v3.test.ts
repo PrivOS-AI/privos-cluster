@@ -308,3 +308,20 @@ test('an HA generation upgrades one replica at a time; a second-replica failure 
 	assert.equal(revertCall.body.mcpV3Binding.imageDigest, `sha256:${'e'.repeat(64)}`);
 	assert.equal(state.apps[0]!.manifestDigest, `sha256:${'e'.repeat(64)}`, 'nothing was persisted as upgraded');
 });
+
+
+test('the redeploy body carries the image repository, never the digest currently running', async () => {
+	// `app.image` is pinned to the digest currently SERVING; a swap names a
+	// different one in both directions. Sending the row verbatim makes the agent
+	// refuse its own disagreeing pin, failing the upgrade before anything is
+	// touched. The fixture was already pinned the way production is — what was
+	// missing was anyone asserting what actually got sent.
+	const state = fixture();
+	await state.service.upgradeMcpV3('workspace-1', command());
+
+	const [call] = state.agentCalls;
+	assert.equal(call!.body.image, 'registry.example/app');
+	assert.ok(!String(call!.body.image).includes('@'), 'the redeploy image must carry no digest pin');
+	// The digest still travels separately, so the agent composes repository@digest.
+	assert.equal(call!.body.digest, `sha256:${'f'.repeat(64)}`);
+});

@@ -1,3 +1,4 @@
+import { imageRepositoryOf } from '../docker/image-reference.js';
 import crypto from 'node:crypto';
 import type { JsonWebKey } from 'node:crypto';
 import { z } from 'zod';
@@ -789,9 +790,15 @@ export class DeploymentService {
 			const platformEnvVars = this.platformEnvVarsV3(app.subdomain);
 			const secretEnvKeys = app.secretEnvKeys ?? [];
 
+			// `app.image` is pinned to the digest currently RUNNING. Both directions
+			// of a swap name a DIFFERENT digest — the target going forward, the
+			// previous one on revert — so the pinned reference must be reduced to
+			// its repository or the agent refuses its own disagreeing pin and the
+			// redeploy fails before touching anything.
+			const appImageRepository = imageRepositoryOf(app.image);
 			const redeployBody = (node: MasterNode, replica: AppReplica, digest: string, manifestDigest: string) => ({
 				workspaceId,
-				image: app.image,
+				image: appImageRepository,
 				digest,
 				versionDigest: app.versionDigest,
 				resources: app.resources,
