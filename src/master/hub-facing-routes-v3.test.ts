@@ -3,6 +3,7 @@ import test from 'node:test';
 import Fastify from 'fastify';
 
 import { hubFacingRoutes } from './hub-facing-routes.js';
+import { getClusterMcpMetrics, resetClusterMcpMetricsForTests } from '../services/mcp-observability.js';
 
 test('all Hub-facing v3 provisioning identity and install routes fail closed while the flag is off', async (t) => {
 	const fastify = Fastify();
@@ -708,4 +709,124 @@ test('the inspect reference drops the running digest pin, so an upgrade can name
 	assert.equal(inspectPayload.image, 'registry.example/app');
 	assert.ok(!inspectPayload.image.includes('@'), 'the inspect reference must carry no digest pin');
 	assert.equal(inspectPayload.digest, targetDigest);
+});
+
+/**
+ * The dispatch 409 used to be silent. When every app container in the fleet
+ * went unhealthy on 2026-08-08 — the tenant Hubs had never learned the cluster
+ * node keys, so nothing could pair — this reply was the only symptom, and it
+ * named neither the app nor the gate that rejected it. The event has to say
+ * which gate emptied the candidate set.
+ */
+test('v3 dispatch records why it 409s when no replica passes the health probe', async (t) => {
+	const fastify = Fastify();
+	t.after(() => fastify.close());
+	resetClusterMcpMetricsForTests();
+	const app = {
+		appId: 'cluster-app-1', workspaceId: 'workspace-1', kind: 'mcp-v3', state: 'RUNNING',
+		mcpInventoryAttestationEstablishedAt: new Date(), mcpDeploymentId: 'deployment-1',
+		mcpGenerationId: 'generation-1', mcpGenerationNumber: 1, mcpRuntimeInstallationId: 'runtime-1',
+		manifestDigest: `sha256:${'f'.repeat(64)}`, mcpApprovalReceiptHash: 'b'.repeat(43),
+		mcpAuthorizationEpoch: 7, resourceManifestHash: 'r'.repeat(43),
+		runtimeResourceInventoryHash: 'i'.repeat(43), mcpAppId: 'mcp-app-1',
+		replicas: [{ replicaId: '11111111-1111-4111-8111-111111111111', nodeId: 'node-1', containerId: 'container-1', state: 'running' }],
+	};
+	await fastify.register(hubFacingRoutes({
+		auth: { verify: async (workspaceId: string) => ({ workspaceId }) } as any,
+		deployment: {} as any,
+		lifecycle: {} as any,
+		repositories: {
+			apps: { findOne: async () => app },
+			nodes: { find: () => ({ toArray: async () => [{ nodeId: 'node-1', status: 'ACTIVE' }] }) },
+		} as any,
+		agentClient: {
+			// Exactly the live failure: the container is running but its docker
+			// healthcheck has gone red, so the probe rejects the only candidate.
+			request: async () => ({ status: 200, body: { state: 'running', healthStatus: 'unhealthy' } }),
+		} as any,
+		baseDomain: 'apps.example.com',
+		mcpSecurity: { consumeDispatchAssertionV3: async () => ({}) } as any,
+		mcpV2Enabled: false,
+		mcpV3Enabled: true,
+		mcpReconfigureEnabled: true,
+		mcpUpgradeEnabled: true,
+		clusterMasterIdentity: {} as any,
+		mcpReleaseAuthorityJwks: [],
+	}));
+	await fastify.ready();
+	const response = await fastify.inject({
+		method: 'POST',
+		url: '/w/workspace-1/api/v1/apps/cluster-app-1/dispatch',
+		headers: { authorization: 'Bearer test' },
+		payload: {
+			assertion: 'signed',
+			rpc: { jsonrpc: '2.0', method: 'tools/call', id: 1 },
+			authorizationContext: 'room',
+			runtimeInstallationId: 'runtime-1',
+			authorizationBindingId: 'binding-1',
+		},
+	});
+
+	// The reply itself is unchanged — this is log-only.
+	assert.equal(response.statusCode, 409);
+	assert.deepEqual(response.json(), { error: 'replica_node_unavailable' });
+	const denied = getClusterMcpMetrics().find(
+		(metric) => metric.event === 'private_dispatch' && metric.outcome === 'denied',
+	);
+	assert.equal(denied?.reason, 'health_probe_failed');
+	assert.equal(denied?.boundary, 'master_v3');
+});
+
+test('v3 dispatch distinguishes a replica on no active node from a failed health probe', async (t) => {
+	const fastify = Fastify();
+	t.after(() => fastify.close());
+	resetClusterMcpMetricsForTests();
+	const app = {
+		appId: 'cluster-app-1', workspaceId: 'workspace-1', kind: 'mcp-v3', state: 'RUNNING',
+		mcpInventoryAttestationEstablishedAt: new Date(), mcpDeploymentId: 'deployment-1',
+		mcpGenerationId: 'generation-1', mcpGenerationNumber: 1, mcpRuntimeInstallationId: 'runtime-1',
+		manifestDigest: `sha256:${'f'.repeat(64)}`, mcpApprovalReceiptHash: 'b'.repeat(43),
+		mcpAuthorizationEpoch: 7, resourceManifestHash: 'r'.repeat(43),
+		runtimeResourceInventoryHash: 'i'.repeat(43), mcpAppId: 'mcp-app-1',
+		replicas: [{ replicaId: '11111111-1111-4111-8111-111111111111', nodeId: 'node-1', containerId: 'container-1', state: 'running' }],
+	};
+	await fastify.register(hubFacingRoutes({
+		auth: { verify: async (workspaceId: string) => ({ workspaceId }) } as any,
+		deployment: {} as any,
+		lifecycle: {} as any,
+		repositories: {
+			apps: { findOne: async () => app },
+			// The node exists on the replica but is not ACTIVE, so it never
+			// becomes a candidate and no probe is ever attempted.
+			nodes: { find: () => ({ toArray: async () => [] }) },
+		} as any,
+		agentClient: { request: async () => assert.fail('no health probe should be attempted') } as any,
+		baseDomain: 'apps.example.com',
+		mcpSecurity: { consumeDispatchAssertionV3: async () => ({}) } as any,
+		mcpV2Enabled: false,
+		mcpV3Enabled: true,
+		mcpReconfigureEnabled: true,
+		mcpUpgradeEnabled: true,
+		clusterMasterIdentity: {} as any,
+		mcpReleaseAuthorityJwks: [],
+	}));
+	await fastify.ready();
+	const response = await fastify.inject({
+		method: 'POST',
+		url: '/w/workspace-1/api/v1/apps/cluster-app-1/dispatch',
+		headers: { authorization: 'Bearer test' },
+		payload: {
+			assertion: 'signed',
+			rpc: { jsonrpc: '2.0', method: 'tools/call', id: 1 },
+			authorizationContext: 'room',
+			runtimeInstallationId: 'runtime-1',
+			authorizationBindingId: 'binding-1',
+		},
+	});
+
+	assert.equal(response.statusCode, 409);
+	const denied = getClusterMcpMetrics().find(
+		(metric) => metric.event === 'private_dispatch' && metric.outcome === 'denied',
+	);
+	assert.equal(denied?.reason, 'no_running_replica_on_active_node');
 });

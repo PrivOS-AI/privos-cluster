@@ -291,7 +291,24 @@ export function hubFacingRoutes(deps: {
 					}
 				}));
 				const selected = health.find((candidate) => candidate !== null);
-				if (!selected) return reply.code(409).send({ error: 'replica_node_unavailable' });
+				if (!selected) {
+					// This 409 was silent, and it was the only externally visible
+					// symptom of a fleet-wide outage: every app container had gone
+					// unhealthy because the tenant Hub never learned the node keys,
+					// so nothing here could pair. Naming which gate emptied the
+					// candidate set is the difference between "dispatch broken" and
+					// a diagnosis.
+					const reason = app.replicas.length === 0
+						? 'no_replica'
+						: candidates.length === 0
+							? 'no_running_replica_on_active_node'
+							: 'health_probe_failed';
+					recordClusterMcpEvent({
+						event: 'private_dispatch', outcome: 'denied', boundary: 'master_v3', reason,
+						correlationId: app.mcpRuntimeInstallationId,
+					});
+					return reply.code(409).send({ error: 'replica_node_unavailable' });
+				}
 				return sendAgent(reply, await deps.agentClient.request(
 					selected.node,
 					app.workspaceId,
@@ -330,7 +347,13 @@ export function hubFacingRoutes(deps: {
 			}
 			recordClusterMcpEvent({ event: 'private_dispatch', outcome: 'allowed', boundary: 'master', reason: 'verified', correlationId: app.mcpInstallationId, emitLog: false });
 			const node = await deps.repositories.nodes.findOne({ nodeId: replica.nodeId, status: 'ACTIVE' });
-			if (!node) return reply.code(409).send({ error: 'replica_node_unavailable' });
+			if (!node) {
+				recordClusterMcpEvent({
+					event: 'private_dispatch', outcome: 'denied', boundary: 'master', reason: 'replica_node_inactive',
+					correlationId: app.mcpInstallationId,
+				});
+				return reply.code(409).send({ error: 'replica_node_unavailable' });
+			}
 			return sendAgent(reply, await deps.agentClient.request(
 				node,
 				app.workspaceId,
