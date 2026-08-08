@@ -99,6 +99,17 @@ export function portalAdminRoutes(deps: {
 			req.log.info({ workspaceId }, 'apps master workspace revoked');
 			return { ok: true };
 		});
+		// Workspace power, driven by the Portal because the Portal owns the
+		// billing state that suspends a tenant. Stop/start only — the app's
+		// identity, entitlement and bindings are untouched, which is why this is
+		// not subject to the signed-Hub-command rule that governs v3 lifecycle.
+		fastify.post(`${root}/workspaces/:workspaceId/power`, { preHandler: authenticate }, async (req) => {
+			const { workspaceId } = z.object({ workspaceId: z.string().min(1) }).parse(req.params);
+			const { action } = z.object({ action: z.enum(['suspend', 'resume']) }).parse(req.body);
+			const result = await deps.lifecycle.setWorkspacePower(workspaceId, action);
+			req.log.info({ workspaceId, action, affected: result.affected }, 'apps master workspace power changed');
+			return result;
+		});
 		fastify.get(`${root}/apps`, { preHandler: authenticate }, async () =>
 			deps.repositories.apps.find({}, { projection: { envVars: 0 } }).toArray());
 		fastify.post(`${root}/usage/rollup`, { preHandler: authenticate }, async (req) => {

@@ -65,6 +65,82 @@ export class AppLifecycleService {
 		return this.get(workspaceId, appId);
 	}
 
+	/**
+	 * Stop or start every app in a workspace because the WORKSPACE's own power
+	 * state changed — dunning suspension, offboard, a manual stack stop.
+	 *
+	 * Deliberately not routed through `invoke`, which refuses `mcp-v3` apps
+	 * because their *lifecycle* transitions must carry a signed Hub command.
+	 * That rule protects identity and authorization — install, uninstall,
+	 * upgrade — and the Hub is the authority for them. Power state is a
+	 * different thing: nothing here touches a generation, binding, receipt,
+	 * epoch or entitlement, and demanding a signed Hub command would be
+	 * unsatisfiable anyway, because the Hub being suspended is the whole reason
+	 * we are here.
+	 *
+	 * Without this, a dunning-suspended tenant left its app containers running
+	 * against a dead Hub: permanently unhealthy, still consuming app-node
+	 * resources, and polluting the health and dispatch-409 signals that the
+	 * release gate now reads.
+	 *
+	 * Idempotent, and never destructive — no uninstall, no purge.
+	 */
+	async setWorkspacePower(
+		workspaceId: string,
+		action: 'suspend' | 'resume',
+	): Promise<{ workspaceId: string; action: string; affected: number }> {
+		const suspending = action === 'suspend';
+		// Suspending takes what is running; resuming takes back only what THIS
+		// mechanism stopped, so an app an operator stopped on purpose before the
+		// suspension is not silently started by the resume.
+		const selector = suspending
+			? { workspaceId, state: 'RUNNING' }
+			: { workspaceId, state: { $ne: 'REMOVED' }, suspendedWithWorkspace: true };
+		const apps = await this.deps.repositories.apps.find(selector).toArray();
+		if (apps.length === 0) return { workspaceId, action, affected: 0 };
+
+		const nodes = await this.loadNodes(apps.flatMap((app) => app.replicas.map((replica) => replica.nodeId)));
+		const now = new Date();
+		for (const app of apps) {
+			const responses = await Promise.all(app.replicas.flatMap((replica) => {
+				const node = nodes.get(replica.nodeId);
+				// A replica whose node is gone has nothing to stop; resuming it is
+				// the deployment path's job, not this one's.
+				if (!node) return [];
+				return [this.deps.agentClient.request(
+					node,
+					workspaceId,
+					'POST',
+					`/api/v1/apps/${replica.containerId}/${suspending ? 'stop' : 'start'}`,
+				)];
+			}));
+			this.assertResponses(responses);
+			const state = suspending ? 'STOPPED' : 'RUNNING';
+			await this.deps.repositories.apps.updateOne(
+				{ appId: app.appId, workspaceId },
+				{
+					$set: {
+						state,
+						updatedAt: now,
+						'replicas.$[].state': state.toLowerCase(),
+						...(suspending ? { suspendedWithWorkspace: true } : {}),
+					},
+					...(suspending ? {} : { $unset: { suspendedWithWorkspace: '' } }),
+				},
+			);
+			await this.deps.repositories.lifecycleEvents.insertMany(app.replicas.map((replica) => ({
+				eventId: crypto.randomUUID(),
+				workspaceId,
+				appId: app.appId,
+				replicaId: replica.replicaId,
+				type: (suspending ? 'STOPPED' : 'STARTED') as 'STOPPED' | 'STARTED',
+				resources: app.resources,
+				at: now,
+			})));
+		}
+		return { workspaceId, action, affected: apps.length };
+	}
+
 	async redeploy(
 		workspaceId: string,
 		appId: string,

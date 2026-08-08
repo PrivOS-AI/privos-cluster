@@ -76,3 +76,84 @@ test('Hub-facing v3 app views do not expose Cluster-owned replica routing identi
 			(error as Error & { code?: string; statusCode?: number }).statusCode === 409,
 	);
 });
+
+/**
+ * Workspace power has to reach v3 apps.
+ *
+ * `invoke` refuses `mcp-v3` because its LIFECYCLE transitions need a signed Hub
+ * command. Power is not a lifecycle transition, and demanding a signed Hub
+ * command here would be unsatisfiable anyway — the Hub being suspended is the
+ * reason we are stopping the app. Tenant 060003's container ran on for over a
+ * day against a dead Hub because nothing propagated the suspension.
+ */
+const v3App: MasterApp = {
+	...mcpApp,
+	appId: 'cluster-app-v3',
+	kind: 'mcp-v3',
+	protocolVersion: 3,
+	mcpRuntimeInstallationId: 'runtime-1',
+	replicas: [
+		{ replicaId: 'r-1', nodeId: 'node-1', containerId: 'container-1', state: 'running' },
+	] as MasterApp['replicas'],
+};
+
+function powerFixture(apps: MasterApp[]) {
+	const calls: string[] = [];
+	const updates: Array<{ filter: any; update: any }> = [];
+	const events: any[] = [];
+	const lifecycle = new AppLifecycleService({
+		repositories: {
+			apps: {
+				find: () => ({ toArray: async () => apps }),
+				updateOne: async (filter: any, update: any) => { updates.push({ filter, update }); },
+			},
+			nodes: { find: () => ({ toArray: async () => [{ nodeId: 'node-1', status: 'ACTIVE' }] }) },
+			lifecycleEvents: { insertMany: async (rows: any[]) => { events.push(...rows); } },
+		} as never,
+		agentClient: {
+			request: async (_node: unknown, _ws: string, method: string, path: string) => {
+				calls.push(`${method} ${path}`);
+				return { status: 200, body: {} };
+			},
+		} as never,
+		ingress: {} as never,
+	});
+	return { lifecycle, calls, updates, events };
+}
+
+test('suspending a workspace stops its v3 app and marks why it stopped', async () => {
+	const state = powerFixture([v3App]);
+
+	const result = await state.lifecycle.setWorkspacePower('workspace-1', 'suspend');
+
+	assert.equal(result.affected, 1);
+	assert.deepEqual(state.calls, ['POST /api/v1/apps/container-1/stop']);
+	assert.equal(state.updates[0]!.update.$set.state, 'STOPPED');
+	assert.equal(state.updates[0]!.update.$set.suspendedWithWorkspace, true);
+	assert.equal(state.events[0]!.type, 'STOPPED');
+	// Identity is untouched: this is power, not lifecycle.
+	for (const key of ['mcpRuntimeInstallationId', 'mcpAuthorizationEpoch', 'mcpGenerationId']) {
+		assert.equal(key in state.updates[0]!.update.$set, false, `${key} must not be touched by a power change`);
+	}
+});
+
+test('resuming clears the marker and starts the app again', async () => {
+	const state = powerFixture([{ ...v3App, state: 'STOPPED', suspendedWithWorkspace: true }]);
+
+	const result = await state.lifecycle.setWorkspacePower('workspace-1', 'resume');
+
+	assert.equal(result.affected, 1);
+	assert.deepEqual(state.calls, ['POST /api/v1/apps/container-1/start']);
+	assert.equal(state.updates[0]!.update.$set.state, 'RUNNING');
+	assert.deepEqual(state.updates[0]!.update.$unset, { suspendedWithWorkspace: '' });
+	assert.equal(state.events[0]!.type, 'STARTED');
+});
+
+test('a workspace with nothing to move is a no-op, not an error', async () => {
+	const state = powerFixture([]);
+
+	const result = await state.lifecycle.setWorkspacePower('workspace-1', 'suspend');
+
+	assert.equal(result.affected, 0);
+	assert.deepEqual(state.calls, []);
+});

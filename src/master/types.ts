@@ -115,6 +115,13 @@ export interface MasterApp {
 	mcpProvisioningNodeIds?: string[];
 	mcpProvisioningReplicas?: McpV3ProvisioningReplicaPlan[];
 	mcpRoomBindingCount?: number;
+	/**
+	 * Set when the app was stopped because its WORKSPACE was suspended (dunning,
+	 * offboard, manual stop) rather than by anything the app itself did. Resume
+	 * restarts exactly the apps carrying this marker, so an app an operator had
+	 * deliberately stopped beforehand stays stopped.
+	 */
+	suspendedWithWorkspace?: boolean;
 	mcpInventoryAttestationEstablishedAt?: Date;
 	resourceManifestHash?: string;
 	runtimeResourceInventoryHash?: string;
