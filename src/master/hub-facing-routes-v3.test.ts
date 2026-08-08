@@ -240,6 +240,7 @@ test('v3 upgrade refuses a new image whose manifest label does not reduce to the
 		resourceManifestHash: 'r'.repeat(43),
 		runtimeResourceInventoryHash: 'i'.repeat(43),
 		authorizationEpoch: 7,
+		resultingAuthorizationEpoch: 8,
 		upgradeEpoch: 1,
 	};
 	await fastify.register(hubFacingRoutes({
@@ -317,6 +318,7 @@ test('a successful v3 upgrade verifies the label, delegates the swap, and return
 		resourceManifestHash: 'r'.repeat(43),
 		runtimeResourceInventoryHash: 'i'.repeat(43),
 		authorizationEpoch: 7,
+		resultingAuthorizationEpoch: 8,
 		upgradeEpoch: 1,
 	};
 	const upgradedApp = {
@@ -414,6 +416,7 @@ test('a FAILED v3 upgrade acknowledgement re-reads the app instead of trusting t
 		resourceManifestHash: 'r'.repeat(43),
 		runtimeResourceInventoryHash: 'i'.repeat(43),
 		authorizationEpoch: 7,
+		resultingAuthorizationEpoch: 8,
 		upgradeEpoch: 2,
 	};
 	// The pre-call snapshot (what the route reads BEFORE calling upgradeMcpV3)
@@ -508,6 +511,7 @@ test('B3: a pre-swap refusal that touched no container is acked REFUSED, never F
 		resourceManifestHash: 'r'.repeat(43),
 		runtimeResourceInventoryHash: 'i'.repeat(43),
 		authorizationEpoch: 7,
+		resultingAuthorizationEpoch: 8,
 		upgradeEpoch: 3,
 	};
 	await fastify.register(hubFacingRoutes({
@@ -597,6 +601,7 @@ test('a CAPACITY_UNAVAILABLE refusal (no active node) carries a signed REFUSED a
 		resourceManifestHash: 'r'.repeat(43),
 		runtimeResourceInventoryHash: 'i'.repeat(43),
 		authorizationEpoch: 7,
+		resultingAuthorizationEpoch: 8,
 		upgradeEpoch: 2,
 	};
 	await fastify.register(hubFacingRoutes({
@@ -665,7 +670,7 @@ test('the inspect reference drops the running digest pin, so an upgrade can name
 		targetManifestDigest: targetDigest, targetImageDigest: targetDigest,
 		previousManifestDigest: runningDigest, previousImageDigest: runningDigest,
 		resourceManifestHash: 'r'.repeat(43), runtimeResourceInventoryHash: 'i'.repeat(43),
-		authorizationEpoch: 7, upgradeEpoch: 1,
+		authorizationEpoch: 7, resultingAuthorizationEpoch: 8, upgradeEpoch: 1,
 	};
 	await fastify.register(hubFacingRoutes({
 		auth: { verify: async (workspaceId: string) => ({ workspaceId }) } as any,

@@ -165,6 +165,7 @@ function upgradePayload(overrides: Record<string, unknown> = {}) {
 		resourceManifestHash: affinity.resourceManifestHash,
 		runtimeResourceInventoryHash: affinity.runtimeResourceInventoryHash,
 		authorizationEpoch: 1,
+		resultingAuthorizationEpoch: 2,
 		upgradeEpoch: 1,
 		...overrides,
 	};

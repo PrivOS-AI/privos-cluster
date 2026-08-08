@@ -308,8 +308,30 @@ export const ClusterUpgradeCommandPayloadV3Schema = z.object({
 	resourceManifestHash: ArtifactHash,
 	runtimeResourceInventoryHash: ArtifactHash,
 	authorizationEpoch: z.number().int().positive(),
+	/**
+	 * The epoch the runtime must attest with once this swap lands.
+	 *
+	 * `authorizationEpoch` above is the affinity value — what the Hub believes
+	 * the generation carries RIGHT NOW, checked against the stored app row.
+	 * The Hub rotates the credential epoch at its own cutover, so the redeployed
+	 * container has to be labelled with the value that comes AFTER, not the one
+	 * being retired. Carrying only the current epoch left the Hub on N+1 and
+	 * every upgraded runtime on N, and pairing then failed permanently with
+	 * `installation_binding_mismatch`.
+	 */
+	resultingAuthorizationEpoch: z.number().int().positive(),
 	upgradeEpoch: z.number().int().positive(),
 }).strict().superRefine((value, ctx) => {
+	// The rotation is exactly one step, and it must move. Anything else is a
+	// malformed or forged command: equal would silently keep the retired epoch
+	// alive, and a jump would strand the runtime behind the Hub.
+	if (value.resultingAuthorizationEpoch !== value.authorizationEpoch + 1) {
+		ctx.addIssue({
+			code: z.ZodIssueCode.custom,
+			path: ['resultingAuthorizationEpoch'],
+			message: 'resultingAuthorizationEpoch must be authorizationEpoch + 1',
+		});
+	}
 	// v1 spends exactly one upgradeEpoch per revision — see the class comment.
 	// A mismatch can only be a malformed or forged command, never a legitimate
 	// retry, so it is refused at the schema boundary rather than reaching the

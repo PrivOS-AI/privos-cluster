@@ -91,6 +91,7 @@ function command(overrides: Partial<ClusterUpgradeCommandPayloadV3> = {}): Clust
 		resourceManifestHash: 'r'.repeat(43),
 		runtimeResourceInventoryHash: 'i'.repeat(43),
 		authorizationEpoch: 7,
+		resultingAuthorizationEpoch: 8,
 		upgradeEpoch: 1,
 		...overrides,
 	};
@@ -157,7 +158,11 @@ test('a verified upgrade swaps every replica through the existing redeploy primi
 	assert.equal(call!.body.mcpV3Binding.imageDigest, `sha256:${'f'.repeat(64)}`);
 	// Everything about permissions/resources travels UNCHANGED (D1) — not renegotiated here.
 	assert.equal(call!.body.mcpV3Binding.approvalReceiptHash, 'b'.repeat(43));
-	assert.equal(call!.body.mcpV3Binding.authorizationEpoch, 7);
+	// The container is labelled with the epoch it will have to attest with AFTER
+	// the swap (8), not the one being retired (7). Labelling the retired epoch is
+	// what left every upgraded runtime permanently unpairable against a Hub that
+	// had already rotated to 8.
+	assert.equal(call!.body.mcpV3Binding.authorizationEpoch, 8);
 	assert.equal(call!.body.mcpV3Binding.resourceManifestHash, 'r'.repeat(43));
 	assert.equal(call!.body.runtimeResourceInventoryHash, 'i'.repeat(43));
 
@@ -169,6 +174,11 @@ test('a verified upgrade swaps every replica through the existing redeploy primi
 	assert.equal(result.app.mcpAppliedRevision, 1);
 	assert.equal(result.app.mcpAppliedUpgradeEpoch, 1);
 	assert.equal(result.app.mcpLastSwapStrategy, 'STOP_THEN_CREATE');
+	// The stored epoch moves with the labels. It is what the NEXT upgrade's
+	// affinity check compares against and what hub-facing dispatch hands back as
+	// `runtimeGrantEpoch`; leaving it on 7 would desynchronize both from the
+	// container that is now attesting 8.
+	assert.equal(result.app.mcpAuthorizationEpoch, 8);
 });
 
 test('the rolling strategy the agent reports is threaded through untouched', async () => {

@@ -741,7 +741,17 @@ export class DeploymentService {
 				app.mcpAppId !== command.mcpAppId ||
 				app.resourceManifestHash !== command.resourceManifestHash ||
 				app.runtimeResourceInventoryHash !== command.runtimeResourceInventoryHash ||
-				app.mcpAuthorizationEpoch !== command.authorizationEpoch
+				// Either side of THIS command's own rotation, and nothing else.
+				// Before it applies, the stored epoch is the one the command names
+				// as current; once it has applied, the stored epoch has moved to
+				// the value the same signed command names as its result. Accepting
+				// only the former would turn every replay — and the Hub
+				// re-dispatches on retry — into an affinity mismatch instead of
+				// reaching the idempotent no-op the epoch guard below provides.
+				// Both values are bound into the signed command, so this widens
+				// nothing an attacker controls.
+				(app.mcpAuthorizationEpoch !== command.authorizationEpoch &&
+					app.mcpAuthorizationEpoch !== command.resultingAuthorizationEpoch)
 			) throw new McpProtocolV3Error('GENERATION_AFFINITY_MISMATCH');
 
 			// No revision applied yet (a fresh install) reads as 0. The Hub's own
@@ -821,7 +831,11 @@ export class DeploymentService {
 					imageDigest: digest,
 					manifestDigest,
 					approvalReceiptHash,
-					authorizationEpoch: command.authorizationEpoch,
+					// The POST-swap epoch. The container attests with whatever is
+					// labelled here, and the Hub rotates its own copy at cutover, so
+					// labelling the retired epoch is what made every upgraded runtime
+					// unpairable until 2026-08-08.
+					authorizationEpoch: command.resultingAuthorizationEpoch,
 					deploymentGrantHash,
 					resourceManifestHash: command.resourceManifestHash,
 				},
@@ -890,6 +904,12 @@ export class DeploymentService {
 							mcpPreviousImageDigest: command.previousImageDigest,
 							mcpAppliedRevision: command.revision,
 							mcpAppliedUpgradeEpoch: command.upgradeEpoch,
+							// Move the stored epoch with the labels. Leaving it behind
+							// would make the NEXT upgrade's affinity check compare
+							// against a value the Hub has already retired, and it is
+							// also what `hub-facing-routes` hands the runtime back as
+							// `runtimeGrantEpoch`.
+							mcpAuthorizationEpoch: command.resultingAuthorizationEpoch,
 							mcpLastSwapStrategy: swapStrategy,
 							updatedAt: appliedAt,
 							'replicas.$[].state': 'running',
