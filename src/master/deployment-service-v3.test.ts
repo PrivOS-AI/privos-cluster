@@ -336,3 +336,39 @@ test('reinstalling over the tombstone of a previous install revives it instead o
 	assert.equal(state.apps[0]!.mcpDeploymentId, 'deployment-1');
 	assert.equal(state.apps[0]!.mcpGenerationId, deploymentGrant.generationId);
 });
+
+test('a duplicate-key collision with no REMOVED row and no live match reports a bounded code and the install correlation id — never the raw Mongo message', async () => {
+	const state = fixture();
+	const deploymentGrant = grant();
+	const deploymentGrantHash = 'g'.repeat(43);
+
+	// Same appId collides on the unique index, but the existing row is neither a REMOVED
+	// tombstone to revive (so `replaceOne` cannot match) nor a live row for THIS deployment
+	// (`mcpDeploymentId` differs, so the `concurrent` lookup also misses). This is the shape
+	// the 135008 incident exposed once the two known cases were resolved: the E11000 itself is
+	// the only evidence, and its raw driver message must never cross the Cluster→Hub boundary.
+	state.apps.push({
+		appId: deploymentGrant.deployment.clusterAppId,
+		workspaceId: 'workspace-1',
+		kind: 'mcp-v3',
+		state: 'RUNNING',
+		replicas: [],
+		mcpDeploymentId: 'deployment-unrelated',
+		mcpGenerationNumber: 1,
+	} as unknown as MasterApp);
+
+	await assert.rejects(
+		state.service.deployMcpV3('workspace-1', deploymentGrant, deploymentGrantHash, state.hubIdentity),
+		(error: unknown) => {
+			assert.ok(error instanceof Error);
+			assert.equal(error.message, 'duplicate_app_row');
+			assert.equal((error as { code?: unknown }).code, 'duplicate_app_row');
+			assert.equal((error as { correlationId?: unknown }).correlationId, deploymentGrant.generationId);
+			assert.ok((error as { cause?: unknown }).cause instanceof Error, 'original Mongo error kept as cause for local logs only');
+			return true;
+		},
+	);
+	// The unresolved collision must not silently proceed to a second row.
+	assert.equal(state.apps.length, 1);
+	assert.equal(state.apps[0]!.mcpDeploymentId, 'deployment-unrelated');
+});

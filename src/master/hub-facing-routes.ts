@@ -100,6 +100,24 @@ function sendAgent(reply: FastifyReply, response: AgentResponse) {
 	return reply.code(response.status).send(response.body);
 }
 
+/**
+ * Tag an error escaping straight to the global handler with the route's own
+ * per-verb correlation id (`generationId` on install, `operationId` on a
+ * signed lifecycle command), so `masterErrorResponse` can echo it even when
+ * the failure was never classified with a `code` at its throw site. Never
+ * overwrites an id a deeper layer already attached.
+ */
+async function withCorrelationId<T>(op: Promise<T>, correlationId: string): Promise<T> {
+	try {
+		return await op;
+	} catch (error) {
+		if (error && typeof error === 'object' && !('correlationId' in error)) {
+			(error as { correlationId?: string }).correlationId = correlationId;
+		}
+		throw error;
+	}
+}
+
 export function hubFacingRoutes(deps: {
 	auth: WorkspaceAuth;
 	deployment: DeploymentService;
@@ -580,11 +598,14 @@ export function hubFacingRoutes(deps: {
 			});
 			const hubIdentity = await deps.mcpSecurity.publicInfo(workspaceId(req));
 			if (!hubIdentity) return reply.code(409).send({ error: 'hub_identity_not_enrolled' });
-			const { app, inventory } = await deps.deployment.deployMcpV3(
-				workspaceId(req),
-				grant,
-				sha256Base64Url(body.data.deploymentGrantJws),
-				hubIdentity,
+			const { app, inventory } = await withCorrelationId(
+				deps.deployment.deployMcpV3(
+					workspaceId(req),
+					grant,
+					sha256Base64Url(body.data.deploymentGrantJws),
+					hubIdentity,
+				),
+				grant.generationId,
 			);
 			const attestation = await deps.clusterMasterIdentity.signRuntimeInventoryAttestation({
 				deploymentGrantJti: grant.jti,
@@ -990,11 +1011,14 @@ export function hubFacingRoutes(deps: {
 					code: clusterMcpSafeReason(error, 'lifecycle_command_invalid'),
 				});
 			}
-			const result = await deps.mcpUninstall.uninstall({
-				workspaceId: workspaceId(req),
-				command,
-				commandHash: sha256Base64Url(body.data.lifecycleCommandJws),
-			});
+			const result = await withCorrelationId(
+				deps.mcpUninstall.uninstall({
+					workspaceId: workspaceId(req),
+					command,
+					commandHash: sha256Base64Url(body.data.lifecycleCommandJws),
+				}),
+				command.operationId,
+			);
 			return reply.code(result.state === 'COMPLETED' ? 200 : 409).send(result);
 		});
 

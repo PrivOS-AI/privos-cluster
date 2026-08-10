@@ -20,26 +20,72 @@ import { McpSecurityVerifier } from './mcp-security.js';
 import { ClusterMasterIdentity } from './cluster-master-identity.js';
 import { McpUninstallServiceV3 } from './mcp-uninstall-service-v3.js';
 
+/** `body.error` is a wire contract: bounded, upper-snake, never the raw text underneath. */
+const BOUNDED_ERROR_CODE = /^[A-Z][A-Z0-9_]{0,127}$/;
+/** Matches the ids already threaded end to end: `operationId` and `generationId`. */
+const CORRELATION_ID = /^[A-Za-z0-9_-]{1,64}$/;
+const FALLBACK_ERROR_CODE = 'INTERNAL_ERROR';
+
+/**
+ * The reason token this service throws is lowercase snake_case (e.g. `duplicate_app_row`,
+ * `mcp_node_identity_unavailable`) — the same convention `clusterMcpSafeReason` uppercases
+ * before it reaches a signed acknowledgement.
+ *
+ * It arrives in one of TWO places, which is why both are candidates: a tagged error carries
+ * it on `code`, but most of this service's throw sites carry no `code` at all and use the
+ * token AS the message (`throw new Error('mcp_node_identity_unavailable')`). Reading only
+ * `code` would collapse every one of those to the fallback and strip the Hub of a reason it
+ * already consumes and classifies.
+ *
+ * Candidates are MATCHED, never rewritten — the repo's own `safeCode` works the same way.
+ * Rewriting would let free text masquerade as a code: `"Some error happened"` would become
+ * `SOME_ERROR_HAPPENED`. Requiring the token shape up front is what keeps raw text out —
+ * a Mongo `E11000 duplicate key error collection: …` or `connect ECONNREFUSED 10.88.0.11:5000`
+ * contains spaces, dots and colons, fails the pattern, and falls through to the fallback.
+ * Mongo's own `code` is a NUMBER (11000), so it is never a string candidate either.
+ */
+const RAW_REASON_CODE = /^[a-z][a-z0-9_]{1,127}$/;
+function boundedErrorCode(code: unknown, message?: unknown): string | undefined {
+	const candidate = [code, message].find(
+		(value): value is string => typeof value === 'string' && RAW_REASON_CODE.test(value.toLowerCase()),
+	);
+	return candidate ? candidate.toUpperCase() : undefined;
+}
+
 /**
  * Turn a thrown value into the status and body the Hub sees.
  *
- * `code` is a string only for this service's own tagged errors. Mongo reports a NUMBER — 11000
- * for a duplicate key — so reading it as a string made the checks below throw inside the error
- * handler itself, and the caller received an opaque 500 carrying that TypeError instead of the
- * real cause. Every Mongo failure was reported that way, which is how a duplicate-key collision
- * reached the Hub with nothing it could map.
+ * `error` is ALWAYS a bounded code, never raw exception text — that is the behavioural
+ * change. Before this, an untagged error fell back to `message` verbatim (`code ?? message`),
+ * which is exactly how a Mongo E11000 (whose `code` is a NUMBER, not a string) reached the Hub
+ * as an opaque wall of driver text and surfaced only as a bare `AUTO_FINALIZATION_FAILED`.
+ * `message` keeps the raw text on purpose — it crosses only to the Hub's logs, truncated, and
+ * is never forwarded past it; sanitizing it away here would throw out the one diagnostic payload
+ * this response carries.
+ *
+ * `correlationId` is passthrough only: a failure class tagged with one at its throw site
+ * (deployment-service's typed errors, or a route's `withCorrelationId` wrapper) echoes it here
+ * so the Cluster's own log line — and anyone reading this response — can grep the same id the
+ * Hub and Portal already have. An untagged error carries none.
  */
 export function masterErrorResponse(error: unknown): {
 	statusCode: number;
-	body: { error: string; message: string };
+	body: { error: string; message: string; correlationId?: string };
 } {
-	const typed = error as { code?: unknown; statusCode?: number; message?: string };
-	const code = typeof typed.code === 'string' ? typed.code : undefined;
+	const typed = error as { code?: unknown; statusCode?: number; message?: string; correlationId?: unknown };
+	const code = boundedErrorCode(typed.code, typed.message);
 	const message = typed.message ?? 'internal error';
+	const correlationId =
+		typeof typed.correlationId === 'string' && CORRELATION_ID.test(typed.correlationId)
+			? typed.correlationId
+			: undefined;
 	const statusCode =
 		typed.statusCode ??
 		(code?.includes('QUOTA') || code?.includes('CAPACITY') || code?.startsWith('HA_') ? 409 : 500);
-	return { statusCode, body: { error: code ?? message, message } };
+	return {
+		statusCode,
+		body: { error: code ?? FALLBACK_ERROR_CODE, message, ...(correlationId ? { correlationId } : {}) },
+	};
 }
 
 export function buildMasterServer(config: MasterConfig, repositories: MasterRepositories) {
@@ -106,8 +152,10 @@ export function buildMasterServer(config: MasterConfig, repositories: MasterRepo
 		usage,
 	}));
 	fastify.setErrorHandler((error, req, reply) => {
-		req.log.error({ err: error }, 'apps master request failed');
 		const { statusCode, body } = masterErrorResponse(error);
+		// `body.correlationId` is already the safe, extracted value (undefined when the
+		// failure was never tagged) — log the same one the Hub sees, not the raw error.
+		req.log.error({ err: error, correlationId: body.correlationId }, 'apps master request failed');
 		return reply.code(statusCode).send(body);
 	});
 	return fastify;

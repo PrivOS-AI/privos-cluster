@@ -308,7 +308,19 @@ export class DeploymentService {
 							mcpDeploymentId: grant.deploymentId,
 							state: { $ne: 'REMOVED' },
 						});
-						if (!concurrent) throw error;
+						if (!concurrent) {
+							// Neither a REMOVED tombstone to revive nor a live row explaining the
+							// collision — the E11000 itself is the only evidence, and its raw driver
+							// message must never reach the Hub (it can name another tenant's appId).
+							// Tag a stable code + the install's own correlation id so the failure is a
+							// one-log-line diagnosis instead of a three-layer excavation (135008); the
+							// original error is kept only as `cause`, for this service's own logs.
+							throw Object.assign(new Error('duplicate_app_row'), {
+								code: 'duplicate_app_row',
+								correlationId: grant.generationId,
+								cause: error,
+							});
+						}
 						this.assertMcpV3AppAffinity(concurrent, grant, deploymentGrantHash);
 						app = concurrent;
 					}
