@@ -20,6 +20,28 @@ import { McpSecurityVerifier } from './mcp-security.js';
 import { ClusterMasterIdentity } from './cluster-master-identity.js';
 import { McpUninstallServiceV3 } from './mcp-uninstall-service-v3.js';
 
+/**
+ * Turn a thrown value into the status and body the Hub sees.
+ *
+ * `code` is a string only for this service's own tagged errors. Mongo reports a NUMBER — 11000
+ * for a duplicate key — so reading it as a string made the checks below throw inside the error
+ * handler itself, and the caller received an opaque 500 carrying that TypeError instead of the
+ * real cause. Every Mongo failure was reported that way, which is how a duplicate-key collision
+ * reached the Hub with nothing it could map.
+ */
+export function masterErrorResponse(error: unknown): {
+	statusCode: number;
+	body: { error: string; message: string };
+} {
+	const typed = error as { code?: unknown; statusCode?: number; message?: string };
+	const code = typeof typed.code === 'string' ? typed.code : undefined;
+	const message = typed.message ?? 'internal error';
+	const statusCode =
+		typed.statusCode ??
+		(code?.includes('QUOTA') || code?.includes('CAPACITY') || code?.startsWith('HA_') ? 409 : 500);
+	return { statusCode, body: { error: code ?? message, message } };
+}
+
 export function buildMasterServer(config: MasterConfig, repositories: MasterRepositories) {
 	const fastify = Fastify({ logger: { level: config.MASTER_LOG_LEVEL }, trustProxy: true });
 	const cipher = new KeyCipher(Buffer.from(config.APP_MASTER_KEY_ENCRYPTION_KEY_B64, 'base64'));
@@ -85,12 +107,8 @@ export function buildMasterServer(config: MasterConfig, repositories: MasterRepo
 	}));
 	fastify.setErrorHandler((error, req, reply) => {
 		req.log.error({ err: error }, 'apps master request failed');
-		const typed = error as { code?: string; statusCode?: number; message?: string };
-		const code = typed.code;
-		const message = typed.message ?? 'internal error';
-		const statusCode = typed.statusCode ??
-			(code?.includes('QUOTA') || code?.includes('CAPACITY') || code?.startsWith('HA_') ? 409 : 500);
-		return reply.code(statusCode).send({ error: code ?? message, message });
+		const { statusCode, body } = masterErrorResponse(error);
+		return reply.code(statusCode).send(body);
 	});
 	return fastify;
 }

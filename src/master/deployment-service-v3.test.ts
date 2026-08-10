@@ -79,6 +79,12 @@ function fixture() {
 			if (update.$push?.replicas) row.replicas.push(clone(update.$push.replicas));
 			return { matchedCount: 1 };
 		},
+		replaceOne: async (filter: Record<string, unknown>, replacement: MasterApp) => {
+			const index = apps.findIndex((candidate) => matches(candidate as unknown as Record<string, unknown>, filter));
+			if (index === -1) return { matchedCount: 0 };
+			apps[index] = clone(replacement);
+			return { matchedCount: 1 };
+		},
 	};
 	const inventoryCollection = {
 		findOne: async (filter: Record<string, unknown>) => clone(inventories.find((row) => matches(row as unknown as Record<string, unknown>, filter)) ?? null),
@@ -297,4 +303,36 @@ test('v3 provisioning persists exact partial resources, resumes deterministicall
 	});
 	assert.equal(identicalActivation.state, 'RUNNING');
 	assert.equal(state.ingressCalls, 1);
+});
+
+test('reinstalling over the tombstone of a previous install revives it instead of failing', async () => {
+	const state = fixture();
+	const deploymentGrant = grant();
+	const deploymentGrantHash = 'g'.repeat(43);
+
+	// What a previous install leaves behind: uninstall keeps the row at REMOVED, and the Portal
+	// hands out the same clusterAppId again because it reuses one deployment-app slot per
+	// (listing, deployment). Before the revive, insertOne hit the unique appId index and the
+	// duplicate-key branch only looked for a live row, so the reinstall died as a bare 500.
+	state.apps.push({
+		appId: deploymentGrant.deployment.clusterAppId,
+		workspaceId: 'workspace-1',
+		kind: 'mcp-v3',
+		state: 'REMOVED',
+		replicas: [],
+		mcpDeploymentId: 'deployment-0',
+		mcpGenerationNumber: 1,
+	} as unknown as MasterApp);
+
+	await assert.rejects(
+		state.service.deployMcpV3('workspace-1', deploymentGrant, deploymentGrantHash, state.hubIdentity),
+		/agent MCP v3 deploy failed/,
+	);
+
+	// One row, revived in place — the slot identity is stable, so a second row would be wrong.
+	assert.equal(state.apps.length, 1);
+	assert.equal(state.apps[0]!.appId, deploymentGrant.deployment.clusterAppId);
+	assert.equal(state.apps[0]!.state, 'PROVISIONING');
+	assert.equal(state.apps[0]!.mcpDeploymentId, 'deployment-1');
+	assert.equal(state.apps[0]!.mcpGenerationId, deploymentGrant.generationId);
 });

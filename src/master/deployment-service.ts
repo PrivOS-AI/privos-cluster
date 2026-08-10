@@ -290,15 +290,28 @@ export class DeploymentService {
 					await this.deps.repositories.apps.insertOne(app);
 				} catch (error: unknown) {
 					if ((error as { code?: number }).code !== 11000) throw error;
-					const concurrent = await this.deps.repositories.apps.findOne({
-						workspaceId,
-						kind: 'mcp-v3',
-						mcpDeploymentId: grant.deploymentId,
-						state: { $ne: 'REMOVED' },
-					});
-					if (!concurrent) throw error;
-					this.assertMcpV3AppAffinity(concurrent, grant, deploymentGrantHash);
-					app = concurrent;
+					// Uninstall retains the row at REMOVED, and the Portal reuses one
+					// `deploymentAppId` per (listing, deployment) slot — so the appId of a
+					// reinstall always equals that of the removed install and collides on the
+					// unique index. Revive the tombstone in place: the slot identity is meant to
+					// be stable, so a second row for it would be wrong. Scoped to REMOVED, which
+					// makes it a no-op against a live row and leaves the concurrent-install
+					// branch below to handle that case.
+					const revived = await this.deps.repositories.apps.replaceOne(
+						{ appId: app.appId, state: 'REMOVED' },
+						app,
+					);
+					if (revived.matchedCount !== 1) {
+						const concurrent = await this.deps.repositories.apps.findOne({
+							workspaceId,
+							kind: 'mcp-v3',
+							mcpDeploymentId: grant.deploymentId,
+							state: { $ne: 'REMOVED' },
+						});
+						if (!concurrent) throw error;
+						this.assertMcpV3AppAffinity(concurrent, grant, deploymentGrantHash);
+						app = concurrent;
+					}
 				}
 			}
 			if (!app) throw new Error('mcp_v3_app_persistence_failed');
