@@ -297,9 +297,15 @@ export class DeploymentService {
 					// be stable, so a second row for it would be wrong. Scoped to REMOVED, which
 					// makes it a no-op against a live row and leaves the concurrent-install
 					// branch below to handle that case.
+					// WITHOUT the `_id` the failed insert stamped onto this very object:
+					// the driver assigns `_id` in place, so passing `app` straight back as a
+					// replacement asks Mongo to change the matched tombstone's immutable
+					// `_id` — error 66, a 500 to the Hub, and an install stranded at
+					// PROVISIONING. Every reinstall-after-uninstall hit it.
+					const { _id: _insertStampedId, ...replacement } = app as MasterApp & { _id?: unknown };
 					const revived = await this.deps.repositories.apps.replaceOne(
 						{ appId: app.appId, state: 'REMOVED' },
-						app,
+						replacement as MasterApp,
 					);
 					if (revived.matchedCount !== 1) {
 						const concurrent = await this.deps.repositories.apps.findOne({

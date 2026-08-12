@@ -67,7 +67,13 @@ function fixture() {
 		find: (filter: Record<string, unknown>) => ({
 			toArray: async () => clone(apps.filter((row) => matches(row as unknown as Record<string, unknown>, filter))),
 		}),
-		insertOne: async (row: MasterApp) => {
+		insertOne: async (row: MasterApp & { _id?: unknown }) => {
+			// The real driver stamps `_id` onto the caller's own object BEFORE it can
+			// fail — including on a duplicate key. Reproduced here because a fake that
+			// leaves the document untouched hid a live 500: the duplicate-key branch
+			// below reused the same object as a replacement and asked Mongo to change
+			// an immutable `_id`.
+			row._id = row._id ?? `oid-${apps.length + 1}`;
 			if (apps.some((candidate) => candidate.appId === row.appId)) throw Object.assign(new Error('duplicate'), { code: 11000 });
 			apps.push(clone(row));
 			return { acknowledged: true };
@@ -79,10 +85,16 @@ function fixture() {
 			if (update.$push?.replicas) row.replicas.push(clone(update.$push.replicas));
 			return { matchedCount: 1 };
 		},
-		replaceOne: async (filter: Record<string, unknown>, replacement: MasterApp) => {
+		replaceOne: async (filter: Record<string, unknown>, replacement: MasterApp & { _id?: unknown }) => {
 			const index = apps.findIndex((candidate) => matches(candidate as unknown as Record<string, unknown>, filter));
 			if (index === -1) return { matchedCount: 0 };
-			apps[index] = clone(replacement);
+			// Mongo refuses a replacement that carries a different `_id` than the
+			// document it matched (error 66), and the master surfaces that as a 500.
+			const existingId = (apps[index] as MasterApp & { _id?: unknown })._id;
+			if (replacement._id !== undefined && existingId !== undefined && replacement._id !== existingId) {
+				throw Object.assign(new Error("After applying the update, the (immutable) field '_id' was found to have been altered"), { code: 66 });
+			}
+			apps[index] = clone({ ...replacement, ...(existingId === undefined ? {} : { _id: existingId }) });
 			return { matchedCount: 1 };
 		},
 	};
@@ -315,6 +327,10 @@ test('reinstalling over the tombstone of a previous install revives it instead o
 	// (listing, deployment). Before the revive, insertOne hit the unique appId index and the
 	// duplicate-key branch only looked for a live row, so the reinstall died as a bare 500.
 	state.apps.push({
+		// A row that has been through Mongo carries an `_id`, and that is the whole
+		// point of this case: the failed insert stamps a DIFFERENT `_id` onto the
+		// replacement, which Mongo rejects as an immutable-field change.
+		_id: 'oid-tombstone',
 		appId: deploymentGrant.deployment.clusterAppId,
 		workspaceId: 'workspace-1',
 		kind: 'mcp-v3',
