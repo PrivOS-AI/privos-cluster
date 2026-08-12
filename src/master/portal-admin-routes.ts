@@ -94,7 +94,9 @@ export function portalAdminRoutes(deps: {
 				workspaceId,
 				state: { $ne: 'REMOVED' },
 			}).toArray();
-			for (const app of apps) await deps.lifecycle.remove(workspaceId, app.appId);
+			// Revocation is Portal-owned: the tenant, its Hub and every app go together, so
+			// v3 apps are removed here without the signed Hub command they need in life.
+			for (const app of apps) await deps.lifecycle.remove(workspaceId, app.appId, { workspaceRevoked: true });
 			await deps.workspaces.revoke(workspaceId);
 			req.log.info({ workspaceId }, 'apps master workspace revoked');
 			return { ok: true };

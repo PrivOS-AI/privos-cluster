@@ -157,3 +157,51 @@ test('a workspace with nothing to move is a no-op, not an error', async () => {
 	assert.equal(result.affected, 0);
 	assert.deepEqual(state.calls, []);
 });
+
+/**
+ * Workspace revocation has to reach v3 apps for the same reason power does: the Hub whose
+ * signature the rule demands is being destroyed with the workspace. Until this existed, a
+ * tenant that had ever installed a v3 app could not be offboarded at all — the Portal's
+ * revoke returned 409 and the tenant's stack, buckets and secrets outlived the account.
+ */
+test('workspace revocation removes a v3 app without a signed Hub command', async () => {
+	const revokedApp: MasterApp = {
+		...mcpApp,
+		kind: 'mcp-v3',
+		protocolVersion: 3,
+		mcpInstallationId: undefined,
+		mcpRuntimeInstallationId: 'runtime-1',
+		replicas: [{
+			replicaId: '11111111-1111-4111-8111-111111111111',
+			nodeId: 'node-1',
+			containerId: '22222222-2222-4222-8222-222222222222',
+			state: 'running',
+		}],
+	};
+	const states: string[] = [];
+	const removedContainers: string[] = [];
+	const lifecycle = new AppLifecycleService({
+		repositories: {
+			apps: {
+				findOne: async () => revokedApp,
+				updateOne: async (_filter: unknown, update: { $set: { state: string } }) => {
+					states.push(update.$set.state);
+				},
+			},
+			nodes: { find: () => ({ toArray: async () => [{ nodeId: 'node-1', address: 'https://node-1.internal' }] }) },
+			lifecycleEvents: { insertMany: async () => undefined },
+		} as never,
+		agentClient: {
+			request: async (_node: unknown, _workspaceId: string, _method: string, path: string) => {
+				removedContainers.push(path);
+				return { status: 200, body: {} };
+			},
+		} as never,
+		ingress: { remove: async () => undefined } as never,
+	});
+
+	await lifecycle.remove('workspace-1', 'cluster-app-1', { workspaceRevoked: true });
+
+	assert.deepEqual(states, ['REMOVING', 'REMOVED']);
+	assert.equal(removedContainers.length, 1);
+});

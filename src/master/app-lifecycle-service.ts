@@ -226,9 +226,18 @@ export class AppLifecycleService {
 		);
 	}
 
-	async remove(workspaceId: string, appId: string): Promise<void> {
+	/**
+	 * `workspaceRevoked` is the one caller allowed past the signed-command rule. That rule
+	 * exists so an app cannot be torn out from under a live Hub without the Hub's own signed
+	 * lifecycle command — but when the workspace itself is being revoked, the Hub is being
+	 * destroyed with it and there is nobody left to sign. Without this the Portal could never
+	 * delete a tenant that had ever installed a v3 app: every offboard failed 409 and the
+	 * tenant's stack, buckets and secrets stayed alive forever. Same reasoning as the
+	 * workspace power route above, which is likewise Portal-owned.
+	 */
+	async remove(workspaceId: string, appId: string, options: { workspaceRevoked?: boolean } = {}): Promise<void> {
 		const app = await this.load(workspaceId, appId);
-		if (app.kind === 'mcp-v3') {
+		if (app.kind === 'mcp-v3' && !options.workspaceRevoked) {
 			throw Object.assign(new Error('MCP v3 removal requires a signed Hub lifecycle command'), {
 				code: 'MCP_SIGNED_LIFECYCLE_REQUIRED',
 				statusCode: 409,
