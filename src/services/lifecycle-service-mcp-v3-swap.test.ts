@@ -330,6 +330,12 @@ test('redeployContainer pre-pulls the previous image before the old container is
 	Object.assign(oldInspect.Config.Labels, mcpLabels, {
 		'privos.mcp.image.digest': previousDigest,
 		'privos.mcp.manifest.digest': previousDigest,
+		// The container being replaced carries the PRE-swap attestation: the master sends the
+		// post-swap epoch by design, so a fixture that labels the old container with the new
+		// epoch cannot fail the way production does — and did, on every epoch-rotating upgrade.
+		'privos.mcp.authorization-epoch': '6',
+		'privos.mcp.approval-receipt': 'a'.repeat(43),
+		'privos.mcp.deployment-grant-hash': 'f'.repeat(43),
 		'privos.env.secret-keys': '[]',
 		// Must match the tiny local health server below, or waitForHealthy spends
 		// its full 30s timeout probing a port nothing listens on.

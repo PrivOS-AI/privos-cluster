@@ -646,10 +646,21 @@ async function assertRawRedeployAllowed(
 }
 
 /**
- * Everything an upgrade must find UNCHANGED on the container it is about to
- * replace, checked against the OLD container's own labels before anything is
- * pulled or torn down. Image and manifest digest are deliberately excluded —
- * those are the one thing this call is allowed to move (D1).
+ * The container an upgrade is about to replace must be *the same container* the master
+ * named. Checked against the OLD container's own labels before anything is pulled or torn
+ * down, so a redeploy can never land on a neighbour.
+ *
+ * Only IDENTITY is a precondition. The binding also carries what the upgrade is about to
+ * WRITE — image and manifest digest (D1), and the post-swap attestation values: the
+ * authorization epoch, the approval receipt, the deployment grant and the resource-manifest
+ * hash. Those describe the new container, not the old one, so comparing them here refuses
+ * exactly the upgrades that change anything.
+ *
+ * That is not hypothetical. Since the master began sending the POST-swap epoch (the
+ * 2026-08-08 fix that made upgraded runtimes pairable at all), every upgrade that rotated
+ * the epoch hit `mcp_v3_upgrade_binding_mismatch` on the old container's epoch label — the
+ * agent comparing 1 against the 2 it was about to write. The Hub verifies those values where
+ * they belong: in the new runtime's own attestation at cutover.
  */
 function assertMcpV3UpgradeAffinity(
 	labels: Record<string, string>,
@@ -668,10 +679,6 @@ function assertMcpV3UpgradeAffinity(
 		'privos.mcp.runtime-installation': binding.runtimeInstallationId,
 		'privos.mcp.app': binding.mcpAppId,
 		'privos.mcp.replica': binding.replicaId,
-		'privos.mcp.resource-manifest-hash': binding.resourceManifestHash,
-		'privos.mcp.approval-receipt': binding.approvalReceiptHash,
-		'privos.mcp.authorization-epoch': String(binding.authorizationEpoch),
-		'privos.mcp.deployment-grant-hash': binding.deploymentGrantHash,
 	};
 	if (Object.entries(expected).some(([key, value]) => labels[key] !== value)) {
 		throw new Error('mcp_v3_upgrade_binding_mismatch');
