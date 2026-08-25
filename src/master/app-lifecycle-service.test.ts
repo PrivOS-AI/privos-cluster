@@ -164,7 +164,7 @@ test('a workspace with nothing to move is a no-op, not an error', async () => {
  * tenant that had ever installed a v3 app could not be offboarded at all — the Portal's
  * revoke returned 409 and the tenant's stack, buckets and secrets outlived the account.
  */
-test('workspace revocation removes a v3 app without a signed Hub command', async () => {
+test('workspace revocation QUARANTINES a v3 app (stops + retains, does not destroy)', async () => {
 	const revokedApp: MasterApp = {
 		...mcpApp,
 		kind: 'mcp-v3',
@@ -178,14 +178,15 @@ test('workspace revocation removes a v3 app without a signed Hub command', async
 			state: 'running',
 		}],
 	};
-	const states: string[] = [];
-	const removedContainers: string[] = [];
+	const sets: Array<Record<string, unknown>> = [];
+	const paths: string[] = [];
+	let ingressRemoved = false;
 	const lifecycle = new AppLifecycleService({
 		repositories: {
 			apps: {
 				findOne: async () => revokedApp,
-				updateOne: async (_filter: unknown, update: { $set: { state: string } }) => {
-					states.push(update.$set.state);
+				updateOne: async (_filter: unknown, update: { $set: Record<string, unknown> }) => {
+					sets.push(update.$set);
 				},
 			},
 			nodes: { find: () => ({ toArray: async () => [{ nodeId: 'node-1', address: 'https://node-1.internal' }] }) },
@@ -193,15 +194,104 @@ test('workspace revocation removes a v3 app without a signed Hub command', async
 		} as never,
 		agentClient: {
 			request: async (_node: unknown, _workspaceId: string, _method: string, path: string) => {
-				removedContainers.push(path);
+				paths.push(path);
 				return { status: 200, body: {} };
 			},
 		} as never,
-		ingress: { remove: async () => undefined } as never,
+		ingress: { remove: async () => { ingressRemoved = true; } } as never,
 	});
 
 	await lifecycle.remove('workspace-1', 'cluster-app-1', { workspaceRevoked: true });
 
-	assert.deepEqual(states, ['REMOVING', 'REMOVED']);
-	assert.equal(removedContainers.length, 1);
+	// Quarantine, not destroy: state QUARANTINED with the grace clock started,
+	// the container STOPPED (not deleted), and ingress left intact.
+	assert.deepEqual(sets.map((s) => s.state), ['QUARANTINED']);
+	assert.ok(sets[0].quarantinedAt instanceof Date);
+	assert.equal(paths.length, 1);
+	assert.match(paths[0], /\/stop$/);
+	assert.equal(ingressRemoved, false);
+});
+
+test('the reaper destroys a quarantined app; un-quarantine restarts it', async () => {
+	const quarantinedApp: MasterApp = {
+		...mcpApp,
+		kind: 'mcp-v3',
+		protocolVersion: 3,
+		state: 'QUARANTINED',
+		quarantinedAt: new Date('2026-08-01T00:00:00Z'),
+		replicas: [{ replicaId: '11111111-1111-4111-8111-111111111111', nodeId: 'node-1', containerId: 'c-1', state: 'stopped' }],
+	} as MasterApp;
+	const makeLifecycle = (opts: { nodeGone?: boolean; deleteStatus?: number } = {}) => {
+		const sets: Array<Record<string, unknown>> = [];
+		const unsets: Array<Record<string, unknown>> = [];
+		const paths: string[] = [];
+		let ingressRemoved = false;
+		const lifecycle = new AppLifecycleService({
+			repositories: {
+				apps: {
+					findOne: async () => quarantinedApp,
+					// Atomic claim: the QUARANTINED-guarded updateOne "wins" (modifiedCount 1).
+					updateOne: async (_f: unknown, update: { $set?: Record<string, unknown>; $unset?: Record<string, unknown> }) => {
+						if (update.$set) sets.push(update.$set);
+						if (update.$unset) unsets.push(update.$unset);
+						return { modifiedCount: 1 };
+					},
+				},
+				nodes: { find: () => ({ toArray: async () => (opts.nodeGone ? [] : [{ nodeId: 'node-1', address: 'https://node-1.internal' }]) }) },
+				lifecycleEvents: { insertMany: async () => undefined },
+			} as never,
+			agentClient: { request: async (_n: unknown, _w: string, _m: string, path: string) => { paths.push(path); return { status: opts.deleteStatus ?? 200, body: {} }; } } as never,
+			ingress: { remove: async () => { ingressRemoved = true; } } as never,
+		});
+		return { lifecycle, sets, unsets, paths, ingressRemoved: () => ingressRemoved };
+	};
+
+	// Reap → full destroy (ends REMOVED, DELETEs the container).
+	const reap = makeLifecycle();
+	await reap.lifecycle.reapQuarantined('workspace-1', 'cluster-app-1');
+	assert.ok(reap.sets.some((s) => s.state === 'REMOVED'));
+	assert.equal(reap.paths.filter((p) => !/\/(stop|start)$/.test(p)).length, 1); // one DELETE
+
+	// H1: reap tolerates a gone node — still reaches REMOVED + frees ingress, no DELETE call.
+	const reapGone = makeLifecycle({ nodeGone: true });
+	await reapGone.lifecycle.reapQuarantined('workspace-1', 'cluster-app-1');
+	assert.ok(reapGone.sets.some((s) => s.state === 'REMOVED'));
+	assert.equal(reapGone.ingressRemoved(), true);
+	assert.equal(reapGone.paths.length, 0);
+
+	// H1: reap tolerates an already-absent container (DELETE 404) — still REMOVED.
+	const reap404 = makeLifecycle({ deleteStatus: 404 });
+	await reap404.lifecycle.reapQuarantined('workspace-1', 'cluster-app-1');
+	assert.ok(reap404.sets.some((s) => s.state === 'REMOVED'));
+
+	// Un-quarantine → RUNNING, quarantinedAt cleared, container started.
+	const un = makeLifecycle();
+	await un.lifecycle.unquarantine('workspace-1', 'cluster-app-1');
+	assert.deepEqual(un.sets.map((s) => s.state), ['RUNNING']);
+	assert.ok(un.unsets.some((u) => 'quarantinedAt' in u));
+	assert.match(un.paths[0], /\/start$/);
+});
+
+test('H2: re-revoking an already-QUARANTINED app is a no-op (grace clock preserved)', async () => {
+	const already: MasterApp = {
+		...mcpApp,
+		kind: 'mcp-v3',
+		state: 'QUARANTINED',
+		quarantinedAt: new Date('2026-08-01T00:00:00Z'),
+		replicas: [{ replicaId: 'r', nodeId: 'node-1', containerId: 'c', state: 'stopped' }],
+	} as MasterApp;
+	let writes = 0;
+	let stops = 0;
+	const lifecycle = new AppLifecycleService({
+		repositories: {
+			apps: { findOne: async () => already, updateOne: async () => { writes += 1; return { modifiedCount: 1 }; } },
+			nodes: { find: () => ({ toArray: async () => [{ nodeId: 'node-1', address: 'https://n1' }] }) },
+			lifecycleEvents: { insertMany: async () => undefined },
+		} as never,
+		agentClient: { request: async () => { stops += 1; return { status: 200, body: {} }; } } as never,
+		ingress: { remove: async () => undefined } as never,
+	});
+	await lifecycle.remove('workspace-1', 'cluster-app-1', { workspaceRevoked: true });
+	assert.equal(writes, 0); // no re-stamp of quarantinedAt
+	assert.equal(stops, 0); // no re-stop
 });

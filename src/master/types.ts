@@ -96,7 +96,13 @@ export interface MasterApp {
 	subdomain: string;
 	uiUrl: string;
 	replicas: AppReplica[];
+	/** RUNNING | STOPPED | REMOVING | REMOVED | QUARANTINED. QUARANTINED = the
+	 * workspace was revoked (offboard/purge): the app is stopped but retained
+	 * (container + volumes) and permanently reaped only after the grace window. */
 	state: string;
+	/** Set when the app enters QUARANTINED; the reaper removes it after the grace
+	 * window elapses. Cleared on un-quarantine (workspace resurrected in grace). */
+	quarantinedAt?: Date;
 	createdAt: Date;
 	updatedAt: Date;
 	kind?: 'raw' | 'mcp-v2' | 'mcp-v3';
@@ -151,7 +157,7 @@ export interface McpArtifactUse {
 	createdAt: Date;
 }
 
-export type LifecycleEventType = 'STARTED' | 'STOPPED' | 'REDEPLOYED' | 'REMOVED';
+export type LifecycleEventType = 'STARTED' | 'STOPPED' | 'REDEPLOYED' | 'REMOVED' | 'QUARANTINED';
 
 export interface AppLifecycleEvent {
 	eventId: string;

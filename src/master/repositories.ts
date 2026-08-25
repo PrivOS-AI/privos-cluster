@@ -50,6 +50,8 @@ export class MasterRepositories {
 			this.apps.createIndex({ appId: 1 }, { unique: true }),
 			this.apps.createIndex({ workspaceId: 1, listingId: 1 }),
 			this.apps.createIndex({ subdomain: 1 }, { unique: true }),
+			// Reaper sweep: find QUARANTINED apps whose grace window has elapsed.
+			this.apps.createIndex({ state: 1, quarantinedAt: 1 }),
 			this.apps.createIndex(
 				{ workspaceId: 1, mcpDeploymentId: 1, mcpGenerationId: 1, kind: 1 },
 				{

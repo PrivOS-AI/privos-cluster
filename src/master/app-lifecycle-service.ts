@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import type { MasterApp } from './types.js';
 import type { MasterRepositories } from './repositories.js';
 import { AgentClient, type AgentResponse } from './agent-client.js';
 import { IngressRouteProgrammer } from './ingress-route-programmer.js';
@@ -243,20 +244,77 @@ export class AppLifecycleService {
 				statusCode: 409,
 			});
 		}
+		// A workspace revoke (offboard/purge/dunning) does NOT destroy immediately:
+		// it QUARANTINES the app — stops it but retains the container + volumes — so
+		// the workload is permanently reaped only after the grace window, and can be
+		// un-quarantined if the workspace is resurrected within it. An explicit
+		// (non-revoked) removal still destroys immediately.
+		if (options.workspaceRevoked) {
+			await this.quarantine(workspaceId, appId, app);
+			return;
+		}
+		await this.destroy(workspaceId, appId, app);
+	}
+
+	/** Phase 1 of a revoked teardown: stop every replica (best-effort — a replica
+	 * whose node/container is already gone must still be marked so the reaper
+	 * collects it) and mark the app QUARANTINED with the grace clock started. */
+	private async quarantine(workspaceId: string, appId: string, app: MasterApp): Promise<void> {
+		// Idempotent: a re-revoke (offboard then purge, a portal retry) must KEEP the
+		// original grace clock — never reset quarantinedAt — and not re-emit events,
+		// or the reap would be deferred indefinitely by repeated revokes.
+		if (app.state === 'QUARANTINED') return;
+		const nodes = await this.loadNodes(app.replicas.map((replica) => replica.nodeId));
+		await Promise.all(app.replicas.map((replica) => {
+			const node = nodes.get(replica.nodeId);
+			if (!node) return undefined;
+			return this.deps.agentClient
+				.request(node, workspaceId, 'POST', `/api/v1/apps/${replica.containerId}/stop`)
+				.catch(() => undefined);
+		}));
+		const now = new Date();
+		await this.deps.repositories.apps.updateOne(
+			{ appId, workspaceId },
+			{
+				$set: { state: 'QUARANTINED', quarantinedAt: now, updatedAt: now, 'replicas.$[].state': 'stopped' },
+				// Clear the dunning-suspend marker so `setWorkspacePower('resume')`
+				// (selector keys on suspendedWithWorkspace) can never revive a
+				// quarantined app and hide it from the reaper.
+				$unset: { suspendedWithWorkspace: '' },
+			},
+		);
+		await this.deps.repositories.lifecycleEvents.insertMany(app.replicas.map((replica) => ({
+			eventId: crypto.randomUUID(),
+			workspaceId,
+			appId,
+			replicaId: replica.replicaId,
+			type: 'QUARANTINED' as const,
+			resources: app.resources,
+			at: now,
+		})));
+	}
+
+	/** Destroy an app for real: remove every replica container, unbind ingress,
+	 * mark REMOVED. Used by an explicit uninstall (strict) and by the reaper
+	 * (`tolerant` — a gone node / already-absent container is treated as done, so
+	 * a stranded row can always reach REMOVED and free its ingress). */
+	private async destroy(workspaceId: string, appId: string, app: MasterApp, options: { tolerant?: boolean } = {}): Promise<void> {
 		await this.deps.repositories.apps.updateOne(
 			{ appId, workspaceId },
 			{ $set: { state: 'REMOVING', updatedAt: new Date() } },
 		);
 		const nodes = await this.loadNodes(app.replicas.map((replica) => replica.nodeId));
-		const responses = await Promise.all(app.replicas.map((replica) =>
-			this.deps.agentClient.request(
-				nodes.get(replica.nodeId)!,
-				workspaceId,
-				'DELETE',
-				`/api/v1/apps/${replica.containerId}`,
-			),
-		));
-		this.assertResponses(responses);
+		const responses = await Promise.all(app.replicas.flatMap((replica) => {
+			const node = nodes.get(replica.nodeId);
+			if (!node) {
+				// A gone node has no container to delete. Reap tolerates it (the
+				// workload is gone anyway); an explicit uninstall keeps the strict error.
+				if (options.tolerant) return [];
+				throw Object.assign(new Error(`node ${replica.nodeId} not found for app removal`), { statusCode: 500 });
+			}
+			return [this.deps.agentClient.request(node, workspaceId, 'DELETE', `/api/v1/apps/${replica.containerId}`)];
+		}));
+		this.assertResponses(responses, { tolerateNotFound: options.tolerant });
 		await this.deps.ingress.remove(app.subdomain);
 		const now = new Date();
 		await this.deps.repositories.apps.updateOne(
@@ -271,6 +329,50 @@ export class AppLifecycleService {
 			type: 'REMOVED' as const,
 			resources: app.resources,
 			at: now,
+		})));
+	}
+
+	/** Reaper phase 2: permanently remove a still-QUARANTINED app after its grace
+	 * window. The QUARANTINED→REMOVING transition is claimed atomically so a
+	 * concurrent reaper (HA / boot+timer) or an un-quarantine cannot double-act;
+	 * only the winner destroys, and the reap tolerates gone nodes/containers. */
+	async reapQuarantined(workspaceId: string, appId: string): Promise<void> {
+		const claimed = await this.deps.repositories.apps.updateOne(
+			{ appId, workspaceId, state: 'QUARANTINED' },
+			{ $set: { state: 'REMOVING', updatedAt: new Date() } },
+		);
+		if (claimed.modifiedCount !== 1) return;
+		const app = await this.deps.repositories.apps.findOne({ appId, workspaceId });
+		if (!app) return;
+		await this.destroy(workspaceId, appId, app, { tolerant: true });
+	}
+
+	/** Un-quarantine a workspace that came back before its grace window elapsed:
+	 * atomically claim QUARANTINED→RUNNING (so a racing reaper's claim fails and it
+	 * never restarts a reaped app), then restart every replica. */
+	async unquarantine(workspaceId: string, appId: string): Promise<void> {
+		const claimed = await this.deps.repositories.apps.updateOne(
+			{ appId, workspaceId, state: 'QUARANTINED' },
+			{ $set: { state: 'RUNNING', updatedAt: new Date(), 'replicas.$[].state': 'running' }, $unset: { quarantinedAt: '' } },
+		);
+		if (claimed.modifiedCount !== 1) return;
+		const app = await this.deps.repositories.apps.findOne({ appId, workspaceId });
+		if (!app) return;
+		const nodes = await this.loadNodes(app.replicas.map((replica) => replica.nodeId));
+		const responses = await Promise.all(app.replicas.flatMap((replica) => {
+			const node = nodes.get(replica.nodeId);
+			if (!node) return [];
+			return [this.deps.agentClient.request(node, workspaceId, 'POST', `/api/v1/apps/${replica.containerId}/start`)];
+		}));
+		this.assertResponses(responses);
+		await this.deps.repositories.lifecycleEvents.insertMany(app.replicas.map((replica) => ({
+			eventId: crypto.randomUUID(),
+			workspaceId,
+			appId,
+			replicaId: replica.replicaId,
+			type: 'STARTED' as const,
+			resources: app.resources,
+			at: new Date(),
 		})));
 	}
 
@@ -293,8 +395,13 @@ export class AppLifecycleService {
 		return new Map(nodes.map((node) => [node.nodeId, node]));
 	}
 
-	private assertResponses(responses: AgentResponse[]): void {
-		const failed = responses.find((response) => response.status >= 300);
+	private assertResponses(responses: AgentResponse[], options: { tolerateNotFound?: boolean } = {}): void {
+		// `tolerateNotFound` is for the reap path: a 404 means the container was
+		// already pruned (during the grace window / a partial prior reap) — that IS
+		// success for a removal, so it must not strand the row as un-reapable.
+		const failed = responses.find(
+			(response) => response.status >= 300 && !(options.tolerateNotFound && response.status === 404),
+		);
 		if (failed) throw new Error(`agent operation failed: ${JSON.stringify(failed.body)}`);
 	}
 

@@ -48,6 +48,11 @@ export class ReconcileService {
 	): Promise<number> {
 		const appId = container.appId ?? container.id;
 		const app = await this.deps.repositories.apps.findOne({ appId, workspaceId });
+		// A QUARANTINED app is intentionally stopped, pending reap after the grace
+		// window — its stopped container is NOT drift. Never touch it here (in
+		// particular, never overwrite QUARANTINED with the container's state, which
+		// would hide it from the reaper and strand the workload forever).
+		if (app?.state === 'QUARANTINED') return 0;
 		// V3 recovery must resume from its persisted generation plan and exact
 		// inventory. Generic discovery must never invent a replica or mark it RUNNING.
 		if (container.mcpV3 || app?.kind === 'mcp-v3') return 0;

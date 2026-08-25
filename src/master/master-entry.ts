@@ -5,6 +5,9 @@ import { KeyCipher } from './key-crypto.js';
 import { AgentClient } from './agent-client.js';
 import { ReconcileService } from './reconcile-service.js';
 import { UsageAggregator, utcDay } from './usage-aggregator.js';
+import { AppLifecycleService } from './app-lifecycle-service.js';
+import { IngressRouteProgrammer } from './ingress-route-programmer.js';
+import { reapExpiredQuarantines, resolveQuarantineGraceMs } from './quarantine-reaper.js';
 
 const config = loadMasterConfig();
 const { client, repositories } = await connectMasterRepositories(
@@ -31,9 +34,34 @@ const usageTimer = setInterval(() => {
 }, 60 * 60 * 1000);
 usageTimer.unref();
 
+// Delayed reaper: permanently remove app workloads that have been QUARANTINED
+// (workspace revoked/offboarded/purged) longer than the grace window. Runs once
+// at boot and hourly thereafter; each app is reaped independently.
+const reaperLifecycle = new AppLifecycleService({
+	repositories,
+	agentClient: new AgentClient(new KeyCipher(Buffer.from(config.APP_MASTER_KEY_ENCRYPTION_KEY_B64, 'base64'))),
+	ingress: new IngressRouteProgrammer({
+		enabled: config.APPS_INGRESS_ENABLED,
+		zoneId: config.CF_APPS_ZONE_ID,
+		apiToken: config.CF_APPS_API_TOKEN,
+		baseDomain: config.APPS_BASE_DOMAIN,
+	}),
+});
+const quarantineGraceMs = resolveQuarantineGraceMs();
+const runReaper = () =>
+	reapExpiredQuarantines(repositories, reaperLifecycle, { graceMs: quarantineGraceMs, log: server.log })
+		.then((result) => {
+			if (result.scanned > 0) server.log.info(result, 'quarantine reaper tick');
+		})
+		.catch((error) => server.log.error({ err: error }, 'quarantine reaper tick failed'));
+await runReaper();
+const reaperTimer = setInterval(() => void runReaper(), 60 * 60 * 1000);
+reaperTimer.unref();
+
 async function shutdown(signal: string): Promise<void> {
 	server.log.info({ signal }, 'apps master shutdown');
 	clearInterval(usageTimer);
+	clearInterval(reaperTimer);
 	await server.close();
 	await client.close();
 }
