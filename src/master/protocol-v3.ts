@@ -8,7 +8,7 @@ import {
 	sha256Base64Url,
 	verifyEs256Jws,
 } from '../security/artifacts.js';
-import { isAllowedReservedEnvName } from '../schemas/app-schemas.js';
+import { isAllowedReservedEnvName } from '../schemas/reserved-env.js';
 
 /**
  * Internal Hub-to-Cluster protocol only.
