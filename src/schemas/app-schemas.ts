@@ -22,6 +22,17 @@ export const EnvNameSchema = z.string().regex(/^[A-Z][A-Z0-9_]{0,63}$/);
 export const PLATFORM_ENV_NAMES = ['PRIVOS_PUBLIC_URL', 'PRIVOS_ACCESS_MODE'] as const;
 export const PlatformEnvNameSchema = z.enum(PLATFORM_ENV_NAMES);
 
+/**
+ * Hub-issued installation agent-bot credential names. Unlike PLATFORM_ENV_NAMES
+ * these arrive inside `envVars` on a Hub-signed deploy/reconfigure, because the
+ * Hub mints the credential and the app declares the keys like ordinary config.
+ * They are the ONLY PRIVOS_ names an envVars map may carry; the rest of the
+ * namespace stays refused so a value can never impersonate a platform injection.
+ */
+export const RESERVED_AGENT_BOT_ENV_NAMES = ['PRIVOS_AGENT_BOT_CREDENTIAL', 'PRIVOS_AGENT_BOT_USER_ID'] as const;
+const reservedAgentBotEnvNames: ReadonlySet<string> = new Set(RESERVED_AGENT_BOT_ENV_NAMES);
+export const isAllowedReservedEnvName = (name: string): boolean => reservedAgentBotEnvNames.has(name);
+
 const DeployRequestObject = z.object({
     appId: z.string().optional(),
     workspaceId: z.string().regex(/^[A-Za-z0-9-]+$/).optional(),
@@ -115,7 +126,7 @@ export const McpRuntimeBindingSchema = z.object({
 export const McpDeployRequestSchema = DeployRequestObject.extend({ mcpBinding: McpRuntimeBindingSchema }).superRefine((value, ctx) => {
 		validateDeployRequest(value, ctx);
 		for (const key of Object.keys(value.envVars ?? {})) {
-			if (key.toUpperCase().startsWith('PRIVOS_')) {
+			if (key.toUpperCase().startsWith('PRIVOS_') && !isAllowedReservedEnvName(key)) {
 				ctx.addIssue({
 					code: z.ZodIssueCode.custom,
 					path: ['envVars', key],
@@ -162,7 +173,7 @@ export const McpDeployRequestV3Schema = DeployRequestObject.extend({
 		ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['appId'], message: 'appId is required for MCP v3' });
 	}
 	for (const key of Object.keys(value.envVars ?? {})) {
-		if (key.toUpperCase().startsWith('PRIVOS_')) {
+		if (key.toUpperCase().startsWith('PRIVOS_') && !isAllowedReservedEnvName(key)) {
 			ctx.addIssue({
 				code: z.ZodIssueCode.custom,
 				path: ['envVars', key],
@@ -225,7 +236,7 @@ export const McpReconfigureRequestV3Schema = DeployRequestObject.extend({
 		ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['appId'], message: 'appId is required for MCP v3' });
 	}
 	for (const key of Object.keys(value.envVars ?? {})) {
-		if (key.toUpperCase().startsWith('PRIVOS_')) {
+		if (key.toUpperCase().startsWith('PRIVOS_') && !isAllowedReservedEnvName(key)) {
 			ctx.addIssue({
 				code: z.ZodIssueCode.custom,
 				path: ['envVars', key],
@@ -280,7 +291,7 @@ export const RedeployRequestSchema = z.object({
     // the PRIVOS_ namespace is platform-only on every path that accepts envVars,
     // not just the ones that were written with an MCP v3 binding in mind.
     for (const key of Object.keys(value.envVars ?? {})) {
-        if (key.toUpperCase().startsWith('PRIVOS_')) {
+        if (key.toUpperCase().startsWith('PRIVOS_') && !isAllowedReservedEnvName(key)) {
             ctx.addIssue({
                 code: z.ZodIssueCode.custom,
                 path: ['envVars', key],

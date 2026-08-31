@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
 	McpDispatchBodyV3Schema,
+	McpReconfigureRequestV3Schema,
 	McpRuntimeProvisioningBindingV3Schema,
 } from './app-schemas.js';
 
@@ -56,5 +57,33 @@ test('room dispatch requires both the exact runtime parent and authorization chi
 	assert.equal(McpDispatchBodyV3Schema.safeParse({
 		assertion: 'signed', rpc, authorizationContext: 'workspace', runtimeInstallationId: 'runtime-1',
 		authorizationBindingId: 'binding-1', runtimeResourceInventoryHash: 'i'.repeat(43),
+	}).success, false);
+});
+
+test('reconfigure envVars admit exactly the Hub-issued agent-bot pair and refuse the rest of the PRIVOS_ namespace', () => {
+	const { hubOrigin, hubKid, hubPublicJwk, ...reconfigureBinding } = provisioningBinding;
+	const request = {
+		appId: 'cluster-app-1',
+		workspaceId: 'workspace-1',
+		image: 'registry.example/marketplace/app',
+		digest: `sha256:${'a'.repeat(64)}`,
+		mcpV3Binding: { ...reconfigureBinding, imageDigest: `sha256:${'a'.repeat(64)}` },
+		configEpoch: 2,
+		runtimeResourceInventoryHash: 'i'.repeat(43),
+		envVars: {
+			APP_MODE: 'demo',
+			PRIVOS_AGENT_BOT_CREDENTIAL: 'secret-credential',
+			PRIVOS_AGENT_BOT_USER_ID: 'bot-user-1',
+		},
+		secretEnvKeys: ['PRIVOS_AGENT_BOT_CREDENTIAL'],
+	};
+	assert.equal(McpReconfigureRequestV3Schema.safeParse(request).success, true);
+	assert.equal(McpReconfigureRequestV3Schema.safeParse({
+		...request,
+		envVars: { ...request.envVars, PRIVOS_PUBLIC_URL: 'https://spoof.example' },
+	}).success, false);
+	assert.equal(McpReconfigureRequestV3Schema.safeParse({
+		...request,
+		envVars: { ...request.envVars, PRIVOS_ANYTHING_ELSE: 'value' },
 	}).success, false);
 });

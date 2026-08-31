@@ -8,6 +8,7 @@ import {
 	signEs256Jws,
 } from '../security/artifacts.js';
 import {
+	ClusterReconfigureCommandPayloadV3Schema,
 	ClusterUpgradeCommandPayloadV3Schema,
 	McpProtocolV3Error,
 	acquisitionAffinityHashV3,
@@ -700,4 +701,42 @@ test('runtime and lifecycle transition graphs allow idempotent delivery but reje
 	assert.doesNotThrow(() => assertClusterLifecycleTransitionV3('VERIFYING', 'VERIFYING'));
 	assert.doesNotThrow(() => assertClusterLifecycleTransitionV3('VERIFYING', 'COMPLETED'));
 	assertV3Error(() => assertClusterLifecycleTransitionV3('COMPLETED', 'RUNTIME_REMOVING'), 'INVALID_LIFECYCLE_TRANSITION');
+});
+
+test('the reconfigure command envelope admits the Hub-issued agent-bot pair and still refuses the rest of the PRIVOS_ namespace', () => {
+	const payload = {
+		...timed(affinity.issuer),
+		type: 'cluster-reconfigure-command',
+		aud: 'privos-apps-master',
+		action: 'RECONFIGURE_RUNTIME',
+		operationId: '33333333-3333-4333-8333-333333333333',
+		clusterId: affinity.clusterId,
+		workspaceId: affinity.workspaceId,
+		deploymentId: affinity.deploymentId,
+		generationId: affinity.generationId,
+		generationNumber: 1,
+		runtimeInstallationId: affinity.runtimeInstallationId,
+		clusterAppId: 'cluster-app-1',
+		mcpAppId: 'mcp-app-1',
+		manifestDigest: contentDigest('c'),
+		resourceManifestHash: affinity.resourceManifestHash,
+		runtimeResourceInventoryHash: affinity.runtimeResourceInventoryHash,
+		authorizationEpoch: 1,
+		configEpoch: 2,
+		envVars: {
+			APP_MODE: 'demo',
+			PRIVOS_AGENT_BOT_CREDENTIAL: 'secret-credential',
+			PRIVOS_AGENT_BOT_USER_ID: 'bot-user-1',
+		},
+		secretKeys: ['PRIVOS_AGENT_BOT_CREDENTIAL'],
+	};
+	assert.equal(ClusterReconfigureCommandPayloadV3Schema.safeParse(payload).success, true);
+	assert.equal(ClusterReconfigureCommandPayloadV3Schema.safeParse({
+		...payload,
+		envVars: { ...payload.envVars, PRIVOS_PUBLIC_URL: 'https://spoof.example' },
+	}).success, false);
+	assert.equal(ClusterReconfigureCommandPayloadV3Schema.safeParse({
+		...payload,
+		envVars: { ...payload.envVars, PRIVOS_ANYTHING_ELSE: 'value' },
+	}).success, false);
 });

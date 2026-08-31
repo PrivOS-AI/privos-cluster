@@ -8,6 +8,7 @@ import {
 	sha256Base64Url,
 	verifyEs256Jws,
 } from '../security/artifacts.js';
+import { isAllowedReservedEnvName } from '../schemas/app-schemas.js';
 
 /**
  * Internal Hub-to-Cluster protocol only.
@@ -26,9 +27,13 @@ const Digest = z.string().regex(/^sha256:[a-f0-9]{64}$/);
 const ArtifactHash = z.string().regex(/^[A-Za-z0-9_-]{43}$/);
 const Nonce = z.string().regex(/^[A-Za-z0-9_-]{16,128}$/);
 const SafeReasonCode = z.string().regex(/^[A-Z][A-Z0-9_]{1,95}$/);
-/** Operator-declarable environment name; the PRIVOS_ namespace is platform-only. */
+/**
+ * Operator-declarable environment name; the PRIVOS_ namespace is platform-only,
+ * except the Hub-issued agent-bot credential pair, which the Hub delivers
+ * inside `envVars` on its signed reconfigure command.
+ */
 const EnvName = z.string().regex(/^[A-Z][A-Z0-9_]{0,63}$/).refine(
-	(value) => !value.startsWith('PRIVOS_'),
+	(value) => !value.startsWith('PRIVOS_') || isAllowedReservedEnvName(value),
 	{ message: 'PRIVOS_ environment names are reserved for the platform' },
 );
 /**
