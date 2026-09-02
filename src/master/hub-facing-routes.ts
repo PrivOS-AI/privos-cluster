@@ -625,6 +625,53 @@ export function hubFacingRoutes(deps: {
 		});
 
 		/**
+		 * Re-issue the runtime-inventory attestation for a generation whose
+		 * install response never reached the Hub (the agent deploy failed after
+		 * the provisioning plan was persisted). A CAPTURING inventory is first
+		 * finalized from the persisted plan, so the attested identities are
+		 * exactly the resources the generation could ever have owned; the Hub
+		 * uses the attestation to bind its installation and run the normal
+		 * signed-command teardown. Additive: a Hub that predates it never calls
+		 * it, and it can only restate what this master already persisted.
+		 */
+		fastify.post(`${root}/mcp/v3/apps/:runtimeInstallationId/inventory-attestations`, { preHandler: authenticate }, async (req, reply) => {
+			if (!deps.mcpV3Enabled || !deps.mcpSecurity) {
+				return reply.code(404).send({ error: 'mcp_install_v3_disabled' });
+			}
+			const runtimeInstallationId = (req.params as { runtimeInstallationId: string }).runtimeInstallationId;
+			let recovered;
+			try {
+				recovered = await withCorrelationId(
+					deps.deployment.recoverMcpV3InventoryAttestation(workspaceId(req), runtimeInstallationId),
+					runtimeInstallationId,
+				);
+			} catch (error) {
+				const statusCode = (error as { statusCode?: number }).statusCode;
+				if (statusCode === 404) return reply.code(404).send({ error: 'not_found' });
+				return reply.code(409).send({
+					error: 'runtime_inventory_recovery_failed',
+					code: clusterMcpSafeReason(error, 'runtime_inventory_recovery_failed'),
+				});
+			}
+			if (!recovered.app.mcpDeploymentGrantJti) {
+				return reply.code(409).send({ error: 'mcp_v3_deployment_grant_missing' });
+			}
+			const attestation = await deps.clusterMasterIdentity.signRuntimeInventoryAttestation({
+				deploymentGrantJti: recovered.app.mcpDeploymentGrantJti,
+				inventoryId: recovered.inventory.inventoryId,
+			});
+			return reply.code(200).send({
+				clusterAppId: recovered.app.appId,
+				runtimeInstallationId,
+				runtimeInventoryAttestation: {
+					compact: attestation.compact,
+					artifactHash: attestation.artifactHash,
+					kid: attestation.kid,
+				},
+			});
+		});
+
+		/**
 		 * Apply a new operator environment to a running generation.
 		 *
 		 * Additive to the install path: a Hub that predates the contract never

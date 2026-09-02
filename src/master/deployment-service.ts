@@ -588,6 +588,116 @@ export class DeploymentService {
 	}
 
 	/**
+	 * Make a generation's runtime-resource inventory attestable again for a Hub
+	 * that never received the install response (the agent deploy failed after
+	 * the provisioning plan was persisted, so the Hub holds no inventory binding
+	 * and cannot sign an uninstall command).
+	 *
+	 * A CAPTURING inventory is finalized from what this master already persisted
+	 * before any agent was called: the resources agents actually reported, plus
+	 * the REPLICA/CONTAINER identities of every planned replica that never
+	 * reported, plus the ingress route. Nothing outside that set can exist for
+	 * the generation, and teardown proves each entry absent or removed
+	 * individually — so finalizing here states only what the plan already
+	 * committed to, never invents success.
+	 */
+	async recoverMcpV3InventoryAttestation(
+		workspaceId: string,
+		runtimeInstallationId: string,
+	): Promise<{ app: MasterApp; inventory: RuntimeResourceInventory & { runtimeResourceInventoryHash: string } }> {
+		return this.deps.locks.run(workspaceId, async () => {
+			// No state filter: a generation the cluster already tore down (REMOVED)
+			// must still replay its attestation so the Hub-side saga can converge.
+			const app = await this.deps.repositories.apps.findOne({
+				workspaceId,
+				kind: 'mcp-v3',
+				mcpRuntimeInstallationId: runtimeInstallationId,
+			});
+			if (!app) throw Object.assign(new Error('MCP v3 app not found'), { statusCode: 404 });
+			const inventoryId = app.runtimeResourceInventoryId
+				?? `inventory-${sha256Base64Url([
+					workspaceId,
+					app.mcpDeploymentId,
+					app.mcpGenerationId,
+					runtimeInstallationId,
+				].join('\0'))}`;
+			let inventory = await this.deps.repositories.runtimeResourceInventories.findOne({ inventoryId });
+			if (!inventory) throw Object.assign(new Error('runtime inventory missing'), { statusCode: 404 });
+			if (inventory.state === 'MIGRATION_REVIEW_REQUIRED') {
+				throw new McpProtocolV3Error('MIGRATION_REVIEW_REQUIRED');
+			}
+			if (inventory.state === 'CAPTURING') {
+				const captured = inventory.expectedResources;
+				const present = new Set(captured.map((resource) => `${resource.kind}\0${resource.resourceId}`));
+				const additions: RuntimeResourceDescriptorV3[] = [];
+				const plans = app.mcpProvisioningReplicas ?? [];
+				const nodes = await this.deps.repositories.nodes.find({
+					nodeId: { $in: plans.map((plan) => plan.nodeId) },
+				}).toArray();
+				for (const plan of plans) {
+					const node = nodes.find((candidate) => candidate.nodeId === plan.nodeId);
+					const nodeIdentityKid = node?.mcpIdentityKid;
+					if (!nodeIdentityKid) throw new Error('mcp_v3_node_identity_missing');
+					for (const planned of [
+						{ kind: 'REPLICA' as const, resourceId: plan.replicaId },
+						{ kind: 'CONTAINER' as const, resourceId: plan.containerId },
+					]) {
+						if (present.has(`${planned.kind}\0${planned.resourceId}`)) continue;
+						additions.push({
+							kind: planned.kind,
+							resourceId: planned.resourceId,
+							ownershipScope: 'INSTALLATION_GENERATION',
+							nodeId: plan.nodeId,
+							replicaId: plan.replicaId,
+							attributes: { nodeIdentityKid },
+						});
+					}
+				}
+				const ingressResource: RuntimeResourceDescriptorV3 = {
+					kind: 'INGRESS',
+					resourceId: `route-${sha256Base64Url(`${app.subdomain}.${this.deps.baseDomain}`)}`,
+					ownershipScope: 'INSTALLATION_GENERATION',
+					nodeId: null,
+					replicaId: null,
+					attributes: { host: `${app.subdomain}.${this.deps.baseDomain}` },
+				};
+				if (!present.has(`${ingressResource.kind}\0${ingressResource.resourceId}`)) {
+					additions.push(ingressResource);
+				}
+				const finalized = finalizeRuntimeResourceInventoryV3(
+					inventory,
+					normalizeRuntimeResourcesV3([...captured, ...additions]),
+					new Date(),
+				);
+				const finalizedWrite = await this.deps.repositories.runtimeResourceInventories.updateOne(
+					{ inventoryId, state: 'CAPTURING' },
+					{
+						$set: {
+							expectedResources: finalized.expectedResources,
+							runtimeResourceInventoryHash: finalized.runtimeResourceInventoryHash,
+							state: 'READY',
+							updatedAt: finalized.updatedAt,
+						},
+					},
+				);
+				inventory = finalizedWrite.matchedCount === 1
+					? finalized
+					: (await this.deps.repositories.runtimeResourceInventories.findOne({ inventoryId }))!;
+			}
+			if (
+				(inventory.state !== 'READY' && inventory.state !== 'COMPACTED') ||
+				!inventory.runtimeResourceInventoryHash
+			) {
+				throw new Error('runtime_resource_inventory_not_ready');
+			}
+			return {
+				app,
+				inventory: inventory as RuntimeResourceInventory & { runtimeResourceInventoryHash: string },
+			};
+		});
+	}
+
+	/**
 	 * Platform-owned container environment.
 	 *
 	 * Injected here rather than carried in the Hub's grant on purpose: the

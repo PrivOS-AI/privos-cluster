@@ -42,21 +42,21 @@ function fixture() {
 	const inventories: RuntimeResourceInventory[] = [];
 	const lifecycleEvents: AppLifecycleEvent[] = [];
 	const now = new Date();
+	const pair = crypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
+	const publicJwk = pair.publicKey.export({ format: 'jwk' });
+	const nodeKid = jwkThumbprint(publicJwk);
 	const nodes: MasterNode[] = [
 		{
 			nodeId: 'node-1', url: 'https://node-1.internal', region: 'eu', failureDomain: 'fd-1',
 			capacity: { memoryMb: 4096, cpus: 4, diskBytes: 10_000_000_000 }, status: 'ACTIVE',
-			keyId: 'key-1', encryptedFleetKey: 'encrypted-1', createdAt: now, updatedAt: now,
+			keyId: 'key-1', encryptedFleetKey: 'encrypted-1', createdAt: now, updatedAt: now, mcpIdentityKid: nodeKid,
 		},
 		{
 			nodeId: 'node-2', url: 'https://node-2.internal', region: 'eu', failureDomain: 'fd-2',
 			capacity: { memoryMb: 4096, cpus: 4, diskBytes: 10_000_000_000 }, status: 'ACTIVE',
-			keyId: 'key-2', encryptedFleetKey: 'encrypted-2', createdAt: now, updatedAt: now,
+			keyId: 'key-2', encryptedFleetKey: 'encrypted-2', createdAt: now, updatedAt: now, mcpIdentityKid: nodeKid,
 		},
 	];
-	const pair = crypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
-	const publicJwk = pair.publicKey.export({ format: 'jwk' });
-	const nodeKid = jwkThumbprint(publicJwk);
 	const deployCalls = new Map<string, number>();
 	const finalized: Array<{ nodeId: string; containerId: string; hash: string }> = [];
 	let failNode2Once = true;
@@ -315,6 +315,47 @@ test('v3 provisioning persists exact partial resources, resumes deterministicall
 	});
 	assert.equal(identicalActivation.state, 'RUNNING');
 	assert.equal(state.ingressCalls, 1);
+});
+
+test('recovering the inventory of a generation stranded mid-install finalizes it from the persisted plan', async () => {
+	const state = fixture();
+	const deploymentGrant = grant();
+	const deploymentGrantHash = 'g'.repeat(43);
+
+	// The incident shape: agent deploy fails after the plan and inventory were
+	// persisted, so the Hub never receives an attestation and holds no binding.
+	await assert.rejects(
+		state.service.deployMcpV3('workspace-1', deploymentGrant, deploymentGrantHash, state.hubIdentity),
+		/agent MCP v3 deploy failed/,
+	);
+	assert.equal(state.inventories[0]!.state, 'CAPTURING');
+
+	const recovered = await state.service.recoverMcpV3InventoryAttestation('workspace-1', 'runtime-1');
+	assert.equal(recovered.inventory.state, 'READY');
+	assert.match(recovered.inventory.runtimeResourceInventoryHash, /^[A-Za-z0-9_-]{43}$/);
+	// node-1's reported resources survive untouched; node-2's planned-but-unreported
+	// REPLICA + CONTAINER and the ingress route are added — nothing else.
+	assert.equal(recovered.inventory.expectedResources.length, 6);
+	const identities = recovered.inventory.expectedResources.map((resource) => `${resource.kind}:${resource.nodeId}`).sort();
+	assert.deepEqual(identities, [
+		'BROKER_SOCKET:node-1',
+		'CONTAINER:node-1',
+		'CONTAINER:node-2',
+		'INGRESS:null',
+		'REPLICA:node-1',
+		'REPLICA:node-2',
+	]);
+	assert.equal(recovered.app.appId, deploymentGrant.deployment.clusterAppId);
+
+	// Replay-stable: a second recovery restates the same finalized inventory.
+	const replayed = await state.service.recoverMcpV3InventoryAttestation('workspace-1', 'runtime-1');
+	assert.equal(replayed.inventory.runtimeResourceInventoryHash, recovered.inventory.runtimeResourceInventoryHash);
+
+	// An unknown generation stays a 404, never an invented inventory.
+	await assert.rejects(
+		state.service.recoverMcpV3InventoryAttestation('workspace-1', 'runtime-unknown'),
+		(error: unknown) => (error as { statusCode?: number }).statusCode === 404,
+	);
 });
 
 test('reinstalling over the tombstone of a previous install revives it instead of failing', async () => {
