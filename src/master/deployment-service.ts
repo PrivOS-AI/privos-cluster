@@ -452,7 +452,10 @@ export class DeploymentService {
 				ownershipScope: 'INSTALLATION_GENERATION',
 				nodeId: null,
 				replicaId: null,
-				attributes: { host: `${app.subdomain}.${this.deps.baseDomain}` },
+				// `subdomain` is what teardown hands to the route programmer;
+				// without it the uninstall's ingress removal could never run
+				// (it used to read a key this descriptor never carried).
+				attributes: { host: `${app.subdomain}.${this.deps.baseDomain}`, subdomain: app.subdomain },
 			};
 
 			if (inventory.state === 'CAPTURING') {
@@ -659,7 +662,7 @@ export class DeploymentService {
 					ownershipScope: 'INSTALLATION_GENERATION',
 					nodeId: null,
 					replicaId: null,
-					attributes: { host: `${app.subdomain}.${this.deps.baseDomain}` },
+					attributes: { host: `${app.subdomain}.${this.deps.baseDomain}`, subdomain: app.subdomain },
 				};
 				if (!present.has(`${ingressResource.kind}\0${ingressResource.resourceId}`)) {
 					additions.push(ingressResource);

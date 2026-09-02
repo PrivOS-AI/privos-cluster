@@ -4,7 +4,7 @@ import fp from 'fastify-plugin';
 import { z } from 'zod';
 
 import { config } from '../config.js';
-import { containerManager, imageManager } from '../docker/index.js';
+import { containerManager, imageManager, networkManager } from '../docker/index.js';
 import * as dockerState from '../docker/docker-state.js';
 import { resolveImmutableImageReference } from '../docker/image-reference.js';
 import {
@@ -304,6 +304,12 @@ const mcpHandler: FastifyPluginAsync = async (fastify) => {
 		const results = [];
 		for (const resource of parsed.data.resources) {
 			results.push(await removeRuntimeResource(resource, workspaceId));
+		}
+		// The workspace network is node plumbing, not a declared generation
+		// resource: reclaim its subnet as soon as the last container is gone
+		// (best effort — the hourly sweep covers anything missed here).
+		if (workspaceId) {
+			await networkManager.removeWorkspaceNetworkIfUnused(workspaceId).catch(() => undefined);
 		}
 		return { results };
 	});

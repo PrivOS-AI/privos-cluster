@@ -100,6 +100,19 @@ async function main(): Promise<void> {
 
 		// 8. Start background services
 		startHealthMonitor();
+		// Reclaim subnets of workspace app networks whose last container is
+		// gone (uninstalled/purged workspaces). Docker's default address pools
+		// hold ~31 bridge subnets per node; without this sweep the node
+		// eventually cannot create any network and every install fails. The
+		// 1h minimum age keeps the sweep clear of deploys in flight.
+		if (config.FLEET_MODE) {
+			const sweep = async (): Promise<void> => {
+				const removed = await networkManager.sweepUnusedWorkspaceNetworks(60 * 60 * 1000);
+				if (removed.length) fastify.log.info({ removed }, 'unused workspace app networks removed');
+			};
+			networkSweepTimer = setInterval(() => void sweep().catch((err) => fastify.log.warn(err, 'network sweep failed')), 60 * 60 * 1000);
+			void sweep().catch((err) => fastify.log.warn(err, 'network sweep failed'));
+		}
 
 		// 9. Listen
 		await fastify.listen({ port: config.PORT, host: config.HOST });
@@ -117,9 +130,12 @@ async function main(): Promise<void> {
 	}
 }
 
+let networkSweepTimer: NodeJS.Timeout | undefined;
+
 async function shutdown(signal: string): Promise<void> {
 	fastify.log.info({ signal }, 'shutdown initiated');
 	try {
+		if (networkSweepTimer) clearInterval(networkSweepTimer);
 		stopHealthMonitor();
 		await mcpBrokerManager.closeAll();
 		await stopReverseProxy();

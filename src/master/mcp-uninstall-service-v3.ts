@@ -421,7 +421,10 @@ export class McpUninstallServiceV3 {
 	}
 
 	private async removeIngress(resource: RuntimeResourceDescriptorV3): Promise<ResourceCleanupResultV3> {
-		const subdomain = resource.attributes.subdomain;
+		// Inventories written before 2026-09 carried only `host`; the subdomain
+		// is its first label (the registry only ever allocates single labels),
+		// so those generations' routes are still removable.
+		const subdomain = resource.attributes.subdomain ?? resource.attributes.host?.split('.')[0];
 		if (!subdomain) {
 			return { kind: resource.kind, resourceId: resource.resourceId, status: 'UNKNOWN', reasonCode: 'SUBDOMAIN_MISSING', verifiedAt: null };
 		}
