@@ -396,6 +396,14 @@ async function removeRuntimeResource(
 		if (resource.kind === 'VOLUME') {
 			const volumeName = resource.attributes.volumeName;
 			if (!volumeName) return { ...identity, status: 'UNKNOWN', reasonCode: 'VOLUME_NAME_MISSING' };
+			// The declared name is caller-supplied: a volume that is not labelled for
+			// this workspace is invisible to it (ABSENT), exactly as getById treats a
+			// container from another workspace above.
+			if (workspaceId) {
+				const volume = await containerManager.inspectVolume(volumeName);
+				if (!volume) return { ...identity, status: 'ABSENT', reasonCode: null };
+				if (volume.Labels?.['privos.workspace'] !== workspaceId) return { ...identity, status: 'ABSENT', reasonCode: null };
+			}
 			// The declared name removes the volume even when its container is long
 			// gone, which a mount-derived list could never do.
 			try {

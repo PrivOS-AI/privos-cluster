@@ -2,7 +2,6 @@ import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import net from 'node:net';
-import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
@@ -25,7 +24,7 @@ async function requestBroker(socketPath: string, request: unknown): Promise<any>
 }
 
 test('broker keeps its host root private while making the bind-mounted replica directory traversable', async (t) => {
-	const temporaryRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'privos-mcp-broker-'));
+	const temporaryRoot = await fs.mkdtemp(path.join('/tmp', 'privos-mcp-broker-'));
 	t.after(() => fs.rm(temporaryRoot, { recursive: true, force: true }));
 	const brokerRoot = path.join(temporaryRoot, 'broker');
 	const manager = new McpBrokerManager(brokerRoot, {} as NodeIdentity, async () => ({}));
@@ -41,7 +40,7 @@ test('broker keeps its host root private while making the bind-mounted replica d
 });
 
 test('v3 broker socket is allocated before inventory finalization and exact final binding survives process restart', async (t) => {
-	const temporaryRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'privos-mcp-broker-v3-'));
+	const temporaryRoot = await fs.mkdtemp(path.join('/tmp', 'privos-mcp-broker-v3-'));
 	t.after(() => fs.rm(temporaryRoot, { recursive: true, force: true }));
 	const brokerRoot = path.join(temporaryRoot, 'broker');
 	const replicaId = '11111111-1111-4111-8111-111111111111';

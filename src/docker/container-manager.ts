@@ -473,6 +473,18 @@ export class ContainerManager {
     }
 
     /**
+     * Inspect a named Docker volume; null when it does not exist.
+     */
+    async inspectVolume(name: string): Promise<{ Name: string; Labels?: Record<string, string> } | null> {
+        try {
+            return await this.docker.getVolume(name).inspect();
+        } catch (err: any) {
+            if (err.statusCode === 404) return null;
+            throw new Error(`Failed to inspect volume ${name}: ${err.message}`);
+        }
+    }
+
+    /**
      * Remove a named Docker volume. Swallows 404 if already gone.
      */
     async removeVolume(name: string): Promise<void> {

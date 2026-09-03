@@ -102,6 +102,10 @@ export class McpBrokerManager {
 		await this.close(binding.replicaId);
 		const directory = this.directory(binding.replicaId);
 		const socketPath = path.join(directory, 'identity.sock');
+		// sun_path is 104 bytes on macOS/BSD (108 on Linux); a longer path is
+		// silently truncated by bind(), so the server "listens" on a path nobody
+		// can mount and the chmod below fails with ENOENT. Fail loudly instead.
+		if (Buffer.byteLength(socketPath) >= 104) throw new Error(`broker_socket_path_too_long: ${socketPath}`);
 		await fs.mkdir(this.root, { recursive: true, mode: 0o700 });
 		await fs.chmod(this.root, 0o700);
 		await fs.mkdir(directory, { recursive: true, mode: 0o711 });

@@ -15,13 +15,12 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import http from 'node:http';
 import fs from 'node:fs/promises';
-import os from 'node:os';
 import path from 'node:path';
 
 // MCP_BROKER_ROOT must be set before config.js first loads (it reads env at
 // import time), so every import that reaches it is deferred with a dynamic
 // import until after this line runs.
-const brokerRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'mcp-broker-test-'));
+const brokerRoot = await fs.mkdtemp(path.join('/tmp', 'mcp-broker-test-'));
 process.env.MCP_BROKER_ROOT = brokerRoot;
 
 const { containerManager, docker } = await import('../docker/index.js');
