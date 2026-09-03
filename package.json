@@ -4,6 +4,7 @@
   "description": "Standalone Docker container management microservice for Privos MCP apps",
   "type": "module",
   "private": true,
+  "license": "SEE LICENSE IN LICENSE",
   "engines": {
     "node": ">=20"
   },
