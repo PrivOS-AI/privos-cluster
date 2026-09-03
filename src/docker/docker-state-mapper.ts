@@ -65,9 +65,9 @@ function parseEnv(raw: string | undefined): Record<string, string> {
 }
 
 /** Reconstruct logical volumes from the container's own mounts (no volumes table). */
-function parseVolumes(info: Docker.ContainerInspectInfo, id: string): ContainerVolume[] {
+function parseVolumes(rawMounts: Array<{ Type?: string; Name?: string; Destination?: string }> | undefined, id: string): ContainerVolume[] {
 	const prefix = `mcp-vol-${id.slice(0, 12)}-`;
-	const mounts = (info.Mounts ?? []) as Array<{ Type?: string; Name?: string; Destination?: string }>;
+	const mounts = rawMounts ?? [];
 	return mounts
 		.filter((m) => m.Type === 'volume' && m.Name)
 		.map((m) => ({
@@ -96,8 +96,8 @@ function hostPortFor(info: Docker.ContainerInspectInfo, port: number): number | 
 	return null;
 }
 
-function networkIpFor(info: Docker.ContainerInspectInfo): string | null {
-	const networks = info.NetworkSettings?.Networks ?? {};
+function networkIpFor(source: { NetworkSettings?: { Networks?: Record<string, { IPAddress?: string } | undefined> | null } | null }): string | null {
+	const networks = source.NetworkSettings?.Networks ?? {};
 	const preferred = Object.entries(networks).find(([name]) => name.startsWith('privos-ws-'));
 	return preferred?.[1]?.IPAddress || Object.values(networks)[0]?.IPAddress || null;
 }
@@ -135,22 +135,31 @@ function isMoreActive(a: { container: Container; dockerCreatedMs: number }, b: {
 	return a.dockerCreatedMs > b.dockerCreatedMs; // otherwise the newer one
 }
 
-/**
- * PURE mapper: Docker inspect object + labels → API `Container`.
- * `health` overlays the ephemeral in-memory counters (default = unknown/0/0/null).
- */
-export function mapInspectToContainer(info: Docker.ContainerInspectInfo, health: HealthCheck = DEFAULT_HEALTH): Container {
-	const labels = (info.Config?.Labels ?? {}) as Record<string, string>;
-	const id = labels['privos.id'] || info.Id;
+/** Native Docker facts distilled from either an inspect object or a `docker ps` entry. */
+interface DockerFacts {
+	labels: Record<string, string>;
+	dockerContainerId: string;
+	dockerContainerName: string;
+	imageRef: string;
+	state: ContainerState;
+	hostPort: number | null;
+	networkIp: string | null;
+	createdFallbackMs: number;
+	startedAt: number | null;
+	stoppedAt: number | null;
+	mounts: Array<{ Type?: string; Name?: string; Destination?: string }>;
+}
+
+/** Shared label-driven assembly for both the inspect and the list mappers. */
+function buildContainer(facts: DockerFacts, health: HealthCheck): Container {
+	const { labels } = facts;
+	const id = labels['privos.id'] || facts.dockerContainerId;
 	const port = parseInt(labels['privos.port'] ?? '0', 10) || 0;
-	const state = mapState(info.State?.Status);
-	const hostPort = hostPortFor(info, port);
-	const networkIp = networkIpFor(info);
-	const internalUrl = state === 'running'
-		? networkIp
-			? `http://${networkIp}:${port}`
-			: hostPort
-				? `http://localhost:${hostPort}`
+	const internalUrl = facts.state === 'running'
+		? facts.networkIp
+			? `http://${facts.networkIp}:${port}`
+			: facts.hostPort
+				? `http://localhost:${facts.hostPort}`
 				: ''
 		: '';
 	const createdAtRaw = labels['privos.created-at'];
@@ -164,22 +173,22 @@ export function mapInspectToContainer(info: Docker.ContainerInspectInfo, health:
 		workspaceId: labelOrNull(labels, 'privos.workspace'),
 		listingId: labelOrNull(labels, 'privos.listing'),
 		versionDigest: labelOrNull(labels, 'privos.version.digest'),
-		dockerContainerId: info.Id,
-		dockerContainerName: (info.Name ?? '').replace(/^\//, ''),
-		image: labels['privos.image'] || (info.Config?.Image ?? '').split(':')[0],
-		tag: labels['privos.tag'] || (info.Config?.Image ?? '').split(':')[1] || 'latest',
+		dockerContainerId: facts.dockerContainerId,
+		dockerContainerName: facts.dockerContainerName.replace(/^\//, ''),
+		image: labels['privos.image'] || facts.imageRef.split(':')[0],
+		tag: labels['privos.tag'] || facts.imageRef.split(':')[1] || 'latest',
 		imageDigest: labelOrNull(labels, 'privos.image.digest'),
-		state,
+		state: facts.state,
 		internalUrl,
 		port,
-		hostPort,
+		hostPort: facts.hostPort,
 		resources: parseResources(labels['privos.resources']),
 		envVars: parseEnv(labels['privos.env']),
 		healthCheck: health,
-		createdAt: Number.isFinite(createdAtLabel) && createdAtLabel > 0 ? createdAtLabel : (toEpoch(info.Created) ?? Date.now()),
-		startedAt: toEpoch(info.State?.StartedAt),
-		stoppedAt: state === 'running' ? null : toEpoch(info.State?.FinishedAt),
-		volumes: parseVolumes(info, id),
+		createdAt: Number.isFinite(createdAtLabel) && createdAtLabel > 0 ? createdAtLabel : (facts.createdFallbackMs || Date.now()),
+		startedAt: facts.startedAt,
+		stoppedAt: facts.stoppedAt,
+		volumes: parseVolumes(facts.mounts, id),
 		subdomain: labelOrNull(labels, 'privos.subdomain'),
 		domain: labelOrNull(labels, 'privos.domain'),
 		healthPolicy: parseHealthPolicy(labels),
@@ -188,4 +197,64 @@ export function mapInspectToContainer(info: Docker.ContainerInspectInfo, health:
 		mcpV2: labels['privos.mcp.schema'] === '2' || labels['privos.mcp.schema'] === '3',
 		mcpV3: labels['privos.mcp.schema'] === '3',
 	};
+}
+
+/**
+ * PURE mapper: Docker inspect object + labels → API `Container`.
+ * `health` overlays the ephemeral in-memory counters (default = unknown/0/0/null).
+ */
+export function mapInspectToContainer(info: Docker.ContainerInspectInfo, health: HealthCheck = DEFAULT_HEALTH): Container {
+	const state = mapState(info.State?.Status);
+	const labels = (info.Config?.Labels ?? {}) as Record<string, string>;
+	const port = parseInt(labels['privos.port'] ?? '0', 10) || 0;
+	return buildContainer(
+		{
+			labels,
+			dockerContainerId: info.Id,
+			dockerContainerName: info.Name ?? '',
+			imageRef: info.Config?.Image ?? '',
+			state,
+			hostPort: hostPortFor(info, port),
+			networkIp: networkIpFor(info),
+			createdFallbackMs: toEpoch(info.Created) ?? 0,
+			startedAt: toEpoch(info.State?.StartedAt),
+			stoppedAt: state === 'running' ? null : toEpoch(info.State?.FinishedAt),
+			mounts: info.Mounts ?? [],
+		},
+		health,
+	);
+}
+
+/** Host port from a `docker ps` entry's flat `Ports` array (published TCP binding). */
+function listHostPortFor(entry: Docker.ContainerInfo, port: number): number | null {
+	const match = (entry.Ports ?? []).find((p) => p.PrivatePort === port && p.Type === 'tcp' && p.PublicPort);
+	return match?.PublicPort ?? null;
+}
+
+/**
+ * PURE mapper: a `docker ps` (`listContainers`) entry + labels → API `Container`.
+ * Avoids a per-container inspect on the health-tick hot path. `startedAt`/`stoppedAt`
+ * are not exposed by the list API, so they map to null (they drive no cluster logic;
+ * the uptime endpoint inspects the one container it needs directly).
+ */
+export function mapListEntryToContainer(entry: Docker.ContainerInfo, health: HealthCheck = DEFAULT_HEALTH): Container {
+	const labels = (entry.Labels ?? {}) as Record<string, string>;
+	const port = parseInt(labels['privos.port'] ?? '0', 10) || 0;
+	return buildContainer(
+		{
+			labels,
+			dockerContainerId: entry.Id,
+			dockerContainerName: entry.Names?.[0] ?? '',
+			imageRef: entry.Image ?? '',
+			// `docker ps` State is already the coarse status vocabulary (running/exited/…).
+			state: mapState(entry.State),
+			hostPort: listHostPortFor(entry, port),
+			networkIp: networkIpFor(entry),
+			createdFallbackMs: entry.Created ? entry.Created * 1000 : 0,
+			startedAt: null,
+			stoppedAt: null,
+			mounts: entry.Mounts ?? [],
+		},
+		health,
+	);
 }

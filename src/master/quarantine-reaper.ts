@@ -35,7 +35,7 @@ export async function reapExpiredQuarantines(
 	const cutoff = new Date(now.getTime() - graceMs);
 
 	const expired = await repositories.apps
-		.find({ state: 'QUARANTINED', quarantinedAt: { $lte: cutoff } })
+		.find({ state: 'QUARANTINED', quarantinedAt: { $lte: cutoff } }, { projection: { appId: 1, workspaceId: 1, quarantinedAt: 1 } })
 		.toArray();
 
 	let reaped = 0;

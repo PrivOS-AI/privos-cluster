@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { buildContainerLabels, HEALTH_DEFAULTS } from './container-manager.js';
-import { mapInspectToContainer, mapState, pickActivePerId } from './docker-state-mapper.js';
+import { mapInspectToContainer, mapListEntryToContainer, mapState, pickActivePerId } from './docker-state-mapper.js';
 import type { Container } from '../types/index.js';
 
 function fakeContainer(id: string, state: Container['state'], dcid = `d-${id}-${state}`): Container {
@@ -333,4 +333,61 @@ test('v3 MCP labels are generation affine without changing v2 label behavior', (
 			hubPublicJwk: { kty: 'EC', crv: 'P-256', x: 'x', y: 'y' },
 		},
 	}), /mcp_protocol_binding_conflict/);
+});
+
+// A `docker ps` (listContainers) entry carrying the same fields the list mapper reads.
+function listEntry(overrides: any = {}): any {
+	return {
+		Id: 'docker-abc123',
+		Names: ['/todo-7f3a9b'],
+		Image: 'nginx:1.27',
+		Created: 1689933600,
+		State: 'running',
+		Status: 'Up 5 minutes',
+		Ports: [{ IP: '0.0.0.0', PrivatePort: 3001, PublicPort: 49155, Type: 'tcp' }],
+		Labels: {
+			'privos.managed': 'true',
+			'privos.id': '11111111-2222-3333-4444-555555555555',
+			'privos.app-id': 'my-app',
+			'privos.workspace': 'ws-a',
+			'privos.image': 'nginx',
+			'privos.tag': '1.27',
+			'privos.port': '3001',
+			'privos.resources': JSON.stringify({ memoryMb: 512, cpus: 1, tmpSizeMb: 128 }),
+			'privos.env': JSON.stringify({ FOO: 'bar' }),
+			'privos.subdomain': 'todo',
+			'privos.domain': 'apps.example.com',
+			'privos.created-at': '2023-11-14T22:13:20.000Z',
+		},
+		NetworkSettings: { Networks: { 'privos-ws-a': { IPAddress: '172.20.0.5' } } },
+		Mounts: [{ Type: 'volume', Name: 'mcp-vol-11111111-222-data', Destination: '/app/data' }],
+		...overrides,
+	};
+}
+
+test('mapListEntryToContainer builds the Container view from a docker ps entry (no inspect)', () => {
+	const c = mapListEntryToContainer(listEntry());
+	assert.equal(c.id, '11111111-2222-3333-4444-555555555555');
+	assert.equal(c.dockerContainerId, 'docker-abc123');
+	assert.equal(c.dockerContainerName, 'todo-7f3a9b');
+	assert.equal(c.state, 'running');
+	assert.equal(c.port, 3001);
+	assert.equal(c.hostPort, 49155);
+	assert.equal(c.internalUrl, 'http://172.20.0.5:3001'); // network IP preferred over host port
+	assert.equal(c.image, 'nginx');
+	assert.equal(c.tag, '1.27');
+	assert.deepEqual(c.resources, { memoryMb: 512, cpus: 1, tmpSizeMb: 128 });
+	assert.deepEqual(c.envVars, { FOO: 'bar' });
+	assert.deepEqual(c.volumes, [{ name: 'data', mountPath: '/app/data' }]);
+	assert.equal(c.createdAt, Date.parse('2023-11-14T22:13:20.000Z'));
+	// The list API exposes neither of these; they are informational only.
+	assert.equal(c.startedAt, null);
+	assert.equal(c.stoppedAt, null);
+});
+
+test('mapListEntryToContainer maps a stopped entry with no published port', () => {
+	const c = mapListEntryToContainer(listEntry({ State: 'exited', Ports: [], NetworkSettings: { Networks: {} } }));
+	assert.equal(c.state, 'stopped');
+	assert.equal(c.hostPort, null);
+	assert.equal(c.internalUrl, ''); // not running → no URL
 });

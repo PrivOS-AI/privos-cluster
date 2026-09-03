@@ -416,7 +416,13 @@ export class ContainerManager {
      * Run a command non-interactively and return stdout as a string.
      * Uses TTY mode; strips carriage returns from output.
      */
-    async execCommand(containerId: string, cmd: string[]): Promise<string> {
+    async execCommand(
+        containerId: string,
+        cmd: string[],
+        opts: { timeoutMs?: number; maxBytes?: number } = {},
+    ): Promise<string> {
+        const timeoutMs = opts.timeoutMs ?? 30_000;
+        const maxBytes = opts.maxBytes ?? 10 * 1024 * 1024;
         const container = this.docker.getContainer(containerId);
         const exec = await container.exec({
             Cmd: cmd,
@@ -428,12 +434,35 @@ export class ContainerManager {
 
         return new Promise<string>((resolve, reject) => {
             const chunks: Buffer[] = [];
-            stream.on('data', (chunk: Buffer) => chunks.push(chunk));
+            let total = 0;
+            let settled = false;
+            // Single exit path: a hung/oversized exec must not leak the hijacked
+            // stream or keep collecting into an unbounded buffer.
+            const finish = (err: Error | null, value?: string) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                stream.destroy();
+                if (err) reject(err);
+                else resolve(value ?? '');
+            };
+            const timer = setTimeout(
+                () => finish(new Error(`execCommand timed out after ${timeoutMs}ms`)),
+                timeoutMs,
+            );
+            stream.on('error', (err: Error) => finish(err));
+            stream.on('data', (chunk: Buffer) => {
+                total += chunk.length;
+                if (total > maxBytes) {
+                    finish(new Error(`execCommand output exceeded ${maxBytes} bytes`));
+                    return;
+                }
+                chunks.push(chunk);
+            });
             stream.on('end', () => {
                 // TTY mode adds \r\n — strip carriage returns
-                resolve(Buffer.concat(chunks).toString('utf-8').replace(/\r/g, ''));
+                finish(null, Buffer.concat(chunks).toString('utf-8').replace(/\r/g, ''));
             });
-            stream.on('error', reject);
         });
     }
 

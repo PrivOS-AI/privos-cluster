@@ -13,7 +13,7 @@ export class ReconcileService {
 
 	async run(): Promise<{ discovered: number; repaired: number; failed: number }> {
 		const [workspaces, nodes] = await Promise.all([
-			this.deps.repositories.workspaces.find({ status: 'ACTIVE' }).toArray(),
+			this.deps.repositories.workspaces.find({ status: 'ACTIVE' }, { projection: { workspaceId: 1 } }).toArray(),
 			this.deps.repositories.nodes.find({ status: { $ne: 'RETIRED' } }).toArray(),
 		]);
 		let discovered = 0;

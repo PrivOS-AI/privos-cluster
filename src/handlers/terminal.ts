@@ -51,10 +51,27 @@ const terminalHandler: FastifyPluginAsync = async (fastify) => {
                 const exec = await containerManager.createExec(container.dockerContainerId);
                 execStream = await exec.start({ hijack: true, stdin: true, Tty: true });
 
-                // 5. Pipe exec output → WebSocket
+                // 5. Pipe exec output → WebSocket, honouring backpressure so a slow
+                // client cannot make us buffer unbounded output in memory.
+                const SOCKET_HIGH_WATER = 1024 * 1024;
                 execStream.on('data', (chunk: Buffer) => {
-                    if (socket.readyState === socket.OPEN) {
-                        socket.send(chunk);
+                    if (socket.readyState !== socket.OPEN) {
+                        return;
+                    }
+                    socket.send(chunk);
+                    if (socket.bufferedAmount > SOCKET_HIGH_WATER) {
+                        execStream.pause();
+                        const resume = () => {
+                            if (socket.readyState !== socket.OPEN) {
+                                return;
+                            }
+                            if (socket.bufferedAmount <= SOCKET_HIGH_WATER) {
+                                execStream.resume();
+                            } else {
+                                setTimeout(resume, 50);
+                            }
+                        };
+                        setTimeout(resume, 50);
                     }
                 });
                 execStream.on('end', () => {
@@ -90,11 +107,13 @@ const terminalHandler: FastifyPluginAsync = async (fastify) => {
                 });
 
                 socket.on('close', () => {
-                    try { execStream.end(); } catch {}
+                    // destroy(), not end(): end() only half-closes stdin, leaving the
+                    // Docker exec running until the container process exits on its own.
+                    try { execStream.destroy(); } catch {}
                 });
                 socket.on('error', (err: Error) => {
                     fastify.log.warn({ err, containerId }, 'websocket error');
-                    try { execStream.end(); } catch {}
+                    try { execStream.destroy(); } catch {}
                 });
             } catch (err: any) {
                 fastify.log.error({ err, containerId }, 'failed to start exec');

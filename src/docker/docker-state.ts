@@ -8,7 +8,7 @@
  */
 import type Docker from 'dockerode';
 import { containerManager } from './index.js';
-import { mapInspectToContainer, pickActivePerId } from './docker-state-mapper.js';
+import { mapListEntryToContainer, pickActivePerId } from './docker-state-mapper.js';
 import type { Container, HealthCheck } from '../types/index.js';
 
 const MANAGED_LABEL = 'privos.managed=true';
@@ -22,19 +22,14 @@ export type HealthProvider = (id: string) => HealthCheck | undefined;
  * then newest by Docker's real creation time (see pickActivePerId).
  */
 async function inspectManaged(filters: Record<string, string[]>, health?: HealthProvider): Promise<Container[]> {
-	const list = await containerManager.listContainers(filters, true);
-	const items: Array<{ container: Container; dockerCreatedMs: number }> = [];
-	for (const item of list) {
-		try {
-			const info = await containerManager.inspectContainer(item.Id);
-			const mapped = mapInspectToContainer(info as unknown as Docker.ContainerInspectInfo);
-			const container = health ? { ...mapped, healthCheck: health(mapped.id) ?? mapped.healthCheck } : mapped;
-			const dockerCreatedMs = Date.parse((info as any).Created ?? '') || 0;
-			items.push({ container, dockerCreatedMs });
-		} catch {
-			// container vanished between list and inspect — skip
-		}
-	}
+	// One `containers/json` (docker ps) call — the list entry already carries labels,
+	// state, ports, networks and mounts, so there is no per-container inspect here.
+	const list = (await containerManager.listContainers(filters, true)) as Docker.ContainerInfo[];
+	const items = list.map((entry) => {
+		const mapped = mapListEntryToContainer(entry);
+		const container = health ? { ...mapped, healthCheck: health(mapped.id) ?? mapped.healthCheck } : mapped;
+		return { container, dockerCreatedMs: (entry.Created ?? 0) * 1000 };
+	});
 	return pickActivePerId(items);
 }
 
@@ -54,23 +49,6 @@ export async function getById(
 	if (workspaceId) labels.push(`privos.workspace=${workspaceId}`);
 	const found = await inspectManaged({ label: labels }, health);
 	return found[0] ?? null;
-}
-
-export async function getByAppId(appId: string, health?: HealthProvider): Promise<Container | null> {
-	const found = await inspectManaged({ label: [MANAGED_LABEL, `privos.app-id=${appId}`] }, health);
-	return found[0] ?? null;
-}
-
-export async function getByDockerContainerId(dockerId: string, health?: HealthProvider): Promise<Container | null> {
-	try {
-		const info = await containerManager.inspectContainer(dockerId);
-		const labels = (info as any).Config?.Labels ?? {};
-		if (labels['privos.managed'] !== 'true') return null;
-		const mapped = mapInspectToContainer(info as unknown as Docker.ContainerInspectInfo);
-		return health ? { ...mapped, healthCheck: health(mapped.id) ?? mapped.healthCheck } : mapped;
-	} catch {
-		return null;
-	}
 }
 
 /** Per-host uniqueness (subdomain + domain) purely from labels. */
