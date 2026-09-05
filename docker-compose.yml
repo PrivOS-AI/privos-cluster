@@ -17,7 +17,11 @@ services:
     # The fleet agent keeps only its node signing identity on durable host
     # storage. Per-replica Unix sockets are runtime-only and live below /run.
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
+      # Mount the socket's DIRECTORY, not the file: a file bind pins the socket
+      # inode, so a dockerd restart leaves the agent on the dead old inode
+      # (health-monitor ECONNREFUSED -> replicas report unhealthy -> dispatch
+      # 409). The dir mount re-resolves the live socket per connection.
+      - /var/run:/var/run
       - /var/lib/privos:/var/lib/privos
       - /run/privos/mcp-broker:/run/privos/mcp-broker
     networks:
