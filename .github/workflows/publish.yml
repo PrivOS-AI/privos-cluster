@@ -10,9 +10,11 @@ name: publish-app-cluster
 # can only be generated from an OIDC-enabled CI run, so this workflow is the only
 # supported publish path for this package.
 #
-# One-time setup:
-#   - Repo secret NPM_TOKEN = an npm *Automation* access token for the @privos_ai
-#     scope. Automation tokens bypass the interactive 2FA OTP that blocks CI.
+# Uses npm Trusted Publishing (OIDC) — no token anywhere. One-time setup on
+# npmjs.com (@privos_ai/app-cluster -> Settings -> Trusted Publisher):
+#   Publisher: GitHub Actions | Organization: PrivOS-AI | Repository: privos-cluster
+#   Workflow filename: publish.yml | Environment: (blank)
+# After that, the repo secret NPM_TOKEN can be deleted.
 #
 # Trigger: push a tag `v<version>` that matches package.json's version, or run
 # the workflow manually. GitHub evaluates this file at the pushed ref, so cut the
@@ -35,12 +37,13 @@ jobs:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
         with:
-          node-version: 22
+          node-version: 24
           registry-url: https://registry.npmjs.org
+      # Trusted publishing needs npm >= 11.5.1; ensure it regardless of the bundled version.
+      - run: npm install -g npm@latest
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
-      # prepublishOnly runs the build; provenance is generated from this OIDC run.
-      - run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      # prepublishOnly runs the build; trusted publishing mints a short-lived
+      # OIDC credential and generates provenance automatically — no token.
+      - run: npm publish --access public
