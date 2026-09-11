@@ -1,12 +1,26 @@
 {
-  "name": "privos-cluster",
+  "name": "@privos_ai/app-cluster",
   "version": "0.1.0",
   "description": "Standalone Docker container management microservice for Privos MCP apps",
   "type": "module",
-  "private": true,
   "license": "SEE LICENSE IN LICENSE",
   "engines": {
     "node": ">=20"
+  },
+  "bin": {
+    "privos-app-cluster": "./dist/cli/privos-app-cluster.js"
+  },
+  "main": "./dist/server.js",
+  "types": "./dist/server.d.ts",
+  "files": [
+    "dist",
+    "!dist/master",
+    "!dist/master/**",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
   },
   "scripts": {
     "dev": "tsx watch --env-file=.env src/server.ts",
@@ -16,26 +30,32 @@
     "build": "tsc -p tsconfig.json",
     "start": "node --env-file=.env dist/server.js",
     "start:master": "node --env-file=.env.master dist/master/master-entry.js",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "prepack": "npm run build",
+    "prepublishOnly": "npm run build"
   },
   "dependencies": {
     "@fastify/cors": "^10.1.0",
     "@fastify/websocket": "^11.0.0",
+    "ajv": "^8.20.0",
+    "ajv-formats": "^3.0.1",
     "dockerode": "^4.0.2",
     "fastify": "^5.0.0",
     "fastify-plugin": "^5.0.0",
     "jsonwebtoken": "^9.0.2",
-    "mongodb": "^6.21.0",
     "pino": "^9.0.0",
     "undici": "^6.0.0",
+    "ws": "^8.21.3",
     "zod": "^3.23.0"
   },
   "devDependencies": {
     "@types/dockerode": "^3.3.29",
     "@types/jsonwebtoken": "^9.0.6",
     "@types/node": "^20.12.0",
+    "@types/ws": "^8.18.1",
+    "mongodb": "^6.21.0",
     "pino-pretty": "^11.0.0",
-    "tsx": "^4.15.0",
+    "tsx": "^4.23.13",
     "typescript": "^5.9.3"
   }
 }

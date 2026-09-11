@@ -11,7 +11,7 @@ import test from 'node:test';
 
 import { DeploymentService } from './deployment-service.js';
 import { KeyCipher } from './key-crypto.js';
-import { McpProtocolV3Error, type ClusterReconfigureCommandPayloadV3 } from './protocol-v3.js';
+import { McpProtocolV3Error, type ClusterReconfigureCommandPayloadV3 } from '../protocol/protocol-v3.js';
 import type { MasterApp, MasterNode } from './types.js';
 
 const CIPHER_KEY = Buffer.alloc(32, 9);

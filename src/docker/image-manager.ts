@@ -165,8 +165,10 @@ export class ImageManager {
 	}
 
 	/**
-	 * Load images from a tarball stream (output of `docker save`).
-	 * Returns the repo:tags loaded by parsing the progress event "Loaded image: <repoTag>".
+	 * Load images from a tarball stream (output of `docker save`/OCI archive).
+	 * Returns every loaded reference — both `Loaded image: <repoTag>` and
+	 * `Loaded image ID: sha256:...` (untagged/content-addressed loads, the
+	 * local-runtime ABI's OCI-archive path) — in the order Docker reported them.
 	 */
 	async loadFromStream(
 		input: NodeJS.ReadableStream,
@@ -195,9 +197,11 @@ export class ImageManager {
 				(ev: { stream?: string; error?: string }) => {
 					onProgress(ev);
 					if (ev.error) return;
-					// "Loaded image: nginx:latest\n" or "Loaded image ID: sha256:..."
+					// "Loaded image: nginx:latest\n" or "Loaded image ID: sha256:..." —
+					// both are captured; callers that only want repo:tags filter the
+					// `sha256:` entries out themselves.
 					const m = /Loaded image(?: ID)?:\s*(\S+)/.exec(ev.stream ?? '');
-					if (m && m[1] && !m[1].startsWith('sha256:')) {
+					if (m && m[1]) {
 						loaded.push(m[1]);
 					}
 				},

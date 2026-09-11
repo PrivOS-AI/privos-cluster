@@ -20,7 +20,7 @@ import {
 	type ClusterLifecycleStepV3,
 	type ResourceCleanupResultV3,
 	type RuntimeResourceDescriptorV3,
-} from './protocol-v3.js';
+} from '../protocol/protocol-v3.js';
 import { canonicalJson, sha256Base64Url } from '../security/artifacts.js';
 import type { ClusterLifecycleOperation, MasterNode, RuntimeResourceInventory } from './types.js';
 

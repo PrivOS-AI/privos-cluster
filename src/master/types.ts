@@ -7,7 +7,7 @@ import type {
 	ResourceCleanupResultV3,
 	RuntimeResourceDescriptorV3,
 	RuntimeResourceKindV3,
-} from './protocol-v3.js';
+} from '../protocol/protocol-v3.js';
 
 export type AvailabilityTier = 'single' | 'ha';
 export type NodeStatus = 'ACTIVE' | 'DRAINING' | 'RETIRED';

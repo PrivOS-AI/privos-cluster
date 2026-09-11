@@ -19,7 +19,7 @@ import {
 	type ClusterReconfigureAcknowledgementPayloadV3,
 	type ClusterRuntimeInventoryAttestationPayloadV3,
 	type ClusterUpgradeAcknowledgementPayloadV3,
-} from './protocol-v3.js';
+} from '../protocol/protocol-v3.js';
 import { runtimeResourceInventoryHashV3 } from './runtime-resource-inventory.js';
 import type {
 	ClusterSigningIdentityRecord,

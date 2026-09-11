@@ -1,6 +1,8 @@
 import type { FastifyPluginAsync } from 'fastify';
 import fp from 'fastify-plugin';
 
+import { config, isLocalRuntimeEnabled } from '../config.js';
+
 const PROTOCOL_VERSION = '1.0';
 const CLUSTER_TYPE = 'docker';
 
@@ -9,6 +11,8 @@ interface ClusterCapabilities {
     version: string;
     protocol: string;
     type: 'docker' | 'k8s' | 'swarm' | 'custom';
+    /** Advertised only when the `privos-local-runtime-driver-v1` ABI routes are registered (phase 6). */
+    localRuntimeAbi?: 'privos-local-runtime-driver-v1';
     features: {
         deploy: boolean;
         start: boolean;
@@ -63,7 +67,9 @@ const CAPABILITIES: ClusterCapabilities = {
 };
 
 const capabilitiesHandler: FastifyPluginAsync = async (fastify) => {
-    fastify.get('/api/v1/capabilities', async () => CAPABILITIES);
+    fastify.get('/api/v1/capabilities', async () => (
+        isLocalRuntimeEnabled(config) ? { ...CAPABILITIES, localRuntimeAbi: 'privos-local-runtime-driver-v1' as const } : CAPABILITIES
+    ));
 };
 
 export default fp(capabilitiesHandler, { name: 'capabilities' });

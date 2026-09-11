@@ -20,7 +20,7 @@ import {
 	ClusterReconfigureAcknowledgementPayloadV3Schema,
 	ClusterReconfigureCommandPayloadV3Schema,
 	RuntimeResourceDescriptorV3Schema,
-} from './protocol-v3.js';
+} from '../protocol/protocol-v3.js';
 
 const VECTORS_DIR =
 	process.env.PRIVOS_CONTRACT_VECTORS_DIR ||

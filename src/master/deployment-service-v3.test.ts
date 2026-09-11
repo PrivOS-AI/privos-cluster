@@ -5,7 +5,7 @@ import test from 'node:test';
 import { jwkThumbprint, sha256Base64Url } from '../security/artifacts.js';
 import { DeploymentService } from './deployment-service.js';
 import { KeyCipher } from './key-crypto.js';
-import type { McpDeploymentGrantPayloadV3 } from './protocol-v3.js';
+import type { McpDeploymentGrantPayloadV3 } from '../protocol/protocol-v3.js';
 import type { AppLifecycleEvent, MasterApp, MasterNode, RuntimeResourceInventory } from './types.js';
 
 function clone<T>(value: T): T {

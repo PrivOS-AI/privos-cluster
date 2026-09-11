@@ -2,6 +2,7 @@ import fp from 'fastify-plugin';
 import type { FastifyPluginAsync, FastifyRequest, FastifyReply } from 'fastify';
 import jwt from 'jsonwebtoken';
 import { config } from '../config.js';
+import { resolveClusterSecret } from '../cluster-secret.js';
 
 // ---------------------------------------------------------------------------
 // Type augmentation
@@ -69,8 +70,14 @@ const authPlugin: FastifyPluginAsync = async (fastify) => {
 				const authorization = req.headers.authorization;
 				if (!authorization?.startsWith('Bearer ')) throw new Error('missing bearer token');
 				const token = authorization.slice('Bearer '.length);
-				const secret = config.FLEET_MODE ? config.FLEET_NODE_KEY : config.JWT_SECRET;
-				if (!secret) throw new Error('authentication key is not configured');
+				// Resolved per request (not the boot-frozen config value) so a
+				// credential acquired after boot, or rotated by a re-pair, takes
+				// effect without a restart. Fleet mode is unaffected — it still
+				// verifies against the fleet node key.
+				const secret = config.FLEET_MODE ? config.FLEET_NODE_KEY : resolveClusterSecret();
+				if (!secret) {
+					return reply.code(401).send({ error: 'cluster_unpaired', reason: 'no cluster credential resolved' });
+				}
 				req.clusterAuth = verifyClusterToken(token, {
 					fleetMode: config.FLEET_MODE,
 					secret,

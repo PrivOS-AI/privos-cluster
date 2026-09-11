@@ -15,6 +15,12 @@ export function imageRepositoryOf(image: string): string {
 }
 
 export function resolveImmutableImageReference(image: string, tag = 'latest', digest?: string): string {
+    // A bare content address (no repository) is already immutable and
+    // unambiguous on its own — Docker's `Image` field for a local-runtime
+    // container is the exact `sha256:<64hex>` config/manifest digest the
+    // artifact store proved, never a `repo@sha256:` reference. Appending
+    // `:<tag>` to it would produce an invalid, unresolvable reference.
+    if (DIGEST_PATTERN.test(image)) return image;
     if (!digest) {
         if (/@sha256:[a-f0-9]{64}$/.test(image)) return image;
         return `${image}:${tag}`;

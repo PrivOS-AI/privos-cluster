@@ -58,6 +58,65 @@ docker compose up --build  # docker
 npm test                   # unit tests (node:test + tsx)
 ```
 
+## Installing as a managed service (`@privos_ai/app-cluster`)
+
+The published npm package `@privos_ai/app-cluster` ships a `privos-app-cluster`
+CLI that installs, updates, and removes the App Cluster as a **systemd system
+service on Linux**. This is the supported way to run an App Cluster outside
+the `privos-mt` fleet (community and BYO-host deployments).
+
+**Linux only.** The supervised service manages a systemd unit, so `install`,
+`update`, `uninstall`, and the running service all require Linux. On macOS,
+`install` refuses immediately (exit code 2) and prints the foreground `run`
+command instead — macOS is a developer-only path in v1, with no LaunchDaemon
+equivalent. Any other platform (e.g. Windows) is out of scope and also
+refuses.
+
+```bash
+# Linux: install and start as a systemd service
+sudo npx @privos_ai/app-cluster install \
+  --hub-url https://hub.example.com \
+  --pair-token-file /path/to/pair-token   # or --pair-token-stdin
+
+# macOS / local development: run in the foreground instead (not for production)
+npx @privos_ai/app-cluster run \
+  --hub-url https://hub.example.com \
+  --pair-token-file /path/to/pair-token
+
+# Reinstall the global package and restart the service (never rewrites env/state)
+sudo privos-app-cluster update
+
+# Stop and remove the service (env file and state dir survive by default)
+sudo privos-app-cluster uninstall
+sudo privos-app-cluster uninstall --purge   # also removes env file, state dir, system user
+
+# Local diagnostic summary — reads local state only, makes no network call
+privos-app-cluster status
+```
+
+Avoid `--pair-token <token>` on argv: it leaks into `ps`, shell history, and
+sudo/auditd logs. Prefer `--pair-token-file <path>` (Hub's pairing modal
+prints this form) or `--pair-token-stdin`.
+
+`install` verifies the package's sigstore provenance attestation before
+installing, always runs the global install with `--ignore-scripts`, and is
+idempotent — re-running it with the same arguments converges without
+re-pairing. It creates a dedicated `privos-app-cluster` system user (no home
+directory) and writes `/etc/privos-app-cluster/app-cluster.env` at `0600`
+containing only `PRIVOS_HUB_URL`, `PRIVOS_PAIR_TOKEN_FILE`,
+`PRIVOS_STATE_DIR`, and `CLUSTER_OPERATOR_ROUTES=off` — it never sets `HOST`,
+`PORT`, or `JWT_SECRET`. The pair token itself lives in its own `0600` file
+inside the state dir, read once and deleted after redemption.
+
+**`docker.sock` is host-root-equivalent.** The service user is added to the
+`docker` group so it can manage containers — that group membership is
+root-equivalent on this host (it can mount the host filesystem into a
+container). Treat the box the App Cluster runs on as an extension of Docker's
+trust boundary, and keep `CLUSTER_OPERATOR_ROUTES=off` unless you specifically
+need the operator terminal/file-browser routes.
+
+**Windows is out of scope** in v1 — there is no installer path for it.
+
 ## Health
 
 ```bash
@@ -151,14 +210,21 @@ Greenfield (no legacy containers to preserve):
 
 ```
 src/
-├── server.ts        # Fastify entry (no DB init)
-├── config.ts        # env validation (zod)
-├── docker/          # dockerode wrappers + docker-state (labels → Container) + mapper
-├── proxy/           # native HTTP reverse proxy (Host → container) + WS passthrough
-├── services/        # lifecycle, health-monitor (in-memory), settings (env), resource-check
-├── handlers/        # REST + WebSocket routes
-├── auth/            # JWT verify
-└── types/           # shared types
+├── server.ts         # Fastify entry (no DB init)
+├── config.ts         # env validation (zod)
+├── state-dir.ts       # 0700 state dir + 0600 credential/pair-token file read/write
+├── cli/
+│   ├── privos-app-cluster.ts   # published bin: install|run|update|uninstall|status
+│   └── service-install.ts      # pure renderers (env/unit) + thin privileged executor
+├── protocol/          # Hub↔master v3 protocol schemas (shared by the published build
+│                       # and the private master, published dist/master/** is excluded)
+├── docker/           # dockerode wrappers + docker-state (labels → Container) + mapper
+├── proxy/            # native HTTP reverse proxy (Host → container) + WS passthrough
+├── services/         # lifecycle, health-monitor (in-memory), settings (env), resource-check
+├── handlers/         # REST + WebSocket routes
+├── auth/             # JWT verify
+├── master/           # private fleet multiplexer — never published (see package.json `files`)
+└── types/            # shared types
 scripts/
 ├── setup-wizard.ts        # `npm run setup` — writes .env + prints cloudflared config
 └── cloudflared-ingress.ts # pure ingress/DNS/env-merge renderers (unit tested)

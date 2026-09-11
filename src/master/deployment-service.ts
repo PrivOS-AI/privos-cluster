@@ -20,7 +20,7 @@ import {
 	type ClusterUpgradeCommandPayloadV3,
 	type McpDeploymentGrantPayloadV3,
 	type RuntimeResourceDescriptorV3,
-} from './protocol-v3.js';
+} from '../protocol/protocol-v3.js';
 import {
 	buildCapturingRuntimeResourceInventoryV3,
 	finalizeRuntimeResourceInventoryV3,

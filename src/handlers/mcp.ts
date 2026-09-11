@@ -17,7 +17,7 @@ import { deployManagedApp, reconfigureManagedAppV3 } from '../services/lifecycle
 import { mcpBrokerManager, nodeIdentity } from '../services/mcp-broker.js';
 import { getClusterMcpMetrics, recordClusterMcpEvent } from '../services/mcp-observability.js';
 import { getAppNetworkName } from '../services/settings-service.js';
-import { RuntimeResourceDescriptorV3Schema } from '../master/protocol-v3.js';
+import { RuntimeResourceDescriptorV3Schema } from '../protocol/protocol-v3.js';
 
 const InspectSchema = z.object({
 	image: z.string().min(1),

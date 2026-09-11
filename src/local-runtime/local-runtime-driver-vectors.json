@@ -1,0 +1,220 @@
+{
+  "ensureReady": {
+    "protocol_version": 3,
+    "operation": "ENSURE_READY",
+    "installation_id": "installation-local-1",
+    "workspace_id": "workspace-1",
+    "deployment_id": "deployment-1",
+    "listing_id": "listing-1",
+    "version_id": "version-1",
+    "generation_id": "generation-1",
+    "generation_number": 1,
+    "descriptor_artifact_hash": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "resource_manifest_hash": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+    "permission_contract_hash": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+    "runtime_authorization": {
+      "security_mode": "runtime-v3",
+      "hub_kid": "Cw2abzT4NR_Pi3PZCD7Y-NnTH3UKcA-Xdu3wHLwTZVI",
+      "hub_public_jwk": {
+        "kty": "EC",
+        "crv": "P-256",
+        "x": "QnQhvyhIzIERjpS3t5rHEiNULLmV_ABrViKZRO32IQE",
+        "y": "c4BDW1f1M7vJfiqYgLe537irq5Y6OvZ-ay9d-mYMYLw"
+      },
+      "mcp_app_id": "mcp-app-1",
+      "manifest_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "allow_unsigned_preactivation_readiness": true
+    },
+    "artifact": {
+      "path": "/var/lib/privos/marketplace/apps/local-1.privos-app",
+      "digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "size_bytes": 4096
+    },
+    "runtime_spec": {
+      "driver_abi": "privos-local-runtime-driver-v1",
+      "artifact_format": "oci-image-archive-v1",
+      "port": 3001,
+      "resources": {
+        "memory_mb": 512,
+        "cpus": 0.5,
+        "tmp_size_mb": 64
+      }
+    }
+  },
+  "ready": {
+    "protocol_version": 3,
+    "state": "READY",
+    "runtime_id": "local-runtime-25d88c3e6576454fdb2cf6e179d42021",
+    "installation_id": "installation-local-1",
+    "workspace_id": "workspace-1",
+    "deployment_id": "deployment-1",
+    "listing_id": "listing-1",
+    "version_id": "version-1",
+    "generation_id": "generation-1",
+    "generation_number": 1,
+    "descriptor_artifact_hash": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "resource_manifest_hash": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+    "permission_contract_hash": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+    "runtime_authorization": {
+      "security_mode": "runtime-v3",
+      "hub_kid": "Cw2abzT4NR_Pi3PZCD7Y-NnTH3UKcA-Xdu3wHLwTZVI",
+      "hub_public_jwk": {
+        "kty": "EC",
+        "crv": "P-256",
+        "x": "QnQhvyhIzIERjpS3t5rHEiNULLmV_ABrViKZRO32IQE",
+        "y": "c4BDW1f1M7vJfiqYgLe537irq5Y6OvZ-ay9d-mYMYLw"
+      },
+      "mcp_app_id": "mcp-app-1",
+      "manifest_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "allow_unsigned_preactivation_readiness": true
+    },
+    "artifact_digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "endpoint": "http://25d88c3e6576454fdb2cf6e179d42021.mcp-runtime.internal:3001",
+    "supervisor": "DOCKER_UNLESS_STOPPED",
+    "ready_at": 1785816000,
+    "driver_evidence_hash": "AGr_ZFfPAojRJ9YSeb2wKYCACtnha5UnLJsTX2GZLH4"
+  },
+  "activate": {
+    "protocol_version": 3,
+    "operation": "ACTIVATE",
+    "runtime_id": "local-runtime-25d88c3e6576454fdb2cf6e179d42021",
+    "installation_id": "installation-local-1",
+    "workspace_id": "workspace-1",
+    "deployment_id": "deployment-1",
+    "listing_id": "listing-1",
+    "version_id": "version-1",
+    "generation_id": "generation-1",
+    "generation_number": 1,
+    "descriptor_artifact_hash": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "resource_manifest_hash": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+    "permission_contract_hash": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+    "runtime_authorization": {
+      "security_mode": "runtime-v3",
+      "hub_kid": "Cw2abzT4NR_Pi3PZCD7Y-NnTH3UKcA-Xdu3wHLwTZVI",
+      "hub_public_jwk": {
+        "kty": "EC",
+        "crv": "P-256",
+        "x": "QnQhvyhIzIERjpS3t5rHEiNULLmV_ABrViKZRO32IQE",
+        "y": "c4BDW1f1M7vJfiqYgLe537irq5Y6OvZ-ay9d-mYMYLw"
+      },
+      "mcp_app_id": "mcp-app-1",
+      "manifest_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "allow_unsigned_preactivation_readiness": true
+    },
+    "artifact_digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "ensure_ready_request_hash": "ZBlFwEhzGtgPzdH9ytlEeYd5y9bOSeYPWX3DsKYs3dg",
+    "runtime_resource_inventory_hash": "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD",
+    "runtime_approval_receipt_hash": "EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE",
+    "runtime_authorization_epoch": 1
+  },
+  "active": {
+    "protocol_version": 3,
+    "state": "ACTIVE",
+    "runtime_id": "local-runtime-25d88c3e6576454fdb2cf6e179d42021",
+    "installation_id": "installation-local-1",
+    "workspace_id": "workspace-1",
+    "deployment_id": "deployment-1",
+    "listing_id": "listing-1",
+    "version_id": "version-1",
+    "generation_id": "generation-1",
+    "generation_number": 1,
+    "descriptor_artifact_hash": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "resource_manifest_hash": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+    "permission_contract_hash": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+    "runtime_authorization": {
+      "security_mode": "runtime-v3",
+      "hub_kid": "Cw2abzT4NR_Pi3PZCD7Y-NnTH3UKcA-Xdu3wHLwTZVI",
+      "hub_public_jwk": {
+        "kty": "EC",
+        "crv": "P-256",
+        "x": "QnQhvyhIzIERjpS3t5rHEiNULLmV_ABrViKZRO32IQE",
+        "y": "c4BDW1f1M7vJfiqYgLe537irq5Y6OvZ-ay9d-mYMYLw"
+      },
+      "mcp_app_id": "mcp-app-1",
+      "manifest_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "allow_unsigned_preactivation_readiness": true
+    },
+    "artifact_digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "ensure_ready_request_hash": "ZBlFwEhzGtgPzdH9ytlEeYd5y9bOSeYPWX3DsKYs3dg",
+    "runtime_resource_inventory_hash": "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD",
+    "runtime_approval_receipt_hash": "EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE",
+    "runtime_authorization_epoch": 1,
+    "unsigned_readiness_disabled": true,
+    "activated_at": 1785816500,
+    "activation_evidence_hash": "qy7n8lWwuWwkP9M_tIdKfR8CblgWe7mCKKMkCW4yrrQ"
+  },
+  "remove": {
+    "protocol_version": 3,
+    "operation": "REMOVE",
+    "runtime_id": "local-runtime-25d88c3e6576454fdb2cf6e179d42021",
+    "installation_id": "installation-local-1",
+    "workspace_id": "workspace-1",
+    "deployment_id": "deployment-1",
+    "listing_id": "listing-1",
+    "version_id": "version-1",
+    "generation_id": "generation-1",
+    "generation_number": 1,
+    "descriptor_artifact_hash": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "resource_manifest_hash": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+    "permission_contract_hash": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+    "runtime_authorization": {
+      "security_mode": "runtime-v3",
+      "hub_kid": "Cw2abzT4NR_Pi3PZCD7Y-NnTH3UKcA-Xdu3wHLwTZVI",
+      "hub_public_jwk": {
+        "kty": "EC",
+        "crv": "P-256",
+        "x": "QnQhvyhIzIERjpS3t5rHEiNULLmV_ABrViKZRO32IQE",
+        "y": "c4BDW1f1M7vJfiqYgLe537irq5Y6OvZ-ay9d-mYMYLw"
+      },
+      "mcp_app_id": "mcp-app-1",
+      "manifest_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "allow_unsigned_preactivation_readiness": true
+    },
+    "artifact_digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+  },
+  "absent": {
+    "protocol_version": 3,
+    "state": "ABSENT",
+    "runtime_id": "local-runtime-25d88c3e6576454fdb2cf6e179d42021",
+    "installation_id": "installation-local-1",
+    "workspace_id": "workspace-1",
+    "deployment_id": "deployment-1",
+    "listing_id": "listing-1",
+    "version_id": "version-1",
+    "generation_id": "generation-1",
+    "generation_number": 1,
+    "descriptor_artifact_hash": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "resource_manifest_hash": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+    "permission_contract_hash": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+    "runtime_authorization": {
+      "security_mode": "runtime-v3",
+      "hub_kid": "Cw2abzT4NR_Pi3PZCD7Y-NnTH3UKcA-Xdu3wHLwTZVI",
+      "hub_public_jwk": {
+        "kty": "EC",
+        "crv": "P-256",
+        "x": "QnQhvyhIzIERjpS3t5rHEiNULLmV_ABrViKZRO32IQE",
+        "y": "c4BDW1f1M7vJfiqYgLe537irq5Y6OvZ-ay9d-mYMYLw"
+      },
+      "mcp_app_id": "mcp-app-1",
+      "manifest_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "allow_unsigned_preactivation_readiness": true
+    },
+    "artifact_digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "checked_at": 1785817000,
+    "removal_evidence_hash": "sQEeCEsiQdRKtYBy36W7GMRTg_Cm1AjGDYZHTRowbsc"
+  },
+  "physicalRuntimeResources": [
+    { "kind": "local-artifact", "resourceId": "r3:installation-generation:artifact" },
+    { "kind": "local-runtime", "resourceId": "local-runtime-25d88c3e6576454fdb2cf6e179d42021" }
+  ],
+  "invalidReadyEvidence": [
+    { "name": "ad-hoc-supervisor", "field": "supervisor", "value": "NOHUP" },
+    { "name": "generation-transplant", "field": "generation_id", "value": "generation-2" },
+    { "name": "artifact-substitution", "field": "artifact_digest", "value": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" }
+  ],
+  "invalidActivationEvidence": [
+    { "name": "inventory-substitution", "field": "runtime_resource_inventory_hash", "value": "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF" },
+    { "name": "approval-substitution", "field": "runtime_approval_receipt_hash", "value": "GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG" },
+    { "name": "unsigned-readiness-reopened", "field": "unsigned_readiness_disabled", "value": false }
+  ]
+}

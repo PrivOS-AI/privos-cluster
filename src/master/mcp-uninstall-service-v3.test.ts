@@ -2,8 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { McpUninstallServiceV3 } from './mcp-uninstall-service-v3.js';
-import { ResourceCleanupResultV3Schema } from './protocol-v3.js';
-import type { RuntimeResourceDescriptorV3 } from './protocol-v3.js';
+import { ResourceCleanupResultV3Schema } from '../protocol/protocol-v3.js';
+import type { RuntimeResourceDescriptorV3 } from '../protocol/protocol-v3.js';
 
 const expectedResources: RuntimeResourceDescriptorV3[] = [
 	{ kind: 'CONTAINER', resourceId: 'container:replica-1', ownershipScope: 'INSTALLATION_GENERATION', nodeId: 'node-1', replicaId: '2f5b7bd6-1f7d-4a2e-9a1e-2a5a0f7f0d11', attributes: { containerId: 'container-1' } },

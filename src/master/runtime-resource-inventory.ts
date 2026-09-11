@@ -3,7 +3,7 @@ import {
 	MCP_PROTOCOL_V3,
 	RuntimeResourceDescriptorV3Schema,
 	type RuntimeResourceDescriptorV3,
-} from './protocol-v3.js';
+} from '../protocol/protocol-v3.js';
 import type { RuntimeResourceInventory } from './types.js';
 
 export type RuntimeResourceInventoryAffinityV3 = {

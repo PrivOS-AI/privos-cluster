@@ -22,6 +22,23 @@ const ConfigSchema = z.object({
 	CLUSTER_OPERATOR_ROUTES: z.enum(['on', 'off']).default('off'),
 
 	JWT_SECRET: z.string().min(16, 'JWT_SECRET must be at least 16 chars').optional(),
+	// Dial-out tunnel (community/BYO app clusters). PRIVOS_HUB_URL being set is
+	// what makes this an unlisted tunnel-mode process: no local listener, no
+	// hard requirement on JWT_SECRET at boot (resolveClusterSecret() resolves
+	// the paired credential per request instead — see src/cluster-secret.ts).
+	PRIVOS_HUB_URL: z.string().url().optional(),
+	PRIVOS_STATE_DIR: z.string().default('/var/lib/privos-app-cluster'),
+	PRIVOS_TUNNEL_ENABLED: z.enum(['on', 'off']).optional(),
+	// `privos-local-runtime-driver-v1` ABI (phase 6) — the five local-runtime
+	// routes plus the tunnel `forward` frame. Unset means "on iff tunnel mode"
+	// (see `isLocalRuntimeEnabled`); `off` always wins, matching the
+	// `CLUSTER_OPERATOR_ROUTES` on/off/unset precedent above.
+	CLUSTER_LOCAL_RUNTIME: z.enum(['on', 'off']).optional(),
+	CLUSTER_LOCAL_RUNTIME_MAX_ARTIFACT_BYTES: z.coerce.number().int().positive().default(250_000_000),
+	// Free-space preflight multiplier: temp file (already on disk by the time
+	// `stage` runs) + re-materialized tar + loaded image, all coexisting
+	// during `docker load` in the worst case.
+	CLUSTER_LOCAL_RUNTIME_FREE_SPACE_MULTIPLIER: z.coerce.number().int().min(1).default(3),
 	FLEET_NODE_ID: z.string().regex(/^[A-Za-z0-9-]+$/).optional(),
 	FLEET_NODE_KEY: z.string().min(32, 'FLEET_NODE_KEY must be at least 32 chars').optional(),
 	FLEET_AGENT_CONTAINER: z.string().default('privos-cluster'),
@@ -58,11 +75,24 @@ const ConfigSchema = z.object({
 	// CORS — comma-separated origins, or "*" for any. Empty disables CORS entirely.
 	CORS_ORIGIN: z.string().default('http://localhost:5173'),
 }).superRefine((cfg, ctx) => {
-	if (!cfg.FLEET_MODE && !cfg.JWT_SECRET) {
+	// Outside fleet mode, boot requires EITHER a JWT_SECRET (fleet/master HTTP
+	// deployment path, unchanged) OR a PRIVOS_HUB_URL (tunnel mode). A tunnel
+	// process with no JWT_SECRET and no paired credential yet still boots,
+	// dials, and waits — resolveClusterSecret() returning none at request time
+	// is refused per-request (401 cluster_unpaired), not a boot-time crash.
+	if (!cfg.FLEET_MODE && !cfg.JWT_SECRET && !cfg.PRIVOS_HUB_URL) {
 		ctx.addIssue({
 			code: z.ZodIssueCode.custom,
 			path: ['JWT_SECRET'],
-			message: 'JWT_SECRET is required outside fleet mode',
+			message: 'JWT_SECRET is required outside fleet mode, unless PRIVOS_HUB_URL is set (tunnel mode)',
+		});
+	}
+
+	if (cfg.PRIVOS_TUNNEL_ENABLED === 'on' && !cfg.PRIVOS_HUB_URL) {
+		ctx.addIssue({
+			code: z.ZodIssueCode.custom,
+			path: ['PRIVOS_TUNNEL_ENABLED'],
+			message: 'PRIVOS_TUNNEL_ENABLED=on requires PRIVOS_HUB_URL',
 		});
 	}
 
@@ -104,6 +134,32 @@ const ConfigSchema = z.object({
 });
 
 export type Config = z.infer<typeof ConfigSchema>;
+
+/**
+ * True when this process dials the Hub over the dial-out tunnel and opens no
+ * local TCP listener. `PRIVOS_TUNNEL_ENABLED=off` always wins (explicit
+ * opt-out); otherwise tunnel mode is on whenever `PRIVOS_HUB_URL` is set —
+ * the "default on when a hub URL is set" rule.
+ */
+export function isTunnelMode(cfg: Pick<Config, 'PRIVOS_HUB_URL' | 'PRIVOS_TUNNEL_ENABLED'>): boolean {
+	if (cfg.PRIVOS_TUNNEL_ENABLED === 'off') return false;
+	return Boolean(cfg.PRIVOS_HUB_URL);
+}
+
+/**
+ * True when the `privos-local-runtime-driver-v1` ABI routes + `forward` frame
+ * handling are active. `off` always wins (explicit opt-out, e.g. a fleet/master
+ * HTTP deployment that never wants this surface); otherwise on exactly when
+ * this process is in tunnel mode — this ABI only makes sense for a
+ * customer-owned box dialing out, never for the fleet/master HTTP path.
+ */
+export function isLocalRuntimeEnabled(
+	cfg: Pick<Config, 'PRIVOS_HUB_URL' | 'PRIVOS_TUNNEL_ENABLED' | 'CLUSTER_LOCAL_RUNTIME'>,
+): boolean {
+	if (cfg.CLUSTER_LOCAL_RUNTIME === 'off') return false;
+	if (cfg.CLUSTER_LOCAL_RUNTIME === 'on') return true;
+	return isTunnelMode(cfg);
+}
 
 function loadConfig(): Config {
 	const parsed = ConfigSchema.safeParse(process.env);

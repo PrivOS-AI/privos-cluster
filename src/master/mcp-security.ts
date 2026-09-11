@@ -28,7 +28,7 @@ import {
 	type GenerationAffinityV3,
 	type McpDeploymentGrantPayloadV3,
 	type McpDispatchAssertionPayloadV3,
-} from './protocol-v3.js';
+} from '../protocol/protocol-v3.js';
 import { runtimeResourceInventoryHashV3 } from './runtime-resource-inventory.js';
 
 const Digest = z.string().regex(/^sha256:[a-f0-9]{64}$/);

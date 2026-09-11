@@ -12,7 +12,7 @@ import {
 import {
 	parseDispatchAssertionPayloadV3,
 	verifyDispatchAssertionV3,
-} from '../master/protocol-v3.js';
+} from '../protocol/protocol-v3.js';
 
 const Digest = z.string().regex(/^sha256:[a-f0-9]{64}$/);
 const Payload = z.object({

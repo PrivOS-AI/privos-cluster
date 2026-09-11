@@ -1,0 +1,226 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://privos.io/contracts/mcp-app-local-runtime-driver-v3.schema.json",
+  "title": "PrivOS MCP App supervised local runtime driver ABI v1",
+  "x-privos-http-abi": {
+    "transport": "unix-socket",
+    "ensure_ready": {
+      "method": "PUT",
+      "path_template": "/v3/runtimes/by-generation/{generation_id}",
+      "request_variant": "ENSURE_READY",
+      "response_variant": "READY"
+    },
+    "status": {
+      "method": "GET",
+      "path_template": "/v3/runtimes/{runtime_id}",
+      "request_body": "none",
+      "response_variant": "READY",
+      "semantics": "EXACT_READY_REPLAY"
+    },
+    "activate": {
+      "method": "PUT",
+      "path_template": "/v3/runtimes/{runtime_id}/activation",
+      "request_variant": "ACTIVATE",
+      "response_variant": "ACTIVE",
+      "semantics": "ONE_WAY_UNSIGNED_READINESS_DISABLE"
+    },
+    "phase_3_remove": {
+      "method": "DELETE",
+      "path_template": "/v3/runtimes/{runtime_id}",
+      "request_variant": "REMOVE",
+      "response_variant": "ABSENT"
+    }
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "installation_id",
+    "workspace_id",
+    "deployment_id",
+    "listing_id",
+    "version_id",
+    "generation_id",
+    "generation_number",
+    "descriptor_artifact_hash",
+    "resource_manifest_hash",
+    "permission_contract_hash",
+    "runtime_authorization"
+  ],
+  "properties": {
+    "protocol_version": { "const": 3 },
+    "operation": { "enum": ["ENSURE_READY", "ACTIVATE", "REMOVE"] },
+    "state": { "enum": ["READY", "ACTIVE", "ABSENT"] },
+    "installation_id": { "$ref": "#/$defs/id" },
+    "workspace_id": { "$ref": "#/$defs/id" },
+    "deployment_id": { "$ref": "#/$defs/id" },
+    "listing_id": { "$ref": "#/$defs/id" },
+    "version_id": { "$ref": "#/$defs/id" },
+    "generation_id": { "$ref": "#/$defs/id" },
+    "generation_number": { "type": "integer", "minimum": 1 },
+    "descriptor_artifact_hash": { "$ref": "#/$defs/hash" },
+    "resource_manifest_hash": { "$ref": "#/$defs/hash" },
+    "permission_contract_hash": { "$ref": "#/$defs/hash" },
+    "runtime_authorization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "security_mode", "hub_kid", "hub_public_jwk", "mcp_app_id",
+        "manifest_digest", "allow_unsigned_preactivation_readiness"
+      ],
+      "properties": {
+        "security_mode": { "const": "runtime-v3" },
+        "hub_kid": { "$ref": "#/$defs/hash" },
+        "hub_public_jwk": { "$ref": "#/$defs/hubPublicJwk" },
+        "mcp_app_id": { "$ref": "#/$defs/id" },
+        "manifest_digest": { "$ref": "#/$defs/sha256" },
+        "allow_unsigned_preactivation_readiness": { "const": true }
+      },
+      "x-privos-container-env": {
+        "security_mode": "PRIVOS_RUNTIME_SECURITY_MODE",
+        "dispatch_trust": "PRIVOS_RUNTIME_DISPATCH_TRUST_V3",
+        "unsigned_readiness_opt_in": "PRIVOS_RUNTIME_ALLOW_UNSIGNED_PREACTIVATION_READINESS"
+      }
+    },
+    "runtime_id": { "$ref": "#/$defs/id" },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "digest", "size_bytes"],
+      "properties": {
+        "path": { "type": "string", "pattern": "^/", "maxLength": 4096 },
+        "digest": { "$ref": "#/$defs/sha256" },
+        "size_bytes": { "type": "integer", "minimum": 1, "maximum": 250000000 }
+      }
+    },
+    "runtime_spec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["driver_abi", "artifact_format", "port", "resources"],
+      "properties": {
+        "driver_abi": { "const": "privos-local-runtime-driver-v1" },
+        "artifact_format": { "const": "oci-image-archive-v1" },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "resources": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["memory_mb", "cpus", "tmp_size_mb"],
+          "properties": {
+            "memory_mb": { "type": "integer", "minimum": 64, "maximum": 16384 },
+            "cpus": { "type": "number", "minimum": 0.1, "maximum": 16 },
+            "tmp_size_mb": { "type": "integer", "minimum": 16, "maximum": 4096 }
+          }
+        }
+      }
+    },
+    "artifact_digest": { "$ref": "#/$defs/sha256" },
+    "ensure_ready_request_hash": {
+      "$ref": "#/$defs/hash",
+      "x-privos-hash-input": "canonical strict ENSURE_READY request"
+    },
+    "runtime_resource_inventory_hash": { "$ref": "#/$defs/hash" },
+    "runtime_approval_receipt_hash": { "$ref": "#/$defs/hash" },
+    "runtime_authorization_epoch": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "unsigned_readiness_disabled": { "const": true },
+    "endpoint": {
+      "type": "string",
+      "format": "uri",
+      "pattern": "^https?://",
+      "maxLength": 2048
+    },
+    "supervisor": { "enum": ["DOCKER_UNLESS_STOPPED", "SYSTEMD"] },
+    "ready_at": { "type": "integer", "minimum": 1 },
+    "checked_at": { "type": "integer", "minimum": 1 },
+    "driver_evidence_hash": {
+      "$ref": "#/$defs/hash",
+      "x-privos-hash-input": "canonical READY object with driver_evidence_hash omitted"
+    },
+    "activated_at": { "type": "integer", "minimum": 1 },
+    "activation_evidence_hash": {
+      "$ref": "#/$defs/hash",
+      "x-privos-hash-input": "canonical ACTIVE object with activation_evidence_hash omitted"
+    },
+    "removal_evidence_hash": {
+      "$ref": "#/$defs/hash",
+      "x-privos-hash-input": "canonical ABSENT object with removal_evidence_hash omitted"
+    }
+  },
+  "oneOf": [
+    {
+      "title": "Ensure desired runtime",
+      "required": ["operation", "artifact", "runtime_spec"],
+      "properties": { "operation": { "const": "ENSURE_READY" } },
+      "not": { "anyOf": [{ "required": ["state"] }, { "required": ["runtime_id"] }] }
+    },
+    {
+      "title": "Ready evidence",
+      "required": [
+        "state", "runtime_id", "artifact_digest", "endpoint", "supervisor",
+        "ready_at", "driver_evidence_hash"
+      ],
+      "properties": { "state": { "const": "READY" } },
+      "not": { "required": ["operation"] }
+    },
+    {
+      "title": "Activate ready runtime and close unsigned readiness",
+      "required": [
+        "operation", "runtime_id", "artifact_digest", "ensure_ready_request_hash",
+        "runtime_resource_inventory_hash", "runtime_approval_receipt_hash",
+        "runtime_authorization_epoch"
+      ],
+      "properties": { "operation": { "const": "ACTIVATE" } },
+      "not": { "required": ["state"] }
+    },
+    {
+      "title": "Active signed-only evidence",
+      "required": [
+        "state", "runtime_id", "artifact_digest", "ensure_ready_request_hash",
+        "runtime_resource_inventory_hash", "runtime_approval_receipt_hash",
+        "runtime_authorization_epoch", "unsigned_readiness_disabled",
+        "activated_at", "activation_evidence_hash"
+      ],
+      "properties": { "state": { "const": "ACTIVE" } },
+      "not": { "required": ["operation"] }
+    },
+    {
+      "title": "Remove desired runtime",
+      "required": ["operation", "runtime_id", "artifact_digest"],
+      "properties": { "operation": { "const": "REMOVE" } },
+      "not": { "required": ["state"] }
+    },
+    {
+      "title": "Verified absence evidence",
+      "required": [
+        "state", "runtime_id", "artifact_digest", "checked_at",
+        "removal_evidence_hash"
+      ],
+      "properties": { "state": { "const": "ABSENT" } },
+      "not": { "required": ["operation"] }
+    }
+  ],
+  "$defs": {
+    "id": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "hash": { "type": "string", "pattern": "^[A-Za-z0-9_-]{43}$" },
+    "p256Coordinate": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{43}$",
+      "x-privos-validation": "canonical unpadded base64url of exactly 32 bytes and point on P-256"
+    },
+    "sha256": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+    "hubPublicJwk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kty", "crv", "x", "y"],
+      "properties": {
+        "kty": { "const": "EC" },
+        "crv": { "const": "P-256" },
+        "x": { "$ref": "#/$defs/p256Coordinate" },
+        "y": { "$ref": "#/$defs/p256Coordinate" }
+      }
+    }
+  }
+}

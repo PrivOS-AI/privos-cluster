@@ -6,7 +6,7 @@ import { KeyCipher } from './key-crypto.js';
 import {
 	verifyClusterFinalAcknowledgementV3,
 	verifyClusterRuntimeInventoryAttestationV3,
-} from './protocol-v3.js';
+} from '../protocol/protocol-v3.js';
 import { buildRuntimeResourceInventoryV3 } from './runtime-resource-inventory.js';
 import type { ClusterSigningIdentityRecord, RuntimeResourceInventory } from './types.js';
 
