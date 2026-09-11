@@ -1,0 +1,46 @@
+name: publish-app-cluster
+
+# Publishes @privos_ai/app-cluster to npm WITH sigstore provenance.
+#
+# Provenance is mandatory here, not optional: the privos-app-cluster installer
+# refuses to install any version that has no registry attestation
+# (verifyProvenanceOrThrow in src/cli/service-install.ts), because the service
+# runs with docker.sock access and is root-equivalent on every customer machine.
+# `npm publish --provenance` on a laptop fails with "provider: null" — provenance
+# can only be generated from an OIDC-enabled CI run, so this workflow is the only
+# supported publish path for this package.
+#
+# One-time setup:
+#   - Repo secret NPM_TOKEN = an npm *Automation* access token for the @privos_ai
+#     scope. Automation tokens bypass the interactive 2FA OTP that blocks CI.
+#
+# Trigger: push a tag `v<version>` that matches package.json's version, or run
+# the workflow manually. GitHub evaluates this file at the pushed ref, so cut the
+# tag from a branch that contains it (privos-mt).
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  id-token: write # required for npm provenance (OIDC)
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      # prepublishOnly runs the build; provenance is generated from this OIDC run.
+      - run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
