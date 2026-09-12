@@ -7,7 +7,7 @@ import path from 'node:path';
 import { afterEach, describe, test } from 'node:test';
 import jwt from 'jsonwebtoken';
 
-import { CREDENTIAL_FILENAME, PAIR_TOKEN_FILENAME, readStateFile, writeStateFile } from '../state-dir.js';
+import { CLUSTER_ID_FILENAME, CREDENTIAL_FILENAME, PAIR_TOKEN_FILENAME, readStateFile, writeStateFile } from '../state-dir.js';
 import { MAX_CHUNK_BYTES } from './frames.js';
 import {
 	BACKOFF_CAP_MS,
@@ -369,6 +369,35 @@ describe('paired frame', () => {
 		socket.emit('message', JSON.stringify({ t: 'paired', clusterId: 'cl_test', credential: 'b64:new-credential' }), false);
 		assert.equal(readStateFile(stateDir, CREDENTIAL_FILENAME), 'b64:new-credential');
 		assert.equal(readStateFile(stateDir, PAIR_TOKEN_FILENAME), undefined);
+		client.stop();
+	});
+
+	// The Hub keys a tunnel cluster by its own row id and resolves it from the
+	// connect JWT's `kid`. Dropping the assigned id means every reconnect after a
+	// successful pairing presents the local default and is refused 401 forever.
+	test('persists the Hub-assigned cluster id', () => {
+		const stateDir = makeTmpDir();
+		const { client, openFirst } = makeHarness({ stateDir });
+		const socket = openFirst();
+		socket.emit('message', JSON.stringify({ t: 'paired', clusterId: 'hub-assigned-id', credential: 'b64:c' }), false);
+		assert.equal(readStateFile(stateDir, CLUSTER_ID_FILENAME), 'hub-assigned-id');
+		client.stop();
+	});
+
+	test('signs later connects with the Hub-assigned id, not the local default', () => {
+		const stateDir = makeTmpDir();
+		writeStateFile(stateDir, CLUSTER_ID_FILENAME, 'hub-assigned-id');
+		const sockets: { headers: Record<string, string> }[] = [];
+		const { client } = makeHarness({
+			stateDir,
+			createSocket: (_url, headers) => {
+				sockets.push({ headers });
+				return new FakeSocket();
+			},
+		});
+		client.start();
+		const token = sockets[0].headers.Authorization!.slice('Bearer '.length);
+		assert.equal(jwt.decode(token, { complete: true })?.header.kid, 'hub-assigned-id');
 		client.stop();
 	});
 });

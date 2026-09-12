@@ -17,6 +17,13 @@ const FILE_MODE = 0o600;
 export const CREDENTIAL_FILENAME = 'credential';
 /** Filename of the one-time pair token, deleted after redemption. */
 export const PAIR_TOKEN_FILENAME = 'pair-token';
+/**
+ * Filename of the cluster id the Hub assigned at pairing. The Hub keys a tunnel
+ * cluster by its own row id and looks it up from the connect JWT's `kid`, so a
+ * paired cluster must sign with the id the Hub gave it, not the local
+ * `FLEET_CLUSTER_ID` default.
+ */
+export const CLUSTER_ID_FILENAME = 'cluster-id';
 
 /** Creates the state dir (if missing) and enforces 0700, even if it pre-existed with a looser mode. */
 export function ensureStateDir(stateDir: string): void {

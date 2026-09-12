@@ -26,7 +26,7 @@ import { config } from '../config.js';
 import { resolveClusterSecret } from '../cluster-secret.js';
 import { docker } from '../docker/index.js';
 import { areOperatorRoutesEnabled } from '../services/settings-service.js';
-import { CREDENTIAL_FILENAME, PAIR_TOKEN_FILENAME, deleteStateFile, readStateFile, writeStateFile } from '../state-dir.js';
+import { CLUSTER_ID_FILENAME, CREDENTIAL_FILENAME, PAIR_TOKEN_FILENAME, deleteStateFile, readStateFile, writeStateFile } from '../state-dir.js';
 import { signConnectToken } from './connect-token.js';
 import { dispatchForward, type ForwardRequest, type ForwardResponse } from './forward.js';
 import { handleRepairRequiredClose, readBootstrapTokenFromEnv, runCommunityBootstrap } from './pairing.js';
@@ -224,10 +224,20 @@ export class TunnelClient {
 		this.socket = undefined;
 	}
 
+	/**
+	 * The id to put in the connect JWT's `kid`. Once paired that MUST be the id the
+	 * Hub assigned — it looks the cluster up by that id — and not the local
+	 * `FLEET_CLUSTER_ID` default, which exists only for the fleet-side deployment
+	 * where the operator names the cluster.
+	 */
+	private resolveClusterId(): string {
+		return readStateFile(this.options.stateDir, CLUSTER_ID_FILENAME)?.trim() || this.options.clusterId;
+	}
+
 	private buildAuthHeaders(): Record<string, string> {
 		const secret = this.options.resolveSecret();
 		if (secret) {
-			return { Authorization: `Bearer ${signConnectToken(this.options.clusterId, secret)}` };
+			return { Authorization: `Bearer ${signConnectToken(this.resolveClusterId(), secret)}` };
 		}
 		// Not yet paired: fall back to the one-time pair token written by the
 		// installer/CLI. If neither is available, connect anyway with no
@@ -375,6 +385,10 @@ export class TunnelClient {
 
 	private handlePaired(frame: PairedFrame): void {
 		writeStateFile(this.options.stateDir, CREDENTIAL_FILENAME, frame.credential);
+		// Persist the Hub-assigned id too: every later connect signs its `kid` with
+		// it, and without it the client would keep presenting the local default and
+		// be refused 401 forever after a successful pairing.
+		writeStateFile(this.options.stateDir, CLUSTER_ID_FILENAME, frame.clusterId);
 		deleteStateFile(this.options.stateDir, PAIR_TOKEN_FILENAME);
 		this.options.fastify.log.info(
 			{ clusterId: frame.clusterId },
