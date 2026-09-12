@@ -1,6 +1,6 @@
 {
   "name": "@privos_ai/app-cluster",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Standalone Docker container management microservice for Privos MCP apps",
   "type": "module",
   "license": "SEE LICENSE IN LICENSE",

@@ -262,10 +262,25 @@ export function buildUserdelCommand(): ShellCommand {
 }
 
 /** True when the registry reports at least one attestation for this exact version. */
+/**
+ * `npm view <pkg> dist.attestations --json` prints an OBJECT, never a list:
+ *
+ *   { "url": "…", "provenance": { "predicateType": "https://slsa.dev/provenance/v1" } }
+ *
+ * A package published without provenance prints nothing at all and still exits 0,
+ * so an unparseable (empty) payload is a legitimate rejection rather than an error.
+ * Gating on the SLSA provenance predicate — not merely on "some attestation exists" —
+ * is what makes this a provenance check: npm also issues a separate publish
+ * attestation that says nothing about where the tarball was built.
+ */
+const SLSA_PROVENANCE_PREDICATE_PREFIX = 'https://slsa.dev/provenance/';
+
 export function provenanceCheckPassed(stdout: string): boolean {
 	try {
 		const parsed: unknown = JSON.parse(stdout);
-		return Array.isArray(parsed) && parsed.length > 0;
+		if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
+		const { provenance } = parsed as { provenance?: { predicateType?: unknown } };
+		return typeof provenance?.predicateType === 'string' && provenance.predicateType.startsWith(SLSA_PROVENANCE_PREDICATE_PREFIX);
 	} catch {
 		return false;
 	}

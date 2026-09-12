@@ -221,16 +221,41 @@ describe('buildProvenanceCheckCommand', () => {
 });
 
 describe('provenanceCheckPassed', () => {
-	it('passes when the registry reports at least one attestation', () => {
-		assert.equal(provenanceCheckPassed('[{"predicateType":"https://slsa.dev/provenance/v1"}]'), true);
+	// Exactly what `npm view @privos_ai/app-cluster@0.1.0 dist.attestations --json` prints.
+	const REAL_NPM_OUTPUT =
+		'{"url":"https://registry.npmjs.org/-/npm/v1/attestations/@privos_ai%2fapp-cluster@0.1.0","provenance":{"predicateType":"https://slsa.dev/provenance/v1"}}';
+
+	it('passes on the object npm actually prints for a provenance-published package', () => {
+		assert.equal(provenanceCheckPassed(REAL_NPM_OUTPUT), true);
 	});
 
-	it('fails on an empty attestation list', () => {
-		assert.equal(provenanceCheckPassed('[]'), false);
+	it('passes on an older SLSA provenance predicate version', () => {
+		assert.equal(provenanceCheckPassed('{"provenance":{"predicateType":"https://slsa.dev/provenance/v0.2"}}'), true);
+	});
+
+	// A package published without provenance prints nothing and exits 0.
+	it('fails on the empty output npm gives a package with no attestations', () => {
+		assert.equal(provenanceCheckPassed(''), false);
+	});
+
+	it('fails when only a non-provenance attestation is reported', () => {
+		assert.equal(
+			provenanceCheckPassed('{"provenance":{"predicateType":"https://github.com/npm/attestation/tree/main/specs/publish/v0.1"}}'),
+			false,
+		);
+	});
+
+	it('fails when the provenance key is absent or malformed', () => {
+		assert.equal(provenanceCheckPassed('{"url":"https://registry.npmjs.org/x"}'), false);
+		assert.equal(provenanceCheckPassed('{"provenance":{}}'), false);
+		assert.equal(provenanceCheckPassed('null'), false);
+	});
+
+	it('fails on a list, which npm never prints here', () => {
+		assert.equal(provenanceCheckPassed('[{"predicateType":"https://slsa.dev/provenance/v1"}]'), false);
 	});
 
 	it('fails on unparseable output', () => {
-		assert.equal(provenanceCheckPassed(''), false);
 		assert.equal(provenanceCheckPassed('not json'), false);
 	});
 });
