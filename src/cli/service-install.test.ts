@@ -152,7 +152,16 @@ describe('parseUninstallArgs', () => {
 });
 
 describe('renderEnvFile', () => {
-	it('writes exactly the four allowed keys, never HOST/PORT/JWT_SECRET', () => {
+	it('pins NODE_ENV=production so the unit does not need the pino-pretty devDependency', () => {
+		const contents = renderEnvFile({
+			hubUrl: 'https://hub.example.com',
+			pairTokenFile: '/var/lib/privos-app-cluster/pair-token',
+			stateDir: '/var/lib/privos-app-cluster',
+		});
+		assert.match(contents, /^NODE_ENV=production$/m);
+	});
+
+	it('writes exactly the allowed keys, never HOST/PORT/JWT_SECRET', () => {
 		const contents = renderEnvFile({
 			hubUrl: 'https://hub.example.com',
 			pairTokenFile: '/var/lib/privos-app-cluster/pair-token',

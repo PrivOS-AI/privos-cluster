@@ -186,6 +186,12 @@ export interface EnvFileOptions {
  */
 export function renderEnvFile(opts: EnvFileOptions): string {
 	return [
+		// A service installed by this CLI is a production deployment by definition.
+		// Without this the config default ('development') wins, and the development
+		// branch of the logger asks pino for the `pino-pretty` transport — a
+		// devDependency that a global `npm install -g --ignore-scripts` never
+		// installs, so the unit crash-loops on boot before it can dial the Hub.
+		'NODE_ENV=production',
 		`PRIVOS_HUB_URL=${opts.hubUrl}`,
 		`PRIVOS_PAIR_TOKEN_FILE=${opts.pairTokenFile}`,
 		`PRIVOS_STATE_DIR=${opts.stateDir}`,
