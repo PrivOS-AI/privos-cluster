@@ -191,7 +191,7 @@ describe('runCommunityBootstrap', () => {
 			const hubNonce = 'hub-nonce-fixed';
 			const hubProof = createHmac('sha256', BOOTSTRAP_TOKEN).update(`hub:${capturedBody!.clusterNonce}:${hubNonce}`).digest('hex');
 			const response: BootstrapFetchResponse = {
-				json: async () => ({ ok: true, clusterId: 'cl_bootstrap', hubNonce, hubProof, token: 'redeemed-pair-token', expiresAt: 1_700_000_000_000 }),
+				json: async () => ({ success: true, clusterId: 'cl_bootstrap', hubNonce, hubProof, token: 'redeemed-pair-token', expiresAt: 1_700_000_000_000 }),
 			};
 			return response;
 		};
@@ -208,7 +208,7 @@ describe('runCommunityBootstrap', () => {
 		const stateDir = makeTmpDir();
 		const fetchImpl: BootstrapFetchFn = async () => ({
 			json: async () => ({
-				ok: true,
+				success: true,
 				clusterId: 'cl_bootstrap',
 				hubNonce: 'hub-nonce-fixed',
 				hubProof: 'deadbeef'.repeat(8), // not derived from BOOTSTRAP_TOKEN — the peer does not know it
@@ -223,13 +223,48 @@ describe('runCommunityBootstrap', () => {
 		assert.equal(readStateFile(stateDir, PAIR_TOKEN_FILENAME), undefined, 'no pair token is ever persisted when the hub proof does not verify');
 	});
 
-	test('a Hub-reported failure (ok:false, e.g. already-burned seed) is surfaced and nothing is persisted', async () => {
+	test('a Hub-reported failure (success:false, e.g. already-burned seed) is surfaced and nothing is persisted', async () => {
 		const stateDir = makeTmpDir();
-		const fetchImpl: BootstrapFetchFn = async () => ({ json: async () => ({ ok: false, reason: 'already_burned' }) });
+		const fetchImpl: BootstrapFetchFn = async () => ({ json: async () => ({ success: false, error: 'already_burned' }) });
 
 		const result = await runCommunityBootstrap({ hubUrl: 'http://hub:3000', bootstrapToken: BOOTSTRAP_TOKEN, stateDir, fetchImpl });
 
 		assert.deepEqual(result, { ok: false, reason: 'already_burned' });
+		assert.equal(readStateFile(stateDir, PAIR_TOKEN_FILENAME), undefined);
+	});
+
+	// Regression: the Hub replies through Rocket.Chat's API envelope. This body is a
+	// verbatim capture from a live community stack. It burned its one-shot seed to
+	// produce this reply, so failing to parse it strands the stack unpairable forever.
+	test('the real Hub envelope from a live stack parses and the pair token is persisted', async () => {
+		const stateDir = makeTmpDir();
+		const clusterNonce = 'client-nonce-fixed';
+		const hubNonce = 'a1b2c3d4e5f6';
+		const hubProof = createHmac('sha256', BOOTSTRAP_TOKEN).update(`hub:${clusterNonce}:${hubNonce}`).digest('hex');
+		const fetchImpl: BootstrapFetchFn = async () => ({
+			json: async () =>
+				JSON.parse(
+					JSON.stringify({ success: true, clusterId: 'cl_live', hubNonce, hubProof, token: 'live-pair-token', expiresAt: 1_789_206_136_000 }),
+				),
+		});
+
+		const result = await runCommunityBootstrap({ hubUrl: 'http://hub:3000', bootstrapToken: BOOTSTRAP_TOKEN, stateDir, fetchImpl, nonce: () => clusterNonce });
+
+		assert.deepEqual(result, { ok: true, clusterId: 'cl_live', expiresAt: 1_789_206_136_000 });
+		assert.equal(readStateFile(stateDir, PAIR_TOKEN_FILENAME), 'live-pair-token');
+	});
+
+	// The shape the client used to expect. It must NOT parse, or the mismatch
+	// silently comes back.
+	test('the old ok/reason shape is refused as invalid_response', async () => {
+		const stateDir = makeTmpDir();
+		const fetchImpl: BootstrapFetchFn = async () => ({
+			json: async () => ({ ok: true, clusterId: 'cl', hubNonce: 'n', hubProof: 'p', token: 't', expiresAt: 1 }),
+		});
+
+		const result = await runCommunityBootstrap({ hubUrl: 'http://hub:3000', bootstrapToken: BOOTSTRAP_TOKEN, stateDir, fetchImpl });
+
+		assert.deepEqual(result, { ok: false, reason: 'invalid_response' });
 		assert.equal(readStateFile(stateDir, PAIR_TOKEN_FILENAME), undefined);
 	});
 

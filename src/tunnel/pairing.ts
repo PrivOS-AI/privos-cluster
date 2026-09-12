@@ -89,15 +89,20 @@ export function readBootstrapTokenFromEnv(): string | undefined {
 	return trimmed || undefined;
 }
 
+// The Hub answers through Rocket.Chat's API envelope, so the discriminator is
+// `success` and the failure text is `error` — there is no `ok`/`reason` pair on
+// the wire. Getting this wrong is not a cosmetic parse failure: the Hub burns its
+// one-shot bootstrap seed *before* it replies, so a reply this side cannot read
+// costs the only pairing attempt the community stack will ever get.
 const BootstrapSuccessSchema = z.object({
-	ok: z.literal(true),
+	success: z.literal(true),
 	clusterId: z.string(),
 	hubNonce: z.string(),
 	hubProof: z.string(),
 	token: z.string(),
 	expiresAt: z.number(),
 });
-const BootstrapFailureSchema = z.object({ ok: z.literal(false), reason: z.string() });
+const BootstrapFailureSchema = z.object({ success: z.literal(false), error: z.string() });
 const BootstrapResponseSchema = z.union([BootstrapSuccessSchema, BootstrapFailureSchema]);
 
 export interface BootstrapFetchResponse {
@@ -157,7 +162,7 @@ export async function runCommunityBootstrap(options: RunCommunityBootstrapOption
 
 	const parsed = BootstrapResponseSchema.safeParse(body);
 	if (!parsed.success) return { ok: false, reason: 'invalid_response' };
-	if (!parsed.data.ok) return { ok: false, reason: parsed.data.reason };
+	if (!parsed.data.success) return { ok: false, reason: parsed.data.error };
 
 	const { clusterId, hubNonce, hubProof, token, expiresAt } = parsed.data;
 	const expectedHubProof = hmacHex(bootstrapToken, `hub:${clusterNonce}:${hubNonce}`);
