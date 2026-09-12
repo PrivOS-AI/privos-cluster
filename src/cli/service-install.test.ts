@@ -154,9 +154,26 @@ describe('parseUninstallArgs', () => {
 });
 
 describe('bundled App Cluster gate', () => {
-	it('lists the container names docker prints', () => {
-		assert.deepEqual(parseAppClusterContainerNames('privos-app-cluster\n'), ['privos-app-cluster']);
-		assert.deepEqual(parseAppClusterContainerNames('a\n\n b \n'), ['a', 'b']);
+	// Verbatim from a community stack — the form that made the first attempt at this
+	// gate match nothing.
+	it('matches the tagged image a real deployment runs', () => {
+		assert.deepEqual(
+			parseAppClusterContainerNames('ghcr.io/privos-ai/privos-app-cluster:latest\tprivos-app-cluster'),
+			['privos-app-cluster'],
+		);
+	});
+
+	it('matches a digest-pinned reference too', () => {
+		assert.deepEqual(
+			parseAppClusterContainerNames('ghcr.io/privos-ai/privos-app-cluster:latest@sha256:abc\tprivos-app-cluster'),
+			['privos-app-cluster'],
+		);
+		assert.deepEqual(parseAppClusterContainerNames('ghcr.io/privos-ai/privos-app-cluster\tno-tag'), ['no-tag']);
+	});
+
+	it('ignores every other container on the host', () => {
+		const stdout = ['mongo:7.0.14\tprivos-mongo', 'redis:7.2-alpine\tprivos-redis', 'ghcr.io/privos-ai/privos-hub:latest\tprivos-hub'].join('\n');
+		assert.deepEqual(parseAppClusterContainerNames(stdout), []);
 	});
 
 	it('treats empty output as nothing running', () => {
@@ -164,11 +181,11 @@ describe('bundled App Cluster gate', () => {
 		assert.deepEqual(parseAppClusterContainerNames('\n  \n'), []);
 	});
 
-	it('probes by image so a renamed container is still found', () => {
+	it('does not use the ancestor filter, which matches nothing for a tagged image', () => {
 		const { cmd, args } = buildAppClusterContainerProbe();
 		assert.equal(cmd, 'docker');
-		assert.ok(args.includes('ancestor=ghcr.io/privos-ai/privos-app-cluster'));
 		assert.ok(args.includes('ps'));
+		assert.ok(!args.some((arg) => arg.startsWith('ancestor=')));
 	});
 });
 

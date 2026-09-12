@@ -415,15 +415,27 @@ export interface InstallOptions extends ConnectArgs {
  * Detect that container and stop, rather than leaving the operator to discover the
  * conflict later.
  */
+export const APP_CLUSTER_IMAGE_REPOSITORY = 'ghcr.io/privos-ai/privos-app-cluster';
+
 export function buildAppClusterContainerProbe(): ShellCommand {
-	return { cmd: 'docker', args: ['ps', '--filter', 'ancestor=ghcr.io/privos-ai/privos-app-cluster', '--format', '{{.Names}}'] };
+	// Deliberately NOT `--filter ancestor=<repo>`: that filter wants an exact image
+	// reference or id, so it silently matches nothing against the tag/digest forms a
+	// real deployment uses. List image + name and match the repository here instead.
+	return { cmd: 'docker', args: ['ps', '--format', '{{.Image}}\t{{.Names}}'] };
 }
 
-/** Names printed by the probe, one per line; empty when docker is absent or nothing matches. */
+/** Container names whose image comes from this repository, whatever tag or digest it carries. */
 export function parseAppClusterContainerNames(stdout: string): string[] {
 	return stdout
 		.split('\n')
 		.map((line) => line.trim())
+		.filter(Boolean)
+		.map((line) => line.split('\t'))
+		.filter(([image]) => {
+			const repository = String(image || '').split('@')[0].replace(/:[^:/]*$/, '');
+			return repository === APP_CLUSTER_IMAGE_REPOSITORY;
+		})
+		.map(([, name]) => String(name || '').trim())
 		.filter(Boolean);
 }
 
