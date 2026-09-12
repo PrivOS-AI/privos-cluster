@@ -9,6 +9,8 @@ import {
 	buildGlobalInstallCommand,
 	buildProvenanceCheckCommand,
 	buildUseraddCommand,
+	buildAppClusterContainerProbe,
+	parseAppClusterContainerNames,
 	parseConnectArgs,
 	parseUninstallArgs,
 	provenanceCheckPassed,
@@ -148,6 +150,37 @@ describe('parseUninstallArgs', () => {
 
 	it('rejects an unknown flag', () => {
 		assert.throws(() => parseUninstallArgs(['--bogus']), (err: unknown) => err instanceof CliExitError);
+	});
+});
+
+describe('bundled App Cluster gate', () => {
+	it('lists the container names docker prints', () => {
+		assert.deepEqual(parseAppClusterContainerNames('privos-app-cluster\n'), ['privos-app-cluster']);
+		assert.deepEqual(parseAppClusterContainerNames('a\n\n b \n'), ['a', 'b']);
+	});
+
+	it('treats empty output as nothing running', () => {
+		assert.deepEqual(parseAppClusterContainerNames(''), []);
+		assert.deepEqual(parseAppClusterContainerNames('\n  \n'), []);
+	});
+
+	it('probes by image so a renamed container is still found', () => {
+		const { cmd, args } = buildAppClusterContainerProbe();
+		assert.equal(cmd, 'docker');
+		assert.ok(args.includes('ancestor=ghcr.io/privos-ai/privos-app-cluster'));
+		assert.ok(args.includes('ps'));
+	});
+});
+
+describe('parseConnectArgs --force', () => {
+	const base = ['--hub-url', 'https://hub.example.com', '--pair-token-file', '/tmp/t'];
+
+	it('defaults to false', () => {
+		assert.equal(parseConnectArgs(base).force, false);
+	});
+
+	it('is set by --force', () => {
+		assert.equal(parseConnectArgs([...base, '--force']).force, true);
 	});
 });
 

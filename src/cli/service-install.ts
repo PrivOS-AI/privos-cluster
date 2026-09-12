@@ -71,6 +71,8 @@ export interface ConnectArgs {
 	stateDir: string;
 	/** Set when `--pair-token` was used on argv; the caller must print it. */
 	deprecationWarning?: string;
+	/** Install even when this host already runs an App Cluster container. */
+	force?: boolean;
 }
 
 function readFlagValue(argv: string[], index: number, flag: string): string {
@@ -91,6 +93,7 @@ export function parseConnectArgs(argv: string[]): ConnectArgs {
 	let pairTokenFile: string | undefined;
 	let pairTokenStdin = false;
 	let pairTokenArgv: string | undefined;
+	let force = false;
 
 	for (let i = 0; i < argv.length; i++) {
 		const arg = argv[i];
@@ -113,6 +116,9 @@ export function parseConnectArgs(argv: string[]): ConnectArgs {
 			case '--pair-token':
 				pairTokenArgv = readFlagValue(argv, i, arg);
 				i++;
+				break;
+			case '--force':
+				force = true;
 				break;
 			default:
 				throw new CliExitError(2, `unknown argument: ${arg}`);
@@ -152,6 +158,7 @@ export function parseConnectArgs(argv: string[]): ConnectArgs {
 		pairToken,
 		stateDir,
 		deprecationWarning: pairToken.kind === 'argv' ? PAIR_TOKEN_ARGV_DEPRECATION_WARNING : undefined,
+		force,
 	};
 }
 
@@ -400,9 +407,52 @@ export interface InstallOptions extends ConnectArgs {
 }
 
 /** Idempotent: converges to the same unit/env state without re-pairing when nothing changed. */
+/**
+ * The community bundle already runs an App Cluster as a container on this host.
+ * Installing the systemd service beside it gives the machine two clusters sharing
+ * one docker.sock and one app network, and the Hub then has two enabled, connected
+ * clusters to choose between for a local install — which it refuses as ambiguous.
+ * Detect that container and stop, rather than leaving the operator to discover the
+ * conflict later.
+ */
+export function buildAppClusterContainerProbe(): ShellCommand {
+	return { cmd: 'docker', args: ['ps', '--filter', 'ancestor=ghcr.io/privos-ai/privos-app-cluster', '--format', '{{.Names}}'] };
+}
+
+/** Names printed by the probe, one per line; empty when docker is absent or nothing matches. */
+export function parseAppClusterContainerNames(stdout: string): string[] {
+	return stdout
+		.split('\n')
+		.map((line) => line.trim())
+		.filter(Boolean);
+}
+
+function assertNoBundledAppClusterRunning(exec: PrivilegedExecutor, force: boolean): void {
+	const { cmd, args } = buildAppClusterContainerProbe();
+	const probe = exec.run(cmd, args);
+	// No docker, or docker unreachable: nothing to assert. The install proceeds and
+	// fails later on its own terms if docker is genuinely required.
+	if (probe.code !== 0) return;
+	const names = parseAppClusterContainerNames(probe.stdout);
+	if (names.length === 0 || force) return;
+	throw new CliExitError(
+		2,
+		`this host already runs an App Cluster in a container (${names.join(', ')}).\n` +
+			'A second cluster on the same machine shares the same docker socket and app network, and leaves the\n' +
+			'Hub with two connected clusters to choose between for a local install.\n' +
+			'Either pair the existing one from the Hub admin instead, or remove it first\n' +
+			'(`install.sh --uninstall` for a community stack), then re-run this command.\n' +
+			'Pass --force to install anyway.',
+	);
+}
+
 export async function performInstall(opts: InstallOptions, exec: PrivilegedExecutor = nodeExecutor): Promise<{ alreadyInstalled: boolean }> {
 	const pkgSpec = `${PACKAGE_NAME}@${opts.version}`;
 	const alreadyInstalled = exec.fileExists(UNIT_FILE_PATH);
+
+	// Only on a first install: a re-run against an existing unit is a legitimate
+	// upgrade/converge and must not be blocked by the cluster it already owns.
+	if (!alreadyInstalled) assertNoBundledAppClusterRunning(exec, opts.force === true);
 
 	verifyProvenanceOrThrow(exec, pkgSpec);
 	const globalInstall = buildGlobalInstallCommand(pkgSpec);

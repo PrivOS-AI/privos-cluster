@@ -48,6 +48,7 @@ install/run options:
   --hub-url <url>              Required. The Hub's base URL.
   --pair-token-file <path>     Recommended. Read the one-time pair token from this file.
   --pair-token-stdin           Read the one-time pair token from stdin.
+  --force                      Install even if this host already runs an App Cluster container.
   --pair-token <token>         Deprecated: exposes the token via ps, shell history, and sudo/auditd logs.
   --state-dir <path>           Defaults to ${DEFAULT_STATE_DIR}.
 
