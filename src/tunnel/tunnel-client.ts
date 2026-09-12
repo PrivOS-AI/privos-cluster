@@ -295,7 +295,9 @@ export class TunnelClient {
 			this.sendFrame({
 				t: 'hello',
 				version: this.options.version,
-				clusterId: this.options.clusterId,
+				// Same id as the connect JWT's `kid`: the Hub compares this frame against
+				// the cluster it resolved from that `kid` and closes 4401 on a mismatch.
+				clusterId: this.resolveClusterId(),
 				clusterCapabilities: this.options.clusterCapabilities,
 			});
 		});

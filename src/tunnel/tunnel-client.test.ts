@@ -384,6 +384,21 @@ describe('paired frame', () => {
 		client.stop();
 	});
 
+	// The Hub compares the hello frame's clusterId against the cluster it resolved
+	// from the connect JWT's kid, and closes 4401 on a mismatch. Both must use the
+	// assigned id, so this covers the second site that read the local default.
+	test('announces the Hub-assigned id in the hello frame', () => {
+		const stateDir = makeTmpDir();
+		writeStateFile(stateDir, CLUSTER_ID_FILENAME, 'hub-assigned-id');
+		const { client, sockets } = makeHarness({ stateDir });
+		client.start();
+		sockets[0].emit('open'); // openFirst() drops the hello frame, which is the point here
+		const hello = JSON.parse(sockets[0].sent[0] as string);
+		assert.equal(hello.t, 'hello');
+		assert.equal(hello.clusterId, 'hub-assigned-id');
+		client.stop();
+	});
+
 	test('signs later connects with the Hub-assigned id, not the local default', () => {
 		const stateDir = makeTmpDir();
 		writeStateFile(stateDir, CLUSTER_ID_FILENAME, 'hub-assigned-id');
