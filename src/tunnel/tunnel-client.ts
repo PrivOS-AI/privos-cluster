@@ -534,7 +534,10 @@ export class TunnelClient {
 			session.hash.update(payload);
 			session.bytesWritten += payload.byteLength;
 			if (control.last) {
-				const sha256 = session.hash.digest('hex');
+				// `ArtifactStore.stage` compares this against a `sha256:`-prefixed
+				// whole-file digest, so the prefix is part of the contract — a bare
+				// hex digest fails verification for every artifact ever streamed.
+				const sha256 = `sha256:${session.hash.digest('hex')}`;
 				fs.closeSync(session.fd);
 				this.stageSessions.delete(control.id);
 				void this.finalizeStage(control.id, session.tempPath, sha256, session.bytesWritten);

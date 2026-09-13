@@ -7,6 +7,8 @@ import path from 'node:path';
 import { afterEach, describe, test } from 'node:test';
 import jwt from 'jsonwebtoken';
 
+import { ArtifactStore, type ArtifactStoreDocker } from '../local-runtime/artifact-store.js';
+import { buildOciArchiveFixture } from '../local-runtime/oci-archive-fixture.js';
 import { CLUSTER_ID_FILENAME, CREDENTIAL_FILENAME, PAIR_TOKEN_FILENAME, readStateFile, writeStateFile } from '../state-dir.js';
 import { MAX_CHUNK_BYTES } from './frames.js';
 import {
@@ -464,8 +466,47 @@ describe('req-chunk artifact staging (bypasses fastify.inject)', () => {
 		await flush();
 		assert.equal(stored.length, 1);
 		assert.equal(stored[0].sizeBytes, chunk1.byteLength + chunk2.byteLength);
-		assert.equal(stored[0].sha256, createHash('sha256').update(Buffer.concat([chunk1, chunk2])).digest('hex'));
+		assert.equal(stored[0].sha256, `sha256:${createHash('sha256').update(Buffer.concat([chunk1, chunk2])).digest('hex')}`);
 		assert.ok(!fs.existsSync(stored[0].path), 'temp file must be deleted once artifact-store has consumed it');
+		client.stop();
+	});
+
+	// The digest the chunk stream hands to the store is a wire contract between
+	// two modules. A stub `artifactStore` closure cannot see a format disagreement
+	// between them, so this drives the REAL ArtifactStore over a REAL OCI archive
+	// and only stubs Docker — the one seam a unit test cannot own.
+	test('a streamed OCI archive is accepted by the real ArtifactStore', async () => {
+		const stateDir = makeTmpDir();
+		const fixture = buildOciArchiveFixture();
+		const docker: ArtifactStoreDocker = {
+			images: new Map<string, { Id: string }>([[fixture.configDigest, { Id: fixture.configDigest }]]),
+			async loadArchive() {},
+			async inspectImage(reference: string) {
+				return (this.images as Map<string, { Id: string }>).get(reference) ?? null;
+			},
+		} as ArtifactStoreDocker & { images: Map<string, { Id: string }> };
+		const store = new ArtifactStore(path.join(stateDir, 'artifacts'), docker, 250_000_000, 3);
+		let stageError: Error | undefined;
+		const { client, openFirst } = makeHarness({
+			stateDir,
+			artifactStore: async ({ path: artifactPath, sha256, sizeBytes }) => {
+				try {
+					await store.stage({ path: artifactPath, sha256, sizeBytes });
+				} catch (err) {
+					stageError = err as Error;
+					throw err;
+				}
+			},
+		});
+		const socket = openFirst();
+		socket.emit('message', JSON.stringify({ t: 'req-chunk', id: 'stage-oci', seq: 0, byteLength: fixture.tar.length, last: true }), false);
+		socket.emit('message', fixture.tar, true);
+		// The real store does stream + fs work, so this needs real timer turns —
+		// `flush()`'s two microtasks only cover the stubbed `inject()` chain.
+		for (let i = 0; i < 20 && !store.resolve(fixture.digest) && !stageError; i++) await new Promise((r) => setTimeout(r, 10));
+
+		assert.equal(stageError, undefined, `the real store rejected the streamed artifact: ${stageError?.message}`);
+		assert.equal(store.resolve(fixture.digest)?.imageRef, fixture.configDigest, 'the streamed artifact must end up staged and resolvable by digest');
 		client.stop();
 	});
 
