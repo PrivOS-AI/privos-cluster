@@ -22,11 +22,12 @@
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { PassThrough, Readable } from 'node:stream';
 
 import type Docker from 'dockerode';
 
 import { ArtifactError, ArtifactStagingRefused } from './errors.js';
-import { type VerifiedOciArchive, verifyOciArchive } from './oci-archive.js';
+import { type VerifiedOciArchive, dockerArchiveTrailer, verifyOciArchive } from './oci-archive.js';
 import type { ImageManager } from '../docker/image-manager.js';
 
 const OCI_MANIFEST_MEDIA_TYPE = 'application/vnd.oci.image.manifest.v1+json';
@@ -42,13 +43,15 @@ export interface StagedArtifactRecord {
 	configDigest: string;
 	/** The Docker-verified content address the runtime container is created against — `configDigest` or `manifestDigest`. */
 	imageRef: string;
+	/** The image's declared `User`, when it has one — the runtime honours it rather than overriding the identity the image was built for. */
+	imageUser?: string;
 	stagedAt: number;
 }
 
 /** The subset of Docker behaviour the artifact store needs — kept narrow and injectable so tests never require a live daemon. */
 export interface ArtifactStoreDocker {
-	/** Loads an OCI-layout tar from disk into the Docker image store. */
-	loadArchive(filePath: string): Promise<void>;
+	/** Loads a verified OCI-layout tar from disk into the Docker image store, in whatever shape this daemon's image store can ingest. */
+	loadArchive(filePath: string, verified: VerifiedOciArchive): Promise<void>;
 	/** Inspects an image by content address; `null` on 404 (not present). */
 	inspectImage(reference: string): Promise<{ Id: string; Descriptor?: { mediaType: string; digest: string; size: number } } | null>;
 	/** Removes an image by content address. A 404 is success — the goal is absence, not a deletion event. */
@@ -57,10 +60,34 @@ export interface ArtifactStoreDocker {
 
 /** Production adapter over the existing `docker/index.ts` singletons — `imageManager.loadFromStream` for load, raw `docker.getImage(...).inspect()` for content-address proof (dockerode's typed `ImageInspectInfo` doesn't model the containerd `Descriptor` field). */
 export function createDockerArtifactStoreDocker(docker: Docker, imageManager: ImageManager): ArtifactStoreDocker {
+	let containerdStore: Promise<boolean> | undefined;
+	/** Docker ≥25 on the containerd image store reports `driver-type io.containerd.snapshotter.v1`; the classic graphdriver store does not. Resolved once per process. */
+	const usesContainerdImageStore = (): Promise<boolean> => {
+		containerdStore ??= docker
+			.info()
+			.then((info: { DriverStatus?: unknown }) =>
+				Array.isArray(info?.DriverStatus) &&
+				info.DriverStatus.some((pair: unknown) => Array.isArray(pair) && pair[0] === 'driver-type' && String(pair[1]).includes('io.containerd.snapshotter')),
+			)
+			.catch((err: any) => {
+				throw new ArtifactError(`docker info failed: ${err?.message ?? String(err)}`);
+			});
+		return containerdStore;
+	};
 	return {
-		async loadArchive(filePath: string): Promise<void> {
-			const stream = fs.createReadStream(filePath);
-			await imageManager.loadFromStream(stream);
+		async loadArchive(filePath: string, verified: VerifiedOciArchive): Promise<void> {
+			// The containerd store ingests the OCI layout as-is and keeps the manifest
+			// digest as the image identity. The classic store cannot read an OCI layout
+			// at all: it gets the same verified bytes with a docker-archive manifest
+			// appended, and identifies the image by its config digest. `proveContentAddress`
+			// checks both identities, so either store ends up pinned to verified content.
+			if (await usesContainerdImageStore()) {
+				await imageManager.loadFromStream(fs.createReadStream(filePath));
+				return;
+			}
+			const members = fs.createReadStream(filePath, { start: 0, end: verified.archiveDataEnd - 1 });
+			const trailer = Readable.from([dockerArchiveTrailer(verified)]);
+			await imageManager.loadFromStream(concatStreams(members, trailer));
 		},
 		async inspectImage(reference: string) {
 			try {
@@ -83,6 +110,16 @@ export function createDockerArtifactStoreDocker(docker: Docker, imageManager: Im
 			}
 		},
 	};
+}
+
+/** Pipes `first` then `second` into one readable, ending only after both — a two-part tar has to arrive as one body. */
+function concatStreams(first: Readable, second: Readable): Readable {
+	const out = new PassThrough();
+	first.on('error', (err) => out.destroy(err));
+	second.on('error', (err) => out.destroy(err));
+	first.pipe(out, { end: false });
+	first.on('end', () => second.pipe(out));
+	return out;
 }
 
 interface StagedArtifactIndex {
@@ -183,6 +220,7 @@ export class ArtifactStore {
 			manifestSizeBytes: verified.manifestSizeBytes,
 			configDigest: verified.configDigest,
 			imageRef,
+			...(verified.imageUser ? { imageUser: verified.imageUser } : {}),
 			stagedAt: this.now(),
 		};
 		const index = this.readIndex();
@@ -228,7 +266,7 @@ export class ArtifactStore {
 	private async loadAndProveContentAddress(filePath: string, verified: VerifiedOciArchive): Promise<string> {
 		const already = await this.docker.inspectImage(verified.configDigest);
 		if (already?.Id === verified.configDigest) return verified.configDigest;
-		await this.docker.loadArchive(filePath);
+		await this.docker.loadArchive(filePath, verified);
 		return this.proveContentAddress(verified);
 	}
 

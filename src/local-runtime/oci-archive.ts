@@ -37,6 +37,8 @@ const SHA256_RE = /^sha256:[a-f0-9]{64}$/;
 const OCI_LAYOUT_MEDIA_TYPE = 'application/vnd.oci.image.index.v1+json';
 const OCI_MANIFEST_MEDIA_TYPE = 'application/vnd.oci.image.manifest.v1+json';
 const OCI_CONFIG_MEDIA_TYPE = 'application/vnd.oci.image.config.v1+json';
+/** Every field the OCI image-spec allows on a descriptor. Real exporters (buildkit, containerd) always add `annotations`. */
+const OCI_DESCRIPTOR_KEYS = new Set(['mediaType', 'digest', 'size', 'platform', 'annotations', 'urls', 'data', 'artifactType']);
 const OCI_LAYER_MEDIA_TYPES = new Set([
 	'application/vnd.oci.image.layer.v1.tar',
 	'application/vnd.oci.image.layer.nondistributable.v1.tar',
@@ -64,6 +66,12 @@ export interface VerifiedOciArchive {
 	manifestDigest: string;
 	manifestSizeBytes: number;
 	configDigest: string;
+	/** Layer blob digests in manifest order — what a docker-archive `manifest.json` has to name. */
+	layerDigests: string[];
+	/** Byte offset of the tar end-of-archive marker: everything before it is member data, verbatim. */
+	archiveDataEnd: number;
+	/** The image config's `User`, when it declares one — the identity the image was built to run as. */
+	imageUser: string | undefined;
 }
 
 function parseOctalField(buf: Buffer): number {
@@ -90,7 +98,7 @@ function fieldString(buf: Buffer): string {
 }
 
 /** Reads the full member catalog of a plain USTAR tar via positioned reads — never buffers member data. */
-function catalogTarMembers(fd: number, fileSize: number, maxBytes: number): TarMember[] {
+export function catalogTarMembers(fd: number, fileSize: number, maxBytes: number): { members: TarMember[]; dataEnd: number } {
 	const members: TarMember[] = [];
 	let offset = 0;
 	let sawEnd = false;
@@ -134,7 +142,8 @@ function catalogTarMembers(fd: number, fileSize: number, maxBytes: number): TarM
 		offset += dataBlocks * BLOCK;
 	}
 	if (!sawEnd) throw new ArtifactError('tar archive is missing its end-of-archive marker');
-	return members;
+	// The loop advanced past the zero block it stopped on; the marker starts one block back.
+	return { members, dataEnd: offset - BLOCK };
 }
 
 /** Reads a bounded member's full content into memory (only used for the small JSON metadata blobs — oci-layout, index.json, manifest, config). */
@@ -186,7 +195,7 @@ function assertDescriptor(value: unknown, allowedMediaTypes: Set<string>): Descr
 	if (typeof value !== 'object' || value === null) throw new ArtifactError('invalid OCI descriptor');
 	const record = value as Record<string, unknown>;
 	const keys = Object.keys(record);
-	if (!keys.every((k) => k === 'mediaType' || k === 'digest' || k === 'size' || k === 'platform')) {
+	if (!keys.every((k) => OCI_DESCRIPTOR_KEYS.has(k))) {
 		throw new ArtifactError('invalid OCI descriptor');
 	}
 	if (typeof record.mediaType !== 'string' || !allowedMediaTypes.has(record.mediaType)) {
@@ -230,7 +239,8 @@ export async function verifyOciArchive(
 	const fd = fs.openSync(filePath, 'r');
 	let members: TarMember[];
 	try {
-		members = catalogTarMembers(fd, stat.size, maxArtifactBytes);
+		let dataEnd: number;
+		({ members, dataEnd } = catalogTarMembers(fd, stat.size, maxArtifactBytes));
 		const byName = new Map<string, TarMember>();
 		for (const member of members) {
 			if (byName.has(member.name)) throw new ArtifactError('duplicate tar member name');
@@ -289,6 +299,9 @@ export async function verifyOciArchive(
 		const configMember = byName.get(blobMemberName(configDescriptor.digest));
 		if (!configMember?.isFile) throw new ArtifactError('manifest references a missing config blob');
 		await verifyMemberDigest(filePath, configMember, configDescriptor);
+		const imageConfig = parseStrictJson(readMemberBytes(fd, configMember, MAX_METADATA_BYTES)) as { config?: { User?: unknown } };
+		const declaredUser = imageConfig?.config?.User;
+		const imageUser = typeof declaredUser === 'string' && declaredUser.trim() !== '' ? declaredUser.trim() : undefined;
 
 		for (const layer of layerDescriptors) {
 			const layerMember = byName.get(blobMemberName(layer.digest));
@@ -314,8 +327,54 @@ export async function verifyOciArchive(
 			manifestDigest: manifestDescriptor.digest,
 			manifestSizeBytes: manifestDescriptor.size,
 			configDigest: configDescriptor.digest,
+			layerDigests: layerDescriptors.map((l) => l.digest),
+			archiveDataEnd: dataEnd,
+			imageUser,
 		};
 	} finally {
 		fs.closeSync(fd);
 	}
+}
+
+/** Minimal USTAR header for one regular file member. */
+export function ustarFileHeader(name: string, size: number): Buffer {
+	const header = Buffer.alloc(BLOCK);
+	header.write(name, 0, 'utf8');
+	header.write('0000644\0', 100, 'ascii');
+	header.write('0000000\0', 108, 'ascii');
+	header.write('0000000\0', 116, 'ascii');
+	header.write(`${size.toString(8).padStart(11, '0')}\0`, 124, 'ascii');
+	header.write('00000000000\0', 136, 'ascii');
+	header.write('        ', 148, 'ascii');
+	header.write('0', 156, 'ascii');
+	header.write('ustar\0', 257, 'ascii');
+	header.write('00', 263, 'ascii');
+	let sum = 0;
+	for (const byte of header) sum += byte;
+	header.write(`${sum.toString(8).padStart(6, '0')}\0 `, 148, 'ascii');
+	return header;
+}
+
+/**
+ * The bytes that turn a verified OCI layout into something Docker's classic
+ * (graphdriver) image store can load: a docker-archive `manifest.json` naming
+ * the SAME config and layer blobs at their existing paths, then the tar
+ * end-of-archive marker. Appended after `archiveDataEnd`, so every verified
+ * member stays byte-identical and the loaded image ID is the config digest.
+ *
+ * Only the containerd image store understands an OCI layout on `docker load`;
+ * a stock Docker install does not, and a customer's machine is a stock install.
+ */
+export function dockerArchiveTrailer(verified: Pick<VerifiedOciArchive, 'configDigest' | 'layerDigests'>): Buffer {
+	const manifest = Buffer.from(
+		JSON.stringify([
+			{
+				Config: blobMemberName(verified.configDigest),
+				RepoTags: [],
+				Layers: verified.layerDigests.map(blobMemberName),
+			},
+		]),
+	);
+	const padding = Buffer.alloc((BLOCK - (manifest.length % BLOCK)) % BLOCK);
+	return Buffer.concat([ustarFileHeader('manifest.json', manifest.length), manifest, padding, Buffer.alloc(2 * BLOCK)]);
 }

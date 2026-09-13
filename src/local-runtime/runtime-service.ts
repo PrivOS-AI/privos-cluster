@@ -16,6 +16,7 @@
  */
 import { createHash } from 'node:crypto';
 import net from 'node:net';
+import os from 'node:os';
 
 import type Docker from 'dockerode';
 
@@ -51,6 +52,8 @@ export interface RuntimeServiceConfig {
 	privateNetwork: string;
 	pidsLimit: number;
 	readyTimeoutSeconds: number;
+	/** Overrides how this process finds its own container (defaults to the hostname Docker assigns). */
+	selfContainerId?: string;
 }
 
 function computeRuntimeId(request: EnsureReadyRequest | Affinity): string {
@@ -153,6 +156,23 @@ function dispatchTrustEnv(request: EnsureReadyRequest, activation: ActivateReque
 	];
 }
 
+/** The unprivileged fallback for an image that declares no user, or declares root. */
+const FALLBACK_USER = '65532:65532';
+
+/**
+ * Run as the user the image was built for. Overriding it with an arbitrary uid
+ * breaks any image whose files are not world-readable — which is most of them,
+ * and every one built `--chown` to its own runtime user. Root is the one thing
+ * never honoured: an image that wants root gets the unprivileged fallback instead.
+ */
+function containerUser(artifact: StagedArtifactRecord): string {
+	const declared = artifact.imageUser?.trim();
+	if (!declared) return FALLBACK_USER;
+	const [user] = declared.split(':');
+	if (user === '' || user === 'root' || user === '0') return FALLBACK_USER;
+	return declared;
+}
+
 function buildPolicy(
 	request: EnsureReadyRequest,
 	artifact: StagedArtifactRecord,
@@ -185,7 +205,7 @@ function buildPolicy(
 		name: runtimeId,
 		Image: artifact.imageRef,
 		Hostname: runtimeId,
-		User: '65532:65532',
+		User: containerUser(artifact),
 		Env: dispatchTrustEnv(request, activation),
 		Labels: labels,
 		ExposedPorts: { [portKey]: {} },
@@ -310,7 +330,34 @@ export class RuntimeService {
 		} catch (err: any) {
 			if (err?.statusCode !== 409) throw new RuntimeUnavailable(`failed to ensure the local-runtime network: ${err?.message ?? String(err)}`);
 		}
+		await this.attachSelfToNetwork();
 		this.networkEnsured = true;
+	}
+
+	/**
+	 * The readiness probe and MCP forwarding both dial the app's address on the
+	 * private network, so this process has to be on that network too. When it
+	 * runs as a container (the self-hosted compose stack), Docker only routes
+	 * between containers that share a network — join it. A process that is not
+	 * a container (host networking) reaches bridge addresses directly and has
+	 * nothing to join.
+	 */
+	private async attachSelfToNetwork(): Promise<void> {
+		const self = this.config.selfContainerId ?? os.hostname();
+		try {
+			await this.docker.getContainer(self).inspect();
+		} catch (err: any) {
+			if (err?.statusCode === 404) return;
+			throw new RuntimeUnavailable(`failed to identify this process's own container: ${err?.message ?? String(err)}`);
+		}
+		try {
+			await this.docker.getNetwork(this.config.privateNetwork).connect({ Container: self });
+		} catch (err: any) {
+			// 403 is Docker's "endpoint already exists" for this container; both it and
+			// 409 mean the attachment is already there, which is the state we want.
+			if (err?.statusCode === 403 || err?.statusCode === 409) return;
+			throw new RuntimeUnavailable(`failed to join the local-runtime network: ${err?.message ?? String(err)}`);
+		}
 	}
 
 	private async inspectByName(name: string): Promise<any | null> {

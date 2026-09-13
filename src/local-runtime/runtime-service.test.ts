@@ -54,7 +54,7 @@ class FakeDockerode {
 		const record: FakeContainer = {
 			Id: id,
 			Image: spec.Image,
-			Config: { Image: spec.Image, Labels: spec.Labels },
+			Config: { Image: spec.Image, Labels: spec.Labels, User: spec.User },
 			HostConfig: spec.HostConfig,
 			NetworkSettings: { Networks: { [spec.HostConfig.NetworkMode]: { IPAddress: '10.99.0.5' } } },
 			Mounts: [],
@@ -62,6 +62,16 @@ class FakeDockerode {
 		};
 		this.containers.set(spec.name, record);
 		return { id, start: async () => { record.State.Running = true; } };
+	}
+
+	networkConnects: { network: string; Container: string }[] = [];
+
+	getNetwork(name: string) {
+		return {
+			connect: async (opts: { Container: string }) => {
+				this.networkConnects.push({ network: name, Container: opts.Container });
+			},
+		};
 	}
 
 	private findByIdOrName(idOrName: string): [string, FakeContainer] | undefined {
@@ -149,23 +159,35 @@ function baseEnsureReadyRequest(overrides: Partial<Record<string, unknown>> = {}
 	};
 }
 
-async function setup() {
+async function setup(options: { user?: string; selfContainerId?: string; selfIsContainer?: boolean } = {}) {
 	const stateDir = tmpDir();
 	const ledger = new RuntimeLedger(path.join(stateDir, 'runtimes.json'));
 	const fakeArtifactDocker = new FakeArtifactStoreDocker();
 	const artifactStore = new ArtifactStore(path.join(stateDir, 'artifacts'), fakeArtifactDocker, 250_000_000, 3);
-	const fixture = buildOciArchiveFixture(['SEED=1']);
+	const fixture = buildOciArchiveFixture(['SEED=1'], options.user ? { user: options.user } : {});
 	fakeArtifactDocker.prime(fixture.configDigest);
 	const artifactTarPath = path.join(stateDir, 'incoming.tar');
 	fs.writeFileSync(artifactTarPath, fixture.tar);
 	const staged = await artifactStore.stage({ path: artifactTarPath, sha256: fixture.digest, sizeBytes: fixture.tar.length });
 
 	const dockerode = new FakeDockerode();
+	if (options.selfContainerId && options.selfIsContainer !== false) {
+		// This process's own container, as Docker would report it.
+		dockerode.containers.set(options.selfContainerId, {
+			Id: options.selfContainerId,
+			Image: 'privos-app-cluster',
+			Config: { Image: 'privos-app-cluster', Labels: {} },
+			HostConfig: {},
+			NetworkSettings: { Networks: {} },
+			Mounts: [],
+			State: { Running: true },
+		});
+	}
 	const service = new RuntimeService(
 		dockerode as any,
 		ledger,
 		artifactStore,
-		{ privateNetwork: 'privos-local-runtime', pidsLimit: 128, readyTimeoutSeconds: 5 },
+		{ privateNetwork: 'privos-local-runtime', pidsLimit: 128, readyTimeoutSeconds: 5, ...(options.selfContainerId ? { selfContainerId: options.selfContainerId } : {}) },
 		() => 1_700_000_000_000,
 		instantReadiness,
 	);
@@ -293,3 +315,40 @@ test('remove deletes the container and the ledger row and returns ABSENT with re
 	assert.equal(secondAbsent.state, 'ABSENT');
 });
 
+
+// The image decides who it runs as. Overriding that with a fixed uid broke the
+// very first real artifact (EACCES on its own package.json), because its files
+// belong to the user it was built for. Root is the one identity never honoured.
+test('the runtime container runs as the user the image declares', async () => {
+	const { service, dockerode, staged } = await setup({ user: 'node' });
+	await service.ensureReady(baseEnsureReadyRequest({}, staged.digest));
+	assert.equal([...dockerode.containers.values()][0]!.Config.User, 'node');
+});
+
+test('an image that declares no user runs as the unprivileged fallback', async () => {
+	const { service, dockerode, staged } = await setup();
+	await service.ensureReady(baseEnsureReadyRequest({}, staged.digest));
+	assert.equal([...dockerode.containers.values()][0]!.Config.User, '65532:65532');
+});
+
+test('an image that asks for root gets the unprivileged fallback instead', async () => {
+	const { service, dockerode, staged } = await setup({ user: 'root' });
+	await service.ensureReady(baseEnsureReadyRequest({}, staged.digest));
+	assert.equal([...dockerode.containers.values()][0]!.Config.User, '65532:65532');
+});
+
+// Readiness and forwarding dial the app on the private network, which Docker
+// only routes between members. Running as a container, the driver must join it
+// or it can never reach anything it starts.
+test('when the driver runs as a container it joins the private network before probing', async () => {
+	const { service, dockerode, staged } = await setup({ selfContainerId: 'app-cluster-self' });
+	await service.ensureReady(baseEnsureReadyRequest({}, staged.digest));
+	assert.deepEqual(dockerode.networkConnects, [{ network: 'privos-local-runtime', Container: 'app-cluster-self' }]);
+});
+
+test('when the driver is not a container there is nothing to join and readiness proceeds', async () => {
+	const { service, dockerode, staged } = await setup({ selfContainerId: 'not-a-container', selfIsContainer: false });
+	const ready = await service.ensureReady(baseEnsureReadyRequest({}, staged.digest));
+	assert.equal(ready.state, 'READY');
+	assert.deepEqual(dockerode.networkConnects, []);
+});

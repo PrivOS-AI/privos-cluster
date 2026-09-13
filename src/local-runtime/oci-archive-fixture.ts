@@ -49,14 +49,21 @@ export interface OciFixture {
 }
 
 /** Builds a single-layer OCI archive; `configEnv` lets tests vary the image config to change `configDigest`/`manifestDigest` (and therefore `artifactDigest`) deterministically. */
-export function buildOciArchiveFixture(configEnv: string[] = []): OciFixture {
+export interface OciFixtureOptions {
+	/** Emit the descriptor annotations (and index `platform`) buildkit/containerd always write — the shape every real pipeline artifact has. */
+	annotations?: boolean;
+	/** The image config's `User`. */
+	user?: string;
+}
+
+export function buildOciArchiveFixture(configEnv: string[] = [], options: OciFixtureOptions = {}): OciFixture {
 	const layerContent = Buffer.from('hello-from-fixture-layer\n');
 	const layerDigest = sha256(layerContent);
 
 	const config = {
 		architecture: 'amd64',
 		os: 'linux',
-		config: { Env: configEnv },
+		config: { Env: configEnv, ...(options.user ? { User: options.user } : {}) },
 		rootfs: { type: 'layers', diff_ids: [layerDigest] },
 	};
 	const configBytes = Buffer.from(JSON.stringify(config));
@@ -66,14 +73,33 @@ export function buildOciArchiveFixture(configEnv: string[] = []): OciFixture {
 		schemaVersion: 2,
 		mediaType: 'application/vnd.oci.image.manifest.v1+json',
 		config: { mediaType: 'application/vnd.oci.image.config.v1+json', digest: configDigest, size: configBytes.length },
-		layers: [{ mediaType: 'application/vnd.oci.image.layer.v1.tar', digest: layerDigest, size: layerContent.length }],
+		layers: [
+			{
+				mediaType: 'application/vnd.oci.image.layer.v1.tar',
+				digest: layerDigest,
+				size: layerContent.length,
+				...(options.annotations ? { annotations: { 'buildkit/rewritten-timestamp': '0' } } : {}),
+			},
+		],
 	};
 	const manifestBytes = Buffer.from(JSON.stringify(manifest));
 	const manifestDigest = sha256(manifestBytes);
 
 	const index = {
 		schemaVersion: 2,
-		manifests: [{ mediaType: 'application/vnd.oci.image.manifest.v1+json', digest: manifestDigest, size: manifestBytes.length }],
+		manifests: [
+			{
+				mediaType: 'application/vnd.oci.image.manifest.v1+json',
+				digest: manifestDigest,
+				size: manifestBytes.length,
+				...(options.annotations
+					? {
+							annotations: { 'io.containerd.image.name': 'docker.io/library/privos-build-job:fixture', 'org.opencontainers.image.ref.name': 'fixture' },
+							platform: { architecture: 'amd64', os: 'linux' },
+						}
+					: {}),
+			},
+		],
 	};
 	const indexBytes = Buffer.from(JSON.stringify(index));
 	const layoutBytes = Buffer.from(JSON.stringify({ imageLayoutVersion: '1.0.0' }));

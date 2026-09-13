@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, test } from 'node:test';
 
-import { verifyOciArchive } from './oci-archive.js';
+import { dockerArchiveTrailer, verifyOciArchive } from './oci-archive.js';
 import { buildOciArchiveFixture } from './oci-archive-fixture.js';
 import { ArtifactError } from './errors.js';
 
@@ -84,4 +84,35 @@ test('rejects an archive containing an unexpected extra file not referenced by t
 	const digest = `sha256:${createHash('sha256').update(withExtra).digest('hex')}`;
 	const filePath = tmpFile(withExtra);
 	await assert.rejects(() => verifyOciArchive(filePath, digest, withExtra.length, 250_000_000), ArtifactError);
+});
+
+// The publish pipeline's artifacts come out of buildkit, which annotates the
+// index descriptor and every layer. A verifier that refuses annotations refuses
+// every real artifact while passing every hand-built fixture — so this fixture
+// is built in the real exporter's shape.
+test('verifies an archive in the shape buildkit actually produces: annotated descriptors and a platform', async () => {
+	const fixture = buildOciArchiveFixture([], { annotations: true, user: 'node' });
+	const filePath = tmpFile(fixture.tar);
+	const result = await verifyOciArchive(filePath, fixture.digest, fixture.tar.length, 250_000_000);
+	assert.equal(result.configDigest, fixture.configDigest);
+	assert.equal(result.imageUser, 'node', 'the user the image was built for must survive verification');
+	assert.equal(result.layerDigests.length, 1);
+	assert.equal(result.archiveDataEnd, fixture.tar.length - 1024, 'data ends exactly where the two-block end marker begins');
+});
+
+test('reports no image user when the config declares none', async () => {
+	const fixture = buildOciArchiveFixture();
+	const result = await verifyOciArchive(tmpFile(fixture.tar), fixture.digest, fixture.tar.length, 250_000_000);
+	assert.equal(result.imageUser, undefined);
+});
+
+test('the docker-archive trailer names the verified config and layers at their existing member paths', () => {
+	const trailer = dockerArchiveTrailer({ configDigest: `sha256:${'c'.repeat(64)}`, layerDigests: [`sha256:${'1'.repeat(64)}`, `sha256:${'2'.repeat(64)}`] });
+	const size = parseInt(trailer.subarray(124, 135).toString('ascii'), 8);
+	const manifest = JSON.parse(trailer.subarray(512, 512 + size).toString('utf8'));
+	assert.deepEqual(manifest, [
+		{ Config: `blobs/sha256/${'c'.repeat(64)}`, RepoTags: [], Layers: [`blobs/sha256/${'1'.repeat(64)}`, `blobs/sha256/${'2'.repeat(64)}`] },
+	]);
+	assert.equal(trailer.subarray(0, 13).toString('utf8'), 'manifest.json');
+	assert.ok(trailer.subarray(trailer.length - 1024).every((b) => b === 0), 'ends with the tar end-of-archive marker');
 });

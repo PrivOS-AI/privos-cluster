@@ -6,6 +6,7 @@ import { afterEach, test } from 'node:test';
 
 import { ArtifactStore, type ArtifactStoreDocker, createDockerArtifactStoreDocker } from './artifact-store.js';
 import { buildOciArchiveFixture } from './oci-archive-fixture.js';
+import { catalogTarMembers } from './oci-archive.js';
 import { ArtifactError, ArtifactStagingRefused } from './errors.js';
 
 const tmpDirs: string[] = [];
@@ -257,4 +258,90 @@ test('the production Docker adapter treats a missing image as removed and surfac
 		(err: Error) => err instanceof ArtifactError && /docker image removal failed/.test(err.message),
 	);
 	assert.deepEqual(calls, ['sha256:missing', 'sha256:present', 'sha256:inuse']);
+});
+
+test('stage records the user the image was built for', async () => {
+	const stateDir = tmpStateDir();
+	const fixture = buildOciArchiveFixture([], { annotations: true, user: 'node' });
+	const docker = new FakeDocker();
+	docker.primeLoad(fixture);
+	const store = new ArtifactStore(stateDir, docker, 250_000_000, 3);
+	const record = await store.stage({ path: writeArtifact(stateDir, fixture.tar), sha256: fixture.digest, sizeBytes: fixture.tar.length });
+	assert.equal(record.imageUser, 'node');
+	assert.equal(store.resolve(fixture.digest)?.imageUser, 'node', 'and it survives the round trip through the index');
+});
+
+// What Docker's daemon can ingest depends on its image store, and only the
+// production adapter knows. These drive the REAL adapter over a stub dockerode
+// that reports each store type and captures exactly the bytes handed to `load`.
+async function captureLoad(storeType: 'graphdriver' | 'containerd', fixture: ReturnType<typeof buildOciArchiveFixture>, stateDir: string): Promise<Buffer> {
+	const chunks: Buffer[] = [];
+	const fakeDockerode = {
+		async info() {
+			return storeType === 'containerd'
+				? { Driver: 'overlayfs', DriverStatus: [['driver-type', 'io.containerd.snapshotter.v1']] }
+				: { Driver: 'overlay2', DriverStatus: [['Backing Filesystem', 'extfs']] };
+		},
+	} as never;
+	const imageManager = {
+		async loadFromStream(stream: NodeJS.ReadableStream) {
+			for await (const chunk of stream as AsyncIterable<Buffer>) chunks.push(chunk);
+			return [];
+		},
+	} as never;
+	const adapter = createDockerArtifactStoreDocker(fakeDockerode, imageManager);
+	const filePath = writeArtifact(stateDir, fixture.tar);
+	const verified = {
+		artifactDigest: fixture.digest,
+		sizeBytes: fixture.tar.length,
+		manifestDigest: fixture.manifestDigest,
+		manifestSizeBytes: fixture.manifestSizeBytes,
+		configDigest: fixture.configDigest,
+		layerDigests: [] as string[],
+		archiveDataEnd: fixture.tar.length - 1024,
+		imageUser: undefined,
+	};
+	// The layer digest is whatever the fixture's single blob member is.
+	const fd = fs.openSync(filePath, 'r');
+	try {
+		const { members } = catalogTarMembers(fd, fixture.tar.length, 250_000_000);
+		verified.layerDigests = members
+			.filter((m) => m.isFile && m.name.startsWith('blobs/sha256/') && !m.name.endsWith(fixture.manifestDigest.slice(7)) && !m.name.endsWith(fixture.configDigest.slice(7)))
+			.map((m) => `sha256:${m.name.slice('blobs/sha256/'.length)}`);
+	} finally {
+		fs.closeSync(fd);
+	}
+	await adapter.loadArchive(filePath, verified);
+	return Buffer.concat(chunks);
+}
+
+test('on the containerd image store the OCI layout is loaded byte-for-byte as-is', async () => {
+	const stateDir = tmpStateDir();
+	const fixture = buildOciArchiveFixture([], { annotations: true });
+	const loaded = await captureLoad('containerd', fixture, stateDir);
+	assert.ok(loaded.equals(fixture.tar));
+});
+
+test('on the classic image store the same members are loaded with a docker-archive manifest appended', async () => {
+	const stateDir = tmpStateDir();
+	const fixture = buildOciArchiveFixture([], { annotations: true });
+	const loaded = await captureLoad('graphdriver', fixture, stateDir);
+
+	const dataEnd = fixture.tar.length - 1024;
+	assert.ok(loaded.subarray(0, dataEnd).equals(fixture.tar.subarray(0, dataEnd)), 'every verified member is streamed unchanged');
+	const loadedPath = path.join(stateDir, 'loaded.tar');
+	fs.writeFileSync(loadedPath, loaded);
+	const fd = fs.openSync(loadedPath, 'r');
+	try {
+		const { members } = catalogTarMembers(fd, loaded.length, 250_000_000);
+		const names = members.map((m) => m.name);
+		assert.equal(names[names.length - 1], 'manifest.json', 'the docker-archive manifest is the appended last member');
+		const manifestMember = members[members.length - 1]!;
+		const manifestJson = JSON.parse(fs.readFileSync(loadedPath).subarray(manifestMember.dataOffset, manifestMember.dataOffset + manifestMember.size).toString('utf8'));
+		assert.equal(manifestJson[0].Config, `blobs/sha256/${fixture.configDigest.slice(7)}`);
+		for (const layer of manifestJson[0].Layers) assert.ok(names.includes(layer), `manifest.json must only name members that exist: ${layer}`);
+		assert.ok(names.includes(manifestJson[0].Config));
+	} finally {
+		fs.closeSync(fd);
+	}
 });
