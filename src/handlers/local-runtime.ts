@@ -141,6 +141,16 @@ async function streamBodyToTempFile(
 	return { tempPath, sha256: `sha256:${hash.digest('hex')}`, sizeBytes: total };
 }
 
+/**
+ * Body parser for every route in this plugin. A body-less request that still
+ * carries the JSON content type (the Hub's artifact erase is a DELETE with no
+ * payload) parses to `undefined` — routes that need a body already check for
+ * one. Anything else goes through the duplicate-member-rejecting parser.
+ */
+export function parseJsonBody(body: string): unknown {
+	return body === '' ? undefined : strictJsonParse(body);
+}
+
 const localRuntimeHandler: FastifyPluginAsync = async (fastify) => {
 	// Logged once at startup: a local app's outbound Hub calls sign DPoP against
 	// this origin, so a silent PRIVOS_HUB_URL/PRIVOS_HUB_PUBLIC_URL mismatch with
@@ -174,7 +184,7 @@ const localRuntimeHandler: FastifyPluginAsync = async (fastify) => {
 		// this plugin only, so no other route's body parsing changes.
 		scoped.addContentTypeParser('application/json', { parseAs: 'string' }, (_req, body, done) => {
 			try {
-				done(null, strictJsonParse(body as string));
+				done(null, parseJsonBody(body as string));
 			} catch (err) {
 				done(err as Error, undefined);
 			}

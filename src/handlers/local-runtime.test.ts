@@ -40,3 +40,24 @@ if (!fs.existsSync(TIMEOUTS_FILE)) {
 		);
 	});
 }
+
+test('a body-less request with a JSON content type reaches its route; real bodies stay strict', async () => {
+	const { parseJsonBody } = await import('./local-runtime.js');
+	const { default: fastify } = await import('fastify');
+	const app = fastify();
+	app.addContentTypeParser('application/json', { parseAs: 'string' }, (_req, body, done) => {
+		try {
+			done(null, parseJsonBody(body as string));
+		} catch (err) {
+			done(err as Error, undefined);
+		}
+	});
+	app.delete('/x/:id', async (req) => ({ bodyIsUndefined: req.body === undefined }));
+	const empty = await app.inject({ method: 'DELETE', url: '/x/1', headers: { 'content-type': 'application/json' }, payload: '' });
+	assert.equal(empty.statusCode, 200);
+	assert.deepEqual(empty.json(), { bodyIsUndefined: true });
+	const duplicate = await app.inject({ method: 'DELETE', url: '/x/1', headers: { 'content-type': 'application/json' }, payload: '{"a":1,"a":2}' });
+	assert.notEqual(duplicate.statusCode, 200);
+	await app.close();
+	assert.throws(() => parseJsonBody('{'));
+});
