@@ -25,6 +25,7 @@ import WebSocket from 'ws';
 import { config } from '../config.js';
 import { resolveClusterSecret } from '../cluster-secret.js';
 import { docker } from '../docker/index.js';
+import { getArtifactStore } from '../handlers/local-runtime.js';
 import { areOperatorRoutesEnabled } from '../services/settings-service.js';
 import { CLUSTER_ID_FILENAME, CREDENTIAL_FILENAME, PAIR_TOKEN_FILENAME, deleteStateFile, readStateFile, writeStateFile } from '../state-dir.js';
 import { signConnectToken } from './connect-token.js';
@@ -58,12 +59,18 @@ export function fullJitterBackoffMs(attempt: number, random: () => number = Math
 }
 
 // ---------------------------------------------------------------------------
-// Phase-6 seam: this phase never buffers a staged artifact in memory — it
-// writes chunks straight to a temp file with a rolling sha256 and, once the
-// stream completes, calls this function with the finished file's path. Phase
-// 6 (local-runtime artifact store) replaces `defaultArtifactStore` with the
-// real implementation; until then it is a typed no-op so `stage` requests
-// round-trip through the tunnel without erroring.
+// Staging seam: never buffers a staged artifact in memory — it writes chunks
+// straight to a temp file with a rolling sha256 and, once the stream
+// completes, calls this function with the finished file's path.
+//
+// This is REQUIRED, deliberately. It used to default to a no-op placeholder
+// from before the artifact store existed, and production never overrode it:
+// the Hub streamed the whole artifact over the tunnel, the chunks landed in a
+// temp file, the no-op resolved, the caller deleted the file, and the bytes
+// were gone — while the cluster still advertised `artifactStaging: true`. The
+// Hub therefore believed staging succeeded and only found out at `ensureReady`
+// (409 ARTIFACT_NOT_STAGED). Requiring it makes that silent drop a compile
+// error instead of a runtime mystery.
 // ---------------------------------------------------------------------------
 export interface StagedArtifact {
 	path: string;
@@ -71,10 +78,6 @@ export interface StagedArtifact {
 	sizeBytes: number;
 }
 export type ArtifactStoreFn = (artifact: StagedArtifact) => Promise<void>;
-const defaultArtifactStore: ArtifactStoreFn = async () => {
-	// No-op until phase 6 lands. The temp file is still deleted by the caller
-	// once this resolves, so nothing accumulates on disk in the meantime.
-};
 
 // ---------------------------------------------------------------------------
 // Phase-6 seam: `forward` (MCP RPC dispatch to a running local-runtime app
@@ -118,7 +121,8 @@ export interface TunnelClientOptions {
 	/** Resolves the secret used to sign the connect JWT; defaults to the real `resolveClusterSecret()`. */
 	resolveSecret: () => string | undefined;
 	concurrencyLimit?: number;
-	artifactStore?: ArtifactStoreFn;
+	/** Required: a missing store used to fall back to a no-op that silently discarded every staged artifact. */
+	artifactStore: ArtifactStoreFn;
 	forwardDispatch?: ForwardDispatchFn;
 	/** Injectable for tests — the default opens a real `ws` connection. */
 	createSocket?: (url: string, headers: Record<string, string>) => TunnelSocket;
@@ -201,7 +205,7 @@ export class TunnelClient {
 		this.options = {
 			...options,
 			concurrencyLimit: options.concurrencyLimit ?? DEFAULT_CONCURRENCY_LIMIT,
-			artifactStore: options.artifactStore ?? defaultArtifactStore,
+			artifactStore: options.artifactStore,
 			forwardDispatch: options.forwardDispatch ?? defaultForwardDispatch,
 			createSocket: options.createSocket ?? defaultCreateSocket,
 			random: options.random ?? Math.random,
@@ -583,6 +587,17 @@ export function startTunnelClient(fastify: TunnelFastify): TunnelClient {
 		clusterCapabilities: { operatorRoutes: areOperatorRoutesEnabled(), artifactStaging: true },
 		fastify,
 		resolveSecret: resolveClusterSecret,
+		// Without this the seam falls back to `defaultArtifactStore`, a no-op left
+		// over from before the artifact store existed: the Hub streams the whole
+		// artifact over the tunnel, the chunks land in a temp file, the no-op
+		// resolves, the temp file is deleted — and the bytes are gone. The cluster
+		// still advertises `artifactStaging: true`, so the Hub believes staging
+		// happened and the next `ensureReady` fails ARTIFACT_NOT_STAGED. That is
+		// every install onto a tunnel-connected cluster, which is every
+		// self-hosted deployment.
+		artifactStore: async ({ path: tempPath, sha256, sizeBytes }) => {
+			await getArtifactStore().stage({ path: tempPath, sha256, sizeBytes });
+		},
 	});
 	client.start();
 	return client;

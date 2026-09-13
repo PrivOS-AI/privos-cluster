@@ -44,8 +44,16 @@ function stateSubDir(name: string): string {
 let cachedArtifactStore: ArtifactStore | undefined;
 let cachedRuntimeService: RuntimeService | undefined;
 
-/** Lazily built so importing this module never touches the filesystem/Docker (unit tests import the plugin without a state dir). */
-function getArtifactStore(): ArtifactStore {
+/**
+ * Lazily built so importing this module never touches the filesystem/Docker (unit tests import the plugin without a state dir).
+ *
+ * Exported because the tunnel transport stages artifacts too: a tunnel-mode
+ * `stage` never reaches the HTTP route below, so `tunnel-client.ts` must hand
+ * its streamed bytes to THIS cached instance — the same one `RuntimeService`
+ * later resolves digests against. A second store would stage into a different
+ * directory and every `ensureReady` would still report ARTIFACT_NOT_STAGED.
+ */
+export function getArtifactStore(): ArtifactStore {
 	if (!cachedArtifactStore) {
 		cachedArtifactStore = new ArtifactStore(
 			stateSubDir('artifacts'),

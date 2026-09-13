@@ -82,6 +82,9 @@ function makeHarness(overrides: Partial<TunnelClientOptions> = {}): Harness {
 		version: '1.2.3',
 		stateDir,
 		clusterCapabilities: { operatorRoutes: false, artifactStaging: true },
+		// Explicit, not a default: production must wire the real store (a silent
+		// no-op there discarded every staged artifact).
+		artifactStore: async () => {},
 		fastify: {
 			inject: async () => ({ statusCode: 200, body: '{}', headers: {}, json: () => ({}) }) as never,
 			log: silentLogger,
