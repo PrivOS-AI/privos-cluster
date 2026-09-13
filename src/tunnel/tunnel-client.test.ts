@@ -577,6 +577,56 @@ describe('reconnect / backoff', () => {
 });
 
 describe('req-chunk artifact staging (bypasses fastify.inject)', () => {
+	test('the stage control frame is answered only once the chunk stream is stored, with the stored digest', async () => {
+		const stored: StagedArtifact[] = [];
+		const injected: string[] = [];
+		const { client, openFirst } = makeHarness({
+			stateDir: makeTmpDir(),
+			artifactStore: async (artifact) => {
+				stored.push(artifact);
+			},
+			fastify: {
+				inject: async (opts: { url: string }) => {
+					injected.push(opts.url);
+					return { statusCode: 200, body: '{}', headers: {}, json: () => ({}) } as never;
+				},
+				log: { info() {}, warn() {}, error() {}, debug() {} },
+			} as never,
+		});
+		const socket = await openFirst();
+		const bytes = Buffer.from('an artifact');
+		const digest = `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
+		const resFrames = () => socket.sent.filter((m): m is string => typeof m === 'string').map((m) => JSON.parse(m)).filter((f) => f.t === 'res' && f.id === 'stage-9');
+
+		socket.emit('message', JSON.stringify({ t: 'req', id: 'stage-9', method: 'PUT', path: `/api/v1/v3/local-artifacts/${digest}`, body: { digest }, timeoutMs: 30000 }), false);
+		await flush();
+		assert.equal(resFrames().length, 0, 'no reply before the bytes have arrived');
+		assert.deepEqual(injected, [], 'the control frame must never be replayed into fastify');
+
+		socket.emit('message', JSON.stringify({ t: 'req-chunk', id: 'stage-9', seq: 0, byteLength: bytes.byteLength, last: true }), false);
+		socket.emit('message', bytes, true);
+		await flush();
+		assert.equal(stored.length, 1);
+		assert.deepEqual(resFrames(), [{ t: 'res', id: 'stage-9', status: 200, body: { digest, size_bytes: bytes.byteLength } }]);
+		client.stop();
+	});
+
+	test('a chunk stream that does not hash to the announced digest is refused with 409 and never stored', async () => {
+		const stored: StagedArtifact[] = [];
+		const { client, openFirst } = makeHarness({ stateDir: makeTmpDir(), artifactStore: async (artifact) => { stored.push(artifact); } });
+		const socket = await openFirst();
+		const bytes = Buffer.from('an artifact');
+		socket.emit('message', JSON.stringify({ t: 'req', id: 'stage-10', method: 'PUT', path: `/api/v1/v3/local-artifacts/sha256:${'0'.repeat(64)}`, body: {}, timeoutMs: 30000 }), false);
+		socket.emit('message', JSON.stringify({ t: 'req-chunk', id: 'stage-10', seq: 0, byteLength: bytes.byteLength, last: true }), false);
+		socket.emit('message', bytes, true);
+		await flush();
+		const res = socket.sent.filter((m): m is string => typeof m === 'string').map((m) => JSON.parse(m)).find((f) => f.t === 'res' && f.id === 'stage-10');
+		assert.equal(res?.status, 409);
+		assert.equal(res?.body?.error?.code, 'ARTIFACT_STAGE_FAILED');
+		assert.equal(stored.length, 0);
+		client.stop();
+	});
+
 	test('streams chunks straight to a temp file with a rolling sha256, calls artifact-store, then deletes the temp file', async () => {
 		const stored: StagedArtifact[] = [];
 		const stateDir = makeTmpDir();

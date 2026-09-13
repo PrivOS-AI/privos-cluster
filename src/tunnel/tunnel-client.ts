@@ -208,6 +208,14 @@ export function cleanupStagingDir(stateDir: string): void {
 }
 
 /** Maps a Hub-controlled req-chunk `id` to a safe, collision-resistant filename (never a path built from the raw id). */
+const STAGE_CONTROL_PATH_RE = /^\/api\/v1\/v3\/local-artifacts\/(sha256:[0-9a-f]{64})$/;
+
+/** The `stage` op's control frame: its artifact follows as `req-chunk` frames correlated by id, so it must never be replayed into fastify (it would only hit the raw upload route with no body). */
+function stageControlDigest(frame: ReqFrame): string | undefined {
+	if (frame.raw || frame.method.toUpperCase() !== 'PUT') return undefined;
+	return STAGE_CONTROL_PATH_RE.exec(frame.path.split('?')[0])?.[1];
+}
+
 function stageFilename(id: string): string {
 	return `${createHash('sha256').update(id).digest('hex')}.part`;
 }
@@ -230,6 +238,8 @@ export class TunnelClient {
 	private inFlight = 0;
 	private pendingChunk: ReqChunkFrame | undefined;
 	private readonly stageSessions = new Map<string, StageSession>();
+	/** Stage control frames whose `res` is owed once the chunk stream is stored (or refused): req id → digest the Hub announced. The Hub waits on that reply before ENSURE_READY, so an early reply would race the upload. */
+	private readonly pendingStageReplies = new Map<string, string>();
 	private bootstrapInFlight = false;
 	/**
 	 * Cached across reconnects — loaded once at `start()`, read synchronously
@@ -517,6 +527,11 @@ export class TunnelClient {
 	}
 
 	private async handleReq(frame: ReqFrame): Promise<void> {
+		const stageDigest = stageControlDigest(frame);
+		if (stageDigest) {
+			this.pendingStageReplies.set(frame.id, stageDigest);
+			return;
+		}
 		if (this.inFlight >= this.options.concurrencyLimit) {
 			this.sendFrame({
 				t: 'res',
@@ -622,6 +637,7 @@ export class TunnelClient {
 
 	private cleanupAllStageSessions(): void {
 		for (const id of [...this.stageSessions.keys()]) this.abortStageSession(id);
+		this.pendingStageReplies.clear();
 	}
 
 	/**
@@ -664,10 +680,17 @@ export class TunnelClient {
 	}
 
 	private async finalizeStage(id: string, tempPath: string, sha256: string, sizeBytes: number): Promise<void> {
+		const announced = this.pendingStageReplies.get(id);
+		this.pendingStageReplies.delete(id);
+		let res: ResFrame = { t: 'res', id, status: 200, body: { digest: sha256, size_bytes: sizeBytes } };
 		try {
+			if (announced !== undefined && announced !== sha256) {
+				throw new Error(`streamed bytes hash to ${sha256}, not the announced ${announced}`);
+			}
 			await this.options.artifactStore({ path: tempPath, sha256, sizeBytes });
 		} catch (err) {
 			this.options.fastify.log.error({ err, id }, 'tunnel: artifact-store call failed');
+			res = { t: 'res', id, status: 409, body: { error: { code: 'ARTIFACT_STAGE_FAILED', message: (err as Error).message } } };
 		} finally {
 			try {
 				fs.unlinkSync(tempPath);
@@ -675,6 +698,8 @@ export class TunnelClient {
 				// already gone
 			}
 		}
+		// Only a stream the Hub opened with a control frame is owed a reply; a bare chunk stream has nothing waiting on it.
+		if (announced !== undefined) this.sendFrame(res);
 	}
 }
 
