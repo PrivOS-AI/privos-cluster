@@ -583,3 +583,56 @@ test('ACTIVATE succeeds off a pre-upgrade ledger record with no replicaId once i
 	assert.equal(active.state, 'ACTIVE');
 	assert.equal(dockerode.containers.size, 1);
 });
+
+// The Hub persists a runtime only after it accepted READY. An install it
+// rejected at readiness therefore never gets a REMOVE from its uninstall — only
+// the artifact erase — and until this backstop the PREACTIVATION container, its
+// broker directory and the ledger record outlived the install on the customer's
+// host (drake-dev, 2026-09-13, install attempts 2 and 3).
+test('removeArtifact tears down a never-activated runtime on that artifact before erasing it: container, broker dir, ledger row', async () => {
+	const { service, dockerode, ledger, staged, brokerRoot, artifactStore } = await setup();
+	const request = baseEnsureReadyRequest({}, staged.digest);
+	const ready = await service.ensureReady(request);
+	const replicaId = ledger.getByRuntimeId(ready.runtime_id)!.replicaId;
+	assert.equal(fs.existsSync(path.join(brokerRoot, replicaId)), true);
+
+	const result = await service.removeArtifact(staged.digest);
+
+	assert.deepEqual({ digest: result.digest, state: result.state, removed: result.removed }, { digest: staged.digest, state: 'ABSENT', removed: true });
+	assert.equal(dockerode.containers.size, 0);
+	assert.equal(ledger.getByRuntimeId(ready.runtime_id), null);
+	assert.equal(fs.existsSync(path.join(brokerRoot, replicaId)), false);
+	assert.equal(await artifactStore.resolve(staged.digest), null);
+});
+
+test('removeArtifact leaves an activated runtime alone — the Hub knows it and REMOVEs it explicitly', async () => {
+	const { service, dockerode, ledger, staged } = await setup();
+	const request = baseEnsureReadyRequest({}, staged.digest);
+	const ready = await service.ensureReady(request);
+	await service.activate({
+		protocol_version: 3,
+		operation: 'ACTIVATE',
+		installation_id: ready.installation_id,
+		workspace_id: ready.workspace_id,
+		deployment_id: ready.deployment_id,
+		listing_id: ready.listing_id,
+		version_id: ready.version_id,
+		generation_id: ready.generation_id,
+		generation_number: ready.generation_number,
+		descriptor_artifact_hash: ready.descriptor_artifact_hash,
+		resource_manifest_hash: ready.resource_manifest_hash,
+		permission_contract_hash: ready.permission_contract_hash,
+		runtime_authorization: ready.runtime_authorization,
+		runtime_id: ready.runtime_id,
+		artifact_digest: ready.artifact_digest,
+		ensure_ready_request_hash: canonicalHash(request),
+		runtime_resource_inventory_hash: 'D'.repeat(43),
+		runtime_approval_receipt_hash: 'E'.repeat(43),
+		runtime_authorization_epoch: 1,
+	});
+
+	await service.removeArtifact(staged.digest);
+
+	assert.equal(dockerode.containers.size, 1);
+	assert.equal(ledger.getByRuntimeId(ready.runtime_id)?.state, 'ACTIVE');
+});

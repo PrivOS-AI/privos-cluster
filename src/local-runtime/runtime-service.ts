@@ -42,6 +42,7 @@ import {
 } from './abi-schema.js';
 import type { ArtifactStore, StagedArtifactRecord } from './artifact-store.js';
 import { buildLocalRuntimeBinding, LOCAL_RUNTIME_BROKER_LABELS, type LocalRuntimeBrokerBinding, type LocalRuntimeBrokerContext } from './broker-binding.js';
+import { dispatchTrustEnv, sortedCanonical } from './dispatch-trust-env.js';
 import { AffinityConflict, ArtifactNotStaged, RuntimeNotFound, RuntimeUnavailable } from './errors.js';
 import { RuntimeLedger, type RuntimeRecord } from './ledger.js';
 import type { McpBrokerManager } from '../services/mcp-broker.js';
@@ -76,22 +77,6 @@ function computeRuntimeId(request: EnsureReadyRequest | Affinity): string {
 	const affinity = affinityFromRequest(request as Affinity);
 	const digest = createHash('sha256').update(JSON.stringify(sortedCanonical(affinity))).digest('hex');
 	return `local-runtime-${digest.slice(0, 32)}`;
-}
-
-// Local mirror of the sorted-key canonicalization `security/artifacts.ts`'s
-// `canonicalJson` already performs — reused here via the sha256-hex form
-// (not base64url) because `_runtime_id` in the reference driver hashes the
-// same canonical bytes with a plain hex digest, not the base64url evidence hash.
-function sortedCanonical(value: unknown): unknown {
-	if (Array.isArray(value)) return value.map(sortedCanonical);
-	if (value && typeof value === 'object') {
-		return Object.fromEntries(
-			Object.entries(value as Record<string, unknown>)
-				.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
-				.map(([k, v]) => [k, sortedCanonical(v)]),
-		);
-	}
-	return value;
 }
 
 function endpointFor(runtimeId: string): string {
@@ -159,37 +144,6 @@ function policyIdentity(
 				}
 			: {}),
 	};
-}
-
-function dispatchTrustEnv(request: EnsureReadyRequest, activation: ActivateRequest | null): string[] {
-	const authorization = request.runtime_authorization;
-	const trust: Record<string, unknown> = {
-		hubKid: authorization.hub_kid,
-		hubPublicJwk: authorization.hub_public_jwk,
-		affinity: {
-			workspaceId: request.workspace_id,
-			deploymentId: request.deployment_id,
-			mcpAppId: authorization.mcp_app_id,
-			executionMode: 'SELF_HOSTED_LOCAL',
-			generationId: request.generation_id,
-			generationNumber: request.generation_number,
-			runtimeInstallationId: request.installation_id,
-			manifestDigest: authorization.manifest_digest,
-			resourceManifestHash: request.resource_manifest_hash,
-			...(activation
-				? {
-						runtimeResourceInventoryHash: activation.runtime_resource_inventory_hash,
-						runtimeApprovalReceiptHash: activation.runtime_approval_receipt_hash,
-						runtimeAuthorizationEpoch: activation.runtime_authorization_epoch,
-					}
-				: {}),
-		},
-	};
-	return [
-		'PRIVOS_RUNTIME_SECURITY_MODE=runtime-v3',
-		`PRIVOS_RUNTIME_DISPATCH_TRUST_V3=${JSON.stringify(sortedCanonical(trust))}`,
-		`PRIVOS_RUNTIME_ALLOW_UNSIGNED_PREACTIVATION_READINESS=${activation ? 'false' : 'true'}`,
-	];
 }
 
 /** The unprivileged fallback for an image that declares no user, or declares root. */
@@ -803,25 +757,7 @@ export class RuntimeService {
 				if (JSON.stringify(affinityFromRequest(persisted)) !== JSON.stringify(affinityFromRequest(request))) {
 					throw new AffinityConflict('The REMOVE request does not match the persisted runtime.');
 				}
-				const container = await this.inspectByName(request.runtime_id);
-				if (container) {
-					if (container.State?.Running) {
-						await this.docker.getContainer(container.Id).stop({ t: 10 }).catch((err: any) => {
-							if (err?.statusCode !== 304 && err?.statusCode !== 404) throw new RuntimeUnavailable(`failed to stop the local runtime container: ${err?.message ?? String(err)}`);
-						});
-					}
-					await this.docker.getContainer(container.Id).remove({ force: false, v: false }).catch((err: any) => {
-						if (err?.statusCode !== 404) throw new RuntimeUnavailable(`failed to remove the local runtime container: ${err?.message ?? String(err)}`);
-					});
-				}
-				// Broker cleanup before the ledger row is dropped: on this
-				// ordering, a crash between the two still leaves the ledger row
-				// (a required re-run of REMOVE can find and finish it); the
-				// reverse order would leak the broker directory forever the
-				// moment a crash landed between them.
-				await this.broker.cleanup(record.replicaId);
-				if (record.activeReplicaId) await this.broker.cleanup(record.activeReplicaId);
-				this.ledger.deleteByRuntimeId(request.runtime_id);
+				await this.teardownRecorded(record);
 			}
 			if (await this.inspectByName(request.runtime_id)) throw new RuntimeUnavailable('Docker did not remove the exact supervised container.');
 			if (this.ledger.getByRuntimeId(request.runtime_id)) throw new RuntimeUnavailable('the runtime record survived removal');
@@ -838,6 +774,50 @@ export class RuntimeService {
 			const response = { ...evidenceWithoutHash, removal_evidence_hash: canonicalHash(evidenceWithoutHash) };
 			return validateAbsent(response);
 		});
+	}
+
+	/** Stops and removes the runtime's container, its broker directories and its ledger row. Caller holds the runtime lock. */
+	private async teardownRecorded(record: RuntimeRecord): Promise<void> {
+		const container = await this.inspectByName(record.runtimeId);
+		if (container) {
+			if (container.State?.Running) {
+				await this.docker.getContainer(container.Id).stop({ t: 10 }).catch((err: any) => {
+					if (err?.statusCode !== 304 && err?.statusCode !== 404) throw new RuntimeUnavailable(`failed to stop the local runtime container: ${err?.message ?? String(err)}`);
+				});
+			}
+			await this.docker.getContainer(container.Id).remove({ force: false, v: false }).catch((err: any) => {
+				if (err?.statusCode !== 404) throw new RuntimeUnavailable(`failed to remove the local runtime container: ${err?.message ?? String(err)}`);
+			});
+		}
+		// Broker cleanup before the ledger row is dropped: on this
+		// ordering, a crash between the two still leaves the ledger row
+		// (a required re-run of REMOVE can find and finish it); the
+		// reverse order would leak the broker directory forever the
+		// moment a crash landed between them.
+		await this.broker.cleanup(record.replicaId);
+		if (record.activeReplicaId) await this.broker.cleanup(record.activeReplicaId);
+		this.ledger.deleteByRuntimeId(record.runtimeId);
+	}
+
+	/**
+	 * Erases a staged artifact (`DELETE /v3/local-artifacts/:digest`). A runtime
+	 * on that artifact whose generation never activated is torn down first: the
+	 * Hub only persists a runtime after it accepted READY, so an install it
+	 * rejected at readiness never gets a REMOVE from its uninstall — the artifact
+	 * erase that uninstall does send is the one signal that the install is dead.
+	 * Docker also refuses to remove an image such a container still references,
+	 * so without this the erase itself would fail. Activated runtimes are never
+	 * touched here: the Hub knows them and REMOVEs them explicitly.
+	 */
+	async removeArtifact(digest: string): Promise<{ digest: string; state: 'ABSENT'; removed: boolean; checkedAt: number }> {
+		for (const record of this.ledger.listRecords()) {
+			if (record.artifactDigest !== digest || record.activationRequestHash !== null) continue;
+			await this.ledger.withRuntimeLock(record.runtimeId, async () => {
+				const current = this.ledger.getByRuntimeId(record.runtimeId);
+				if (current && current.activationRequestHash === null) await this.teardownRecorded(current);
+			});
+		}
+		return this.artifactStore.remove(digest);
 	}
 
 	/**

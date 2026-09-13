@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { dispatchForward, type ForwardTransport } from './forward.js';
+import http from 'node:http';
+import type { AddressInfo } from 'node:net';
+
+import { FORWARD_BODY_MAX_BYTES, dispatchForward, type ForwardTransport } from './forward.js';
+import { MAX_JSON_FRAME_BYTES, encodeFrame } from './frames.js';
 
 const RUNTIME_ID = 'local-runtime-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 
@@ -104,7 +108,7 @@ test('an oversized request body is refused with 413 before the transport is invo
 	const docker = fakeDocker([runningContainer(RUNTIME_ID)]);
 	let transportCalled = false;
 	const transport: ForwardTransport = async () => { transportCalled = true; return { status: 200, bodyText: '{}' }; };
-	const hugeBody = { data: 'x'.repeat(70 * 1024) };
+	const hugeBody = { data: 'x'.repeat(FORWARD_BODY_MAX_BYTES) };
 	const result = await dispatchForward(docker, { runtimeId: RUNTIME_ID, path: '/mcp', body: hugeBody }, transport);
 	assert.equal(result.status, 413);
 	assert.equal(transportCalled, false);
@@ -124,4 +128,42 @@ test('a transport failure maps to a 502 res body instead of throwing out of disp
 	const result = await dispatchForward(docker, { runtimeId: RUNTIME_ID, path: '/mcp' }, transport);
 	assert.equal(result.status, 502);
 	assert.equal(result.error?.code, 'forward_failed');
+});
+
+/** A real upstream over loopback so the default (undici) transport's response cap is what gets exercised. */
+async function withUpstream(bodyText: string, run: (port: number) => Promise<void>): Promise<void> {
+	const server = http.createServer((_req, res) => {
+		res.setHeader('content-type', 'application/json');
+		res.end(bodyText);
+	});
+	await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+	try {
+		await run((server.address() as AddressInfo).port);
+	} finally {
+		await new Promise<void>((resolve) => server.close(() => resolve()));
+	}
+}
+
+// The demo's largest UI asset is a 149 KB vendor chunk, read through this
+// path as a `resources/read` result; the previous 64 KB cap cut it off. The
+// reply must also still fit the tunnel frame it rides in.
+test('an asset-sized JSON reply passes the response cap and its res frame fits the tunnel JSON frame cap', async () => {
+	const reply = JSON.stringify({ jsonrpc: '2.0', id: 3, result: { contents: [{ uri: 'ui://app/assets/vendor.js', mimeType: 'text/javascript', text: 'v'.repeat(600 * 1024) }] } });
+	await withUpstream(reply, async (port) => {
+		const docker = fakeDocker([runningContainer(RUNTIME_ID, '127.0.0.1', port)]);
+		const result = await dispatchForward(docker, { runtimeId: RUNTIME_ID, path: '/mcp', body: { jsonrpc: '2.0', id: 3, method: 'resources/read', params: { uri: 'ui://app/assets/vendor.js' } } });
+		assert.equal(result.status, 200);
+		assert.deepEqual(result.body, JSON.parse(reply));
+		const frame = encodeFrame({ t: 'res', id: 'f1', status: result.status, body: result.body });
+		assert.ok(Buffer.byteLength(frame, 'utf8') <= MAX_JSON_FRAME_BYTES);
+	});
+});
+
+test('a reply above the cap is refused as 502 response_too_large instead of an unencodable frame', async () => {
+	await withUpstream(JSON.stringify({ data: 'x'.repeat(FORWARD_BODY_MAX_BYTES) }), async (port) => {
+		const docker = fakeDocker([runningContainer(RUNTIME_ID, '127.0.0.1', port)]);
+		const result = await dispatchForward(docker, { runtimeId: RUNTIME_ID, path: '/mcp', body: { jsonrpc: '2.0', id: 4, method: 'resources/read' } });
+		assert.equal(result.status, 502);
+		assert.equal(result.error?.code, 'response_too_large');
+	});
 });

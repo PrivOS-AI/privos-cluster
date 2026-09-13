@@ -413,6 +413,11 @@ export class RuntimeLedger {
 		return true;
 	}
 
+	/** Every record in any state — used to find runtimes that never activated on an artifact being erased. */
+	listRecords(): RuntimeRecord[] {
+		return Object.values(this.read().byRuntimeId);
+	}
+
 	/** Every runtimeId currently recorded — used by boot/label-based orphan reconciliation. */
 	listRuntimeIds(): string[] {
 		return Object.keys(this.read().byRuntimeId);

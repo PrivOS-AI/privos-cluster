@@ -8,16 +8,22 @@
  * label matching `runtimeId` — a label lookup only, never a caller-supplied
  * address. An unknown `runtimeId` returns 404 without any Docker mutation
  * (the label lookup itself is a read-only `listContainers` call). Bodies are
- * capped and the response is size-bounded the same way the ABI's raw
- * response cap is (`DRIVER_RESPONSE_MAX_BYTES` in
- * `mcp-local-runtime-driver-v3.ts` — 64 KB), reused here for symmetry rather
- * than inventing a second number.
+ * capped in both directions by what fits one tunnel JSON frame.
  */
 import { request as undiciRequest } from 'undici';
 import type Docker from 'dockerode';
 
-/** Matches the Hub's `DRIVER_RESPONSE_MAX_BYTES` (`mcp-local-runtime-driver-v3.ts:10-11`) — reused, not re-derived. */
-export const FORWARD_BODY_MAX_BYTES = 64 * 1024;
+import { MAX_JSON_FRAME_BYTES } from './frames.js';
+
+/**
+ * A forwarded body travels inside one `res`/`forward` JSON control frame, so
+ * its ceiling is the frame cap minus the envelope. An app's UI assets ride
+ * this path too (`resources/read` for every script the Hub caches, up to its
+ * own 2 MB per-asset cap), so this must fit a real bundle — a 64 KB cap cut
+ * the demo's 149 KB vendor chunk off. Anything above this ceiling cannot be
+ * served to a locally executed app's UI at all.
+ */
+export const FORWARD_BODY_MAX_BYTES = MAX_JSON_FRAME_BYTES - 16 * 1024;
 /** Matches the Hub's `DRIVER_TIMEOUT_MS` default; per-call `timeoutMs` from the frame overrides it. */
 export const FORWARD_DEFAULT_TIMEOUT_MS = 30_000;
 
