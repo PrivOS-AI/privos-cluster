@@ -50,6 +50,17 @@ export interface RuntimeRecord {
 	activationEvidenceJson: string | null;
 	createdAt: number;
 	updatedAt: number;
+	/**
+	 * The MANAGED identity broker's replica id for the PREACTIVATION (provisioning)
+	 * container — minted once, durably, the first time this generation is claimed
+	 * (never re-minted on replay). The finalized ACTIVATE-phase replica gets its
+	 * own id (`activeReplicaId`) so the two broker directories are never conflated.
+	 */
+	replicaId: string;
+	/** Minted once, durably, in `claimActivation` — never re-minted on a retried activation. `null` until activation is first claimed. */
+	activeReplicaId: string | null;
+	/** Last time this process (re)registered the broker binding for the current phase's replica — observability only, never read back for correctness. */
+	brokerRegisteredAt: number | null;
 }
 
 interface LedgerFile {
@@ -102,11 +113,36 @@ export class RuntimeLedger {
 			if (parsed.schemaVersion !== 1 || typeof parsed.byRuntimeId !== 'object' || typeof parsed.generationToRuntimeId !== 'object') {
 				throw new RuntimeUnavailable('The local runtime ledger is corrupt.');
 			}
-			return parsed;
+			return this.backfillReplicaIds(parsed);
 		} catch (err) {
 			if ((err as NodeJS.ErrnoException).code === 'ENOENT') return emptyLedger();
 			throw new RuntimeUnavailable('The local runtime ledger is unavailable.');
 		}
+	}
+
+	/**
+	 * `replicaId` was added to this record shape after some ledgers were
+	 * already written to disk, and every caller treats it as a required
+	 * string (`ensureReadyLocked`'s `broker.prepare(record.replicaId)`,
+	 * REMOVE's `broker.cleanup(record.replicaId)`) — without this, a
+	 * pre-upgrade record has no value for it at all (not even `null`), and
+	 * `path.join(root, undefined)` throws on the very next ENSURE_READY,
+	 * ACTIVATE, or REMOVE this process handles for it. Minted once, durably,
+	 * the first time a pre-upgrade record is read back — every later read
+	 * (including a concurrent one; this whole method runs synchronously, with
+	 * no `await` inside it, so two reads never interleave) sees the same
+	 * persisted value, never a re-mint.
+	 */
+	private backfillReplicaIds(state: LedgerFile): LedgerFile {
+		let dirty = false;
+		for (const record of Object.values(state.byRuntimeId)) {
+			if (typeof record.replicaId !== 'string' || record.replicaId.length === 0) {
+				record.replicaId = crypto.randomUUID();
+				dirty = true;
+			}
+		}
+		if (dirty) this.writeAtomic(state);
+		return state;
 	}
 
 	/** Write-temp-then-rename keeps a crash mid-write from ever leaving a half-written ledger file on disk. */
@@ -192,6 +228,9 @@ export class RuntimeLedger {
 			activationEvidenceJson: null,
 			createdAt: input.now,
 			updatedAt: input.now,
+			replicaId: crypto.randomUUID(),
+			activeReplicaId: null,
+			brokerRegisteredAt: null,
 		};
 		state.byRuntimeId[input.runtimeId] = record;
 		state.generationToRuntimeId[input.generationId] = input.runtimeId;
@@ -269,9 +308,36 @@ export class RuntimeLedger {
 		record.activationRequestJson = input.activationRequestJson;
 		record.activeContainerSpecHash = input.activeContainerSpecHash;
 		record.activationClaimedAt = input.now;
+		record.activeReplicaId = crypto.randomUUID();
 		record.updatedAt = input.now;
 		this.writeAtomic(state);
 		return record;
+	}
+
+	/** Records that the broker binding for `runtimeId`'s current phase was (re)registered — observability only. */
+	recordBrokerRegistered(runtimeId: string, now: number): RuntimeRecord {
+		const state = this.read();
+		const record = state.byRuntimeId[runtimeId];
+		if (!record) throw new RuntimeUnavailable('no local runtime record to record broker registration against');
+		record.brokerRegisteredAt = now;
+		record.updatedAt = now;
+		this.writeAtomic(state);
+		return record;
+	}
+
+	/** Every ACTIVE runtime's record — the startup rebind sweep's input (the broker's in-memory socket does not survive a process restart). */
+	listActiveRecords(): RuntimeRecord[] {
+		return Object.values(this.read().byRuntimeId).filter((record) => record.state === 'ACTIVE');
+	}
+
+	/** Every replica id this ledger still remembers, provisioning or finalized — used to identify orphan broker directories with no matching record. */
+	listKnownReplicaIds(): string[] {
+		const ids: string[] = [];
+		for (const record of Object.values(this.read().byRuntimeId)) {
+			ids.push(record.replicaId);
+			if (record.activeReplicaId) ids.push(record.activeReplicaId);
+		}
+		return ids;
 	}
 
 	recordActiveContainerReady(input: { runtimeId: string; activationRequestHash: string; now: number }): RuntimeRecord {

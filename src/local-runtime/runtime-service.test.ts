@@ -10,10 +10,21 @@ import { ArtifactStore, type ArtifactStoreDocker } from './artifact-store.js';
 import { buildOciArchiveFixture } from './oci-archive-fixture.js';
 import { canonicalHash } from './abi-schema.js';
 import { ArtifactNotStaged, RuntimeNotFound } from './errors.js';
+import { McpBrokerManager } from '../services/mcp-broker.js';
+import type { NodeIdentity } from '../security/node-identity.js';
 
 const tmpDirs: string[] = [];
 function tmpDir(): string {
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'runtime-service-test-'));
+	tmpDirs.push(dir);
+	return dir;
+}
+// The broker's unix socket path (`brokerRoot/<replicaId>/identity.sock`) has a
+// 104-byte `sun_path` ceiling on macOS — `os.tmpdir()` resolves under the deep
+// `/var/folders/...` path there, so the broker root needs its own short tmp
+// dir directly under `/tmp` (same fix `mcp-broker.test.ts` already uses).
+function tmpBrokerRoot(): string {
+	const dir = fs.mkdtempSync(path.join('/tmp', 'privos-local-runtime-broker-'));
 	tmpDirs.push(dir);
 	return dir;
 }
@@ -33,31 +44,41 @@ interface FakeContainer {
 	State: { Running: boolean };
 }
 
+interface FakeNetwork {
+	Internal: boolean;
+	Containers: Record<string, unknown>;
+}
+
 class FakeDockerode {
-	networks = new Set<string>();
+	networks = new Map<string, FakeNetwork>();
 	containers = new Map<string, FakeContainer>(); // keyed by name
 	createContainerCalls = 0;
 	removeCalls = 0;
 
-	async createNetwork(opts: { Name: string }): Promise<void> {
+	async createNetwork(opts: { Name: string; Internal?: boolean }): Promise<void> {
 		if (this.networks.has(opts.Name)) {
 			const err: any = new Error('conflict');
 			err.statusCode = 409;
 			throw err;
 		}
-		this.networks.add(opts.Name);
+		this.networks.set(opts.Name, { Internal: Boolean(opts.Internal), Containers: {} });
 	}
 
 	async createContainer(spec: any): Promise<{ id: string; start: () => Promise<void> }> {
 		this.createContainerCalls++;
 		const id = `cid-${spec.name}-${this.createContainerCalls}`;
+		const mounts = (spec.HostConfig?.Mounts ?? []).map((mount: any) => ({
+			Source: mount.Source,
+			Destination: mount.Target,
+			RW: !mount.ReadOnly,
+		}));
 		const record: FakeContainer = {
 			Id: id,
 			Image: spec.Image,
 			Config: { Image: spec.Image, Labels: spec.Labels, User: spec.User },
 			HostConfig: spec.HostConfig,
 			NetworkSettings: { Networks: { [spec.HostConfig.NetworkMode]: { IPAddress: '10.99.0.5' } } },
-			Mounts: [],
+			Mounts: mounts,
 			State: { Running: false },
 		};
 		this.containers.set(spec.name, record);
@@ -65,11 +86,29 @@ class FakeDockerode {
 	}
 
 	networkConnects: { network: string; Container: string }[] = [];
+	networkDisconnects: { network: string; Container: string }[] = [];
+	networkRemoves: string[] = [];
 
 	getNetwork(name: string) {
 		return {
+			inspect: async () => {
+				const net = this.networks.get(name);
+				if (!net) { const err: any = new Error('not found'); err.statusCode = 404; throw err; }
+				return { Internal: net.Internal, Containers: net.Containers };
+			},
 			connect: async (opts: { Container: string }) => {
 				this.networkConnects.push({ network: name, Container: opts.Container });
+				this.networks.get(name)?.Containers && (this.networks.get(name)!.Containers[opts.Container] = {});
+				const found = this.findByIdOrName(opts.Container);
+				if (found) found[1].NetworkSettings.Networks[name] = { IPAddress: '10.99.0.9' };
+			},
+			disconnect: async (opts: { Container: string }) => {
+				this.networkDisconnects.push({ network: name, Container: opts.Container });
+				delete this.networks.get(name)?.Containers[opts.Container];
+			},
+			remove: async () => {
+				this.networkRemoves.push(name);
+				this.networks.delete(name);
 			},
 		};
 	}
@@ -183,19 +222,36 @@ async function setup(options: { user?: string; selfContainerId?: string; selfIsC
 			State: { Running: true },
 		});
 	}
+	const brokerRoot = tmpBrokerRoot();
+	const broker = new McpBrokerManager(
+		brokerRoot,
+		{} as NodeIdentity, // never signs in these tests — no test here drives a real attest request
+		(id: string) => dockerode.getContainer(id).inspect(),
+	);
 	const service = new RuntimeService(
 		dockerode as any,
 		ledger,
 		artifactStore,
-		{ privateNetwork: 'privos-local-runtime', pidsLimit: 128, readyTimeoutSeconds: 5, ...(options.selfContainerId ? { selfContainerId: options.selfContainerId } : {}) },
+		broker,
+		{
+			privateNetwork: 'privos-local-runtime',
+			pidsLimit: 128,
+			readyTimeoutSeconds: 5,
+			stateDir,
+			fallbackClusterId: 'privos-app-cluster',
+			nodeId: 'local-node',
+			hubOrigin: 'https://hub.example.com',
+			brokerRoot,
+			...(options.selfContainerId ? { selfContainerId: options.selfContainerId } : {}),
+		},
 		() => 1_700_000_000_000,
 		instantReadiness,
 	);
-	return { service, dockerode, ledger, artifactStore, staged, fixture };
+	return { service, dockerode, ledger, artifactStore, staged, fixture, broker, stateDir, brokerRoot };
 }
 
-test('ensureReady stages a valid runtime: READY evidence, no host port, private network, read-only rootfs, no bind mounts', async () => {
-	const { service, dockerode, staged } = await setup();
+test('ensureReady stages a valid runtime: READY evidence, no host port, read-only rootfs, exactly the broker mount, non-internal network', async () => {
+	const { service, dockerode, staged, brokerRoot } = await setup();
 	const request = baseEnsureReadyRequest({}, staged.digest);
 	const ready = await service.ensureReady(request);
 
@@ -210,8 +266,12 @@ test('ensureReady stages a valid runtime: READY evidence, no host port, private 
 	assert.equal(container.HostConfig.ReadonlyRootfs, true);
 	assert.deepEqual(container.HostConfig.PortBindings, {});
 	assert.deepEqual(container.HostConfig.Binds, []);
-	assert.deepEqual(container.Mounts, []);
+	assert.equal(container.Mounts.length, 1);
+	assert.equal(container.Mounts[0].Destination, '/run/privos');
+	assert.equal(container.Mounts[0].RW, false);
+	assert.ok(container.Mounts[0].Source.startsWith(brokerRoot));
 	assert.equal(container.State.Running, true);
+	assert.equal(dockerode.networks.get('privos-local-runtime')?.Internal, false);
 });
 
 test('ensureReady is idempotent: a repeat call replays the exact stored READY document with no second container create', async () => {
@@ -343,12 +403,183 @@ test('an image that asks for root gets the unprivileged fallback instead', async
 test('when the driver runs as a container it joins the private network before probing', async () => {
 	const { service, dockerode, staged } = await setup({ selfContainerId: 'app-cluster-self' });
 	await service.ensureReady(baseEnsureReadyRequest({}, staged.digest));
-	assert.deepEqual(dockerode.networkConnects, [{ network: 'privos-local-runtime', Container: 'app-cluster-self' }]);
+	assert.ok(
+		dockerode.networkConnects.some((c) => c.network === 'privos-local-runtime' && c.Container === 'app-cluster-self'),
+	);
 });
 
-test('when the driver is not a container there is nothing to join and readiness proceeds', async () => {
+test('when the driver is not a container there is nothing to join for itself, and ensureReady still succeeds', async () => {
 	const { service, dockerode, staged } = await setup({ selfContainerId: 'not-a-container', selfIsContainer: false });
 	const ready = await service.ensureReady(baseEnsureReadyRequest({}, staged.digest));
 	assert.equal(ready.state, 'READY');
-	assert.deepEqual(dockerode.networkConnects, []);
+	assert.equal(dockerode.networkConnects.some((c) => c.Container === 'not-a-container'), false);
+});
+
+test('an existing internal privos-local-runtime network is reconciled to non-internal, not left silently wrong', async () => {
+	const { service, dockerode, staged } = await setup();
+	await dockerode.createNetwork({ Name: 'privos-local-runtime', Internal: true });
+	assert.equal(dockerode.networks.get('privos-local-runtime')?.Internal, true);
+
+	await service.ensureReady(baseEnsureReadyRequest({}, staged.digest));
+
+	assert.equal(dockerode.networks.get('privos-local-runtime')?.Internal, false);
+	assert.deepEqual(dockerode.networkRemoves, ['privos-local-runtime']);
+});
+
+test('ensureNetwork memoizes an in-flight reconcile: two concurrent callers share one inspect/remove/create sequence', async () => {
+	const { service, dockerode } = await setup();
+	await dockerode.createNetwork({ Name: 'privos-local-runtime', Internal: true });
+	const runtimeService = service as unknown as { ensureNetwork(): Promise<void> };
+
+	// Both calls are issued back-to-back with no `await` in between, so
+	// without memoization each would independently see the stale `Internal:
+	// true` network and run its own disconnect/remove/create — the array
+	// below would then hold the name twice instead of once.
+	await Promise.all([runtimeService.ensureNetwork(), runtimeService.ensureNetwork()]);
+
+	assert.deepEqual(dockerode.networkRemoves, ['privos-local-runtime']);
+	assert.equal(dockerode.networks.get('privos-local-runtime')?.Internal, false);
+});
+
+test('reconciling an internal network first disconnects every attached endpoint, including this process itself', async () => {
+	const { service, dockerode, staged } = await setup({ selfContainerId: 'app-cluster-self' });
+	await dockerode.createNetwork({ Name: 'privos-local-runtime', Internal: true });
+	await dockerode.getNetwork('privos-local-runtime').connect({ Container: 'app-cluster-self' });
+
+	await service.ensureReady(baseEnsureReadyRequest({}, staged.digest));
+
+	assert.ok(dockerode.networkDisconnects.some((d) => d.network === 'privos-local-runtime' && d.Container === 'app-cluster-self'));
+	assert.equal(dockerode.networks.get('privos-local-runtime')?.Internal, false);
+});
+
+// Docker has no "flip Internal in place" op, so a stale internal network is
+// fixed by disconnect-everything -> remove -> recreate. Without a reattach
+// pass, any OTHER endpoint the reconcile disconnected (not just this
+// process's own container) would stay silently detached from the recreated
+// network forever.
+test('reconciling an internal network re-attaches every endpoint it disconnected, not only this process itself', async () => {
+	const { service, dockerode, staged } = await setup();
+	await dockerode.createNetwork({ Name: 'privos-local-runtime', Internal: true });
+	dockerode.containers.set('other-app', {
+		Id: 'other-app-id',
+		Image: 'other-app-image',
+		Config: { Image: 'other-app-image', Labels: {} },
+		HostConfig: {},
+		NetworkSettings: { Networks: {} },
+		Mounts: [],
+		State: { Running: true },
+	});
+	await dockerode.getNetwork('privos-local-runtime').connect({ Container: 'other-app-id' });
+
+	await service.ensureReady(baseEnsureReadyRequest({}, staged.digest));
+
+	assert.equal(dockerode.networks.get('privos-local-runtime')?.Internal, false);
+	assert.ok(
+		dockerode.networkConnects.some((c) => c.network === 'privos-local-runtime' && c.Container === 'other-app-id'),
+		'the disconnected endpoint must be reconnected once the network is recreated',
+	);
+});
+
+// The SDK inside the app container resolves its outbound identity mode once
+// at process boot by checking whether the broker's identity socket exists.
+// Registering the broker binding after `start()` can leave an ACTIVE app
+// with no outbound identity for its entire lifetime.
+test('the broker binding is registered before the container is started', async () => {
+	const { service, dockerode, staged, broker } = await setup();
+	const order: string[] = [];
+
+	const originalRegisterProvisioningV3 = broker.registerProvisioningV3.bind(broker);
+	broker.registerProvisioningV3 = (async (binding: Parameters<typeof originalRegisterProvisioningV3>[0]) => {
+		order.push('register');
+		return originalRegisterProvisioningV3(binding);
+	}) as typeof broker.registerProvisioningV3;
+
+	const originalGetContainer = dockerode.getContainer.bind(dockerode);
+	dockerode.getContainer = ((idOrName: string) => {
+		const handle = originalGetContainer(idOrName);
+		return { ...handle, start: async () => { order.push('start'); return handle.start(); } };
+	}) as typeof dockerode.getContainer;
+
+	await service.ensureReady(baseEnsureReadyRequest({}, staged.digest));
+
+	assert.deepEqual(order, ['register', 'start']);
+});
+
+// A ledger record written before `replicaId` existed on this record shape has
+// no value for it at all — `RuntimeLedger` backfills it on read, but REMOVE
+// and ACTIVATE must actually complete off that backfilled record, not just
+// avoid a `path.join(root, undefined)` crash and then fail some other way.
+function rewriteLedgerRecord(stateDir: string, runtimeId: string, mutate: (record: Record<string, unknown>) => void): void {
+	const ledgerPath = path.join(stateDir, 'runtimes.json');
+	const raw = JSON.parse(fs.readFileSync(ledgerPath, 'utf8')) as { byRuntimeId: Record<string, Record<string, unknown>> };
+	mutate(raw.byRuntimeId[runtimeId]!);
+	fs.writeFileSync(ledgerPath, JSON.stringify(raw));
+}
+
+test('REMOVE does not throw for a pre-upgrade ledger record with no replicaId', async () => {
+	const { service, dockerode, ledger, staged, stateDir } = await setup();
+	const request = baseEnsureReadyRequest({}, staged.digest);
+	const ready = await service.ensureReady(request);
+
+	rewriteLedgerRecord(stateDir, ready.runtime_id, (record) => { delete record.replicaId; });
+
+	await assert.doesNotReject(() =>
+		service.remove({
+			protocol_version: 3,
+			operation: 'REMOVE',
+			installation_id: ready.installation_id,
+			workspace_id: ready.workspace_id,
+			deployment_id: ready.deployment_id,
+			listing_id: ready.listing_id,
+			version_id: ready.version_id,
+			generation_id: ready.generation_id,
+			generation_number: ready.generation_number,
+			descriptor_artifact_hash: ready.descriptor_artifact_hash,
+			resource_manifest_hash: ready.resource_manifest_hash,
+			permission_contract_hash: ready.permission_contract_hash,
+			runtime_authorization: ready.runtime_authorization,
+			runtime_id: ready.runtime_id,
+			artifact_digest: ready.artifact_digest,
+		}),
+	);
+	assert.equal(dockerode.containers.size, 0);
+	assert.equal(ledger.getByRuntimeId(ready.runtime_id), null);
+});
+
+test('ACTIVATE succeeds off a pre-upgrade ledger record with no replicaId once its container is already gone', async () => {
+	const { service, dockerode, staged, stateDir } = await setup();
+	const request = baseEnsureReadyRequest({}, staged.digest);
+	const ready = await service.ensureReady(request);
+
+	// The exact state a genuinely pre-upgrade record is in: the ledger row
+	// predates `replicaId` entirely, and its container (from before this
+	// driver ever mounted a broker directory) is already gone.
+	dockerode.containers.clear();
+	rewriteLedgerRecord(stateDir, ready.runtime_id, (record) => { delete record.replicaId; });
+
+	const activation = {
+		protocol_version: 3,
+		operation: 'ACTIVATE',
+		installation_id: ready.installation_id,
+		workspace_id: ready.workspace_id,
+		deployment_id: ready.deployment_id,
+		listing_id: ready.listing_id,
+		version_id: ready.version_id,
+		generation_id: ready.generation_id,
+		generation_number: ready.generation_number,
+		descriptor_artifact_hash: ready.descriptor_artifact_hash,
+		resource_manifest_hash: ready.resource_manifest_hash,
+		permission_contract_hash: ready.permission_contract_hash,
+		runtime_authorization: ready.runtime_authorization,
+		runtime_id: ready.runtime_id,
+		artifact_digest: ready.artifact_digest,
+		ensure_ready_request_hash: canonicalHash(request),
+		runtime_resource_inventory_hash: 'D'.repeat(43),
+		runtime_approval_receipt_hash: 'E'.repeat(43),
+		runtime_authorization_epoch: 1,
+	};
+
+	const active = await service.activate(activation);
+	assert.equal(active.state, 'ACTIVE');
+	assert.equal(dockerode.containers.size, 1);
 });

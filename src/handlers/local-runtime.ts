@@ -1,9 +1,8 @@
 /**
- * The five `privos-local-runtime-driver-v1` ABI routes (phase 6 routes
- * table). Registered on the existing Fastify instance behind the existing
- * `fastify.authenticate` preHandler, so they are reachable both over the
- * tunnel (`fastify.inject`, phase 3/4) and — on a fleet/master HTTP
- * deployment — over real HTTP.
+ * The five `privos-local-runtime-driver-v1` ABI routes. Registered on the
+ * existing Fastify instance behind the existing `fastify.authenticate`
+ * preHandler, so they are reachable both over the tunnel (`fastify.inject`)
+ * and — on a fleet/master HTTP deployment — over real HTTP.
  *
  * `stage` is the one op that, in tunnel mode, never actually reaches this
  * route: `tunnel-client.ts`'s `req-chunk` handling calls `ArtifactStore.stage`
@@ -27,15 +26,20 @@ import fp from 'fastify-plugin';
 import { strictJsonParse } from '../local-runtime/canonical.js';
 import { ArtifactStore, createDockerArtifactStoreDocker } from '../local-runtime/artifact-store.js';
 import { RuntimeLedger } from '../local-runtime/ledger.js';
-import { RuntimeService } from '../local-runtime/runtime-service.js';
+import { RuntimeService, type RuntimeServiceLogger } from '../local-runtime/runtime-service.js';
 import { DriverError } from '../local-runtime/errors.js';
-import { config } from '../config.js';
+import { config, resolveHubOrigin } from '../config.js';
 import { docker, imageManager } from '../docker/index.js';
+import { mcpBrokerManager } from '../services/mcp-broker.js';
 
 const SHA256_RE = /^sha256:[a-f0-9]{64}$/;
 const PRIVATE_NETWORK = 'privos-local-runtime';
 const PIDS_LIMIT = 128;
-const READY_TIMEOUT_SECONDS = 30;
+// Must equal `clusterReadyTimeoutSeconds` in
+// `privos-mt-manage/resources/mcp-app-lifecycle-v3/timeouts.json` — pinned by
+// `local-runtime.test.ts`, which also checks the invariant that vector file
+// documents (the Hub's driver-ACTIVATE timeout must stay above this).
+export const READY_TIMEOUT_SECONDS = 30;
 
 function stateSubDir(name: string): string {
 	return path.join(config.PRIVOS_STATE_DIR, name);
@@ -65,13 +69,27 @@ export function getArtifactStore(): ArtifactStore {
 	return cachedArtifactStore;
 }
 
-function getRuntimeService(): RuntimeService {
+/** `logger` is only honoured the first time this builds the singleton — pass it from the earliest call site (the plugin's own startup rebind, which runs before any route can call this with none). */
+export function getRuntimeService(logger?: RuntimeServiceLogger): RuntimeService {
 	if (!cachedRuntimeService) {
 		cachedRuntimeService = new RuntimeService(
 			docker,
 			new RuntimeLedger(path.join(stateSubDir('local-runtime'), 'runtimes.json')),
 			getArtifactStore(),
-			{ privateNetwork: PRIVATE_NETWORK, pidsLimit: PIDS_LIMIT, readyTimeoutSeconds: READY_TIMEOUT_SECONDS },
+			mcpBrokerManager,
+			{
+				privateNetwork: PRIVATE_NETWORK,
+				pidsLimit: PIDS_LIMIT,
+				readyTimeoutSeconds: READY_TIMEOUT_SECONDS,
+				stateDir: config.PRIVOS_STATE_DIR,
+				fallbackClusterId: config.FLEET_CLUSTER_ID,
+				nodeId: config.FLEET_NODE_ID ?? 'local-node',
+				hubOrigin: resolveHubOrigin(config),
+				brokerRoot: config.MCP_BROKER_ROOT,
+			},
+			undefined,
+			undefined,
+			logger,
 		);
 	}
 	return cachedRuntimeService;
@@ -124,6 +142,33 @@ async function streamBodyToTempFile(
 }
 
 const localRuntimeHandler: FastifyPluginAsync = async (fastify) => {
+	// Logged once at startup: a local app's outbound Hub calls sign DPoP against
+	// this origin, so a silent PRIVOS_HUB_URL/PRIVOS_HUB_PUBLIC_URL mismatch with
+	// the Hub's own ROOT_URL only ever surfaces as a 401 deep in a request —
+	// this line is the fast way to rule that out from the boot log alone.
+	fastify.log.info(
+		{
+			hubOrigin: resolveHubOrigin(config),
+			source: config.PRIVOS_HUB_PUBLIC_URL ? 'PRIVOS_HUB_PUBLIC_URL' : config.PRIVOS_HUB_URL ? 'PRIVOS_HUB_URL (fallback)' : 'unset',
+		},
+		'local-runtime: resolved hub origin',
+	);
+
+	// Startup reconciliation for local ACTIVE runtimes: the broker's socket is
+	// an in-memory server that does not survive this process restarting (nor a
+	// host reboot, which also wipes the `/run` tmpfs the broker directory lives
+	// under). `server.ts` runs its own MANAGED-only `rebindMcpBrokers()` before
+	// this plugin registers; this is the local-runtime equivalent, run here
+	// because this plugin (unlike `server.ts`) owns the `RuntimeService`
+	// instance the rebind needs. Best-effort: a failure here must not crash the
+	// rest of server boot.
+	try {
+		const rebind = await getRuntimeService(fastify.log).rebindActiveRuntimes();
+		fastify.log.info(rebind, 'local-runtime brokers rebound');
+	} catch (err) {
+		fastify.log.error({ err }, 'local-runtime broker rebind failed');
+	}
+
 	await fastify.register(async (scoped) => {
 		// Duplicate-JSON-member rejection (fail-closed layer 1) — scoped to
 		// this plugin only, so no other route's body parsing changes.

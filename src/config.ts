@@ -27,9 +27,14 @@ const ConfigSchema = z.object({
 	// hard requirement on JWT_SECRET at boot (resolveClusterSecret() resolves
 	// the paired credential per request instead — see src/cluster-secret.ts).
 	PRIVOS_HUB_URL: z.string().url().optional(),
+	// The Hub's PUBLIC origin — local apps call this directly (no compose-internal
+	// bridge network), and its DPoP `htu` must match the Hub's own `ROOT_URL`.
+	// Falls back to `PRIVOS_HUB_URL` when unset, which is already the public URL
+	// on a non-compose (tunnel) install — see `resolveHubOrigin`.
+	PRIVOS_HUB_PUBLIC_URL: z.string().url().optional(),
 	PRIVOS_STATE_DIR: z.string().default('/var/lib/privos-app-cluster'),
 	PRIVOS_TUNNEL_ENABLED: z.enum(['on', 'off']).optional(),
-	// `privos-local-runtime-driver-v1` ABI (phase 6) — the five local-runtime
+	// `privos-local-runtime-driver-v1` ABI — the five local-runtime
 	// routes plus the tunnel `forward` frame. Unset means "on iff tunnel mode"
 	// (see `isLocalRuntimeEnabled`); `off` always wins, matching the
 	// `CLUSTER_OPERATOR_ROUTES` on/off/unset precedent above.
@@ -159,6 +164,18 @@ export function isLocalRuntimeEnabled(
 	if (cfg.CLUSTER_LOCAL_RUNTIME === 'off') return false;
 	if (cfg.CLUSTER_LOCAL_RUNTIME === 'on') return true;
 	return isTunnelMode(cfg);
+}
+
+/**
+ * The origin a local app calls for outbound Hub API calls: the Hub's PUBLIC
+ * URL, never a compose-internal address — its DPoP `htu` must match the
+ * Hub's own `ROOT_URL`. Falls back to `PRIVOS_HUB_URL` (already the public
+ * URL on a non-compose/tunnel install) when `PRIVOS_HUB_PUBLIC_URL` is unset.
+ * Normalized to a bare origin (scheme + host, no path, no trailing slash).
+ */
+export function resolveHubOrigin(cfg: Pick<Config, 'PRIVOS_HUB_PUBLIC_URL' | 'PRIVOS_HUB_URL'>): string {
+	const raw = cfg.PRIVOS_HUB_PUBLIC_URL || cfg.PRIVOS_HUB_URL;
+	return raw ? new URL(raw).origin : '';
 }
 
 function loadConfig(): Config {
