@@ -26,7 +26,7 @@ const instantReadiness: ReadinessProbe = { waitReady: async () => {} };
 interface FakeContainer {
 	Id: string;
 	Image: string;
-	Config: { Image: string; Labels: Record<string, string> };
+	Config: { Image: string; Labels: Record<string, string>; User?: string };
 	HostConfig: any;
 	NetworkSettings: { Networks: Record<string, { IPAddress: string }> };
 	Mounts: any[];
