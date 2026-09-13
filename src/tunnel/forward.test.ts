@@ -44,7 +44,7 @@ test('the tunnel frame carries only the 32-hex part and still resolves the conta
 	const calls: string[] = [];
 	const transport: ForwardTransport = async (url) => {
 		calls.push(url);
-		return { status: 200, headers: { 'content-type': 'application/json' }, body: Buffer.from('{}') };
+		return { status: 200, bodyText: '{}' };
 	};
 	const result = await dispatchForward(docker, { runtimeId: hex, path: '/mcp', body: { jsonrpc: '2.0' } }, transport);
 	assert.equal(result.status, 200);
