@@ -51,6 +51,13 @@ test('the tunnel frame carries only the 32-hex part and still resolves the conta
 	assert.equal(calls.length, 1);
 });
 
+test('a body-less upstream reply is status-only, never raw with an empty rawBody', async () => {
+	const docker = fakeDocker([runningContainer(RUNTIME_ID)]);
+	const transport: ForwardTransport = async () => ({ status: 202, bodyText: '' });
+	const result = await dispatchForward(docker, { runtimeId: RUNTIME_ID, path: '/mcp', body: { jsonrpc: '2.0', method: 'notifications/initialized' } }, transport);
+	assert.deepEqual(result, { status: 202 });
+});
+
 test('an unknown runtimeId returns 404 without invoking the HTTP transport', async () => {
 	const docker = fakeDocker([runningContainer(RUNTIME_ID)]);
 	let transportCalled = false;

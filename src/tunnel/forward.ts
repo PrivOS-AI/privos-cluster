@@ -120,6 +120,10 @@ export async function dispatchForward(
 			body: bodyText,
 			timeoutMs: input.timeoutMs ?? FORWARD_DEFAULT_TIMEOUT_MS,
 		});
+		// A body-less reply (a JSON-RPC notification is answered 202 with nothing) is
+		// status-only on the wire: `res.raw` requires a non-empty `rawBody`, and the Hub
+		// closes the whole tunnel on that frame otherwise.
+		if (result.bodyText === '') return { status: result.status };
 		try {
 			return { status: result.status, body: JSON.parse(result.bodyText) };
 		} catch {

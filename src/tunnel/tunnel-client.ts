@@ -553,7 +553,8 @@ export class TunnelClient {
 				payload: (frame.raw ? frame.rawBody : frame.body) as InjectOptions['payload'],
 			});
 			const res: ResFrame = { t: 'res', id: frame.id, status: injected.statusCode };
-			if (frame.raw) {
+			// An empty body is status-only either way: `res.raw` requires a non-empty `rawBody`.
+			if (frame.raw && injected.body) {
 				res.raw = true;
 				res.rawBody = injected.body;
 			} else if (injected.body) {
