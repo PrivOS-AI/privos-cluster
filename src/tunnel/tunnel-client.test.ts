@@ -50,11 +50,12 @@ class FakeSocket extends EventEmitter implements TunnelSocket {
 const silentLogger = { info: () => {}, warn: () => {}, error: () => {} };
 
 async function flush(): Promise<void> {
-	// Two microtask turns is enough to drain the single `await inject()` chain
-	// used throughout `handleReq`/`finalizeStage`.
-	await Promise.resolve();
-	await Promise.resolve();
-	await Promise.resolve();
+	// A real (zero-delay) timer only fires once every currently queued
+	// microtask has drained — which covers both the `inject()`/`finalizeStage`
+	// promise chains this used to count microtask turns for, and `start()`'s
+	// bounded node-identity race (`Promise.race` against a real `setTimeout`),
+	// which a fixed microtask count cannot reliably outlast.
+	await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
 let tmpDirs: string[] = [];
@@ -72,7 +73,7 @@ interface Harness {
 	client: TunnelClient;
 	sockets: FakeSocket[];
 	stateDir: string;
-	openFirst(): FakeSocket;
+	openFirst(): Promise<FakeSocket>;
 }
 
 function makeHarness(overrides: Partial<TunnelClientOptions> = {}): Harness {
@@ -104,8 +105,12 @@ function makeHarness(overrides: Partial<TunnelClientOptions> = {}): Harness {
 		client,
 		sockets,
 		stateDir,
-		openFirst(): FakeSocket {
+		async openFirst(): Promise<FakeSocket> {
 			client.start();
+			// `start()` now awaits the (bounded) node-identity load before its
+			// first `connect()`; the fake socket does not exist until that
+			// resolves and `connect()` actually runs.
+			await flush();
 			const socket = sockets[0];
 			socket.emit('open');
 			socket.sent.length = 0; // drop the `hello` frame for tests that don't care about it
@@ -129,9 +134,10 @@ describe('fullJitterBackoffMs', () => {
 });
 
 describe('connect + hello', () => {
-	test('sends {t:hello, version, clusterId, clusterCapabilities} on open', () => {
+	test('sends {t:hello, version, clusterId, clusterCapabilities} on open', async () => {
 		const { client, sockets } = makeHarness();
 		client.start();
+		await flush();
 		sockets[0].emit('open');
 		assert.deepEqual(JSON.parse(sockets[0].sent[0] as string), {
 			t: 'hello',
@@ -142,7 +148,7 @@ describe('connect + hello', () => {
 		client.stop();
 	});
 
-	test('signs a connect JWT (iss/kid/jti/60s ttl) when a secret is resolved', () => {
+	test('signs a connect JWT (iss/kid/jti/60s ttl) when a secret is resolved', async () => {
 		const sockets: { headers: Record<string, string> }[] = [];
 		const { client } = makeHarness({
 			createSocket: (_url, headers) => {
@@ -151,6 +157,7 @@ describe('connect + hello', () => {
 			},
 		});
 		client.start();
+		await flush();
 		const auth = sockets[0].headers.Authorization;
 		assert.ok(auth?.startsWith('Bearer '));
 		const token = auth!.slice('Bearer '.length);
@@ -163,7 +170,7 @@ describe('connect + hello', () => {
 		client.stop();
 	});
 
-	test('falls back to the X-Privos-Pair-Token header when unpaired', () => {
+	test('falls back to the X-Privos-Pair-Token header when unpaired', async () => {
 		const stateDir = makeTmpDir();
 		writeStateFile(stateDir, PAIR_TOKEN_FILENAME, 'one-time-token-value');
 		const sockets: { headers: Record<string, string> }[] = [];
@@ -176,12 +183,13 @@ describe('connect + hello', () => {
 			},
 		});
 		client.start();
+		await flush();
 		assert.equal(sockets[0].headers['X-Privos-Pair-Token'], 'one-time-token-value');
 		assert.equal(sockets[0].headers.Authorization, undefined);
 		client.stop();
 	});
 
-	test('connects with no auth headers when neither a secret nor a pair token exists (dials and waits, no crash)', () => {
+	test('connects with no auth headers when neither a secret nor a pair token exists (dials and waits, no crash)', async () => {
 		const sockets: { headers: Record<string, string> }[] = [];
 		const { client } = makeHarness({
 			resolveSecret: () => undefined,
@@ -191,7 +199,126 @@ describe('connect + hello', () => {
 			},
 		});
 		assert.doesNotThrow(() => client.start());
+		await flush();
 		assert.deepEqual(sockets[0].headers, {});
+		client.stop();
+	});
+
+	test('sends nodeIdentity in hello once loadNodeIdentity resolves', async () => {
+		const identity = {
+			nodeId: 'local-node',
+			kid: 'VSIBfJ14VRCMkHzJw-1aOda1DVridqQxqPxsy8rZFOM',
+			publicJwk: { kty: 'EC' as const, crv: 'P-256' as const, x: 'x-coord', y: 'y-coord' },
+		};
+		const { client, sockets } = makeHarness({ loadNodeIdentity: async () => identity });
+		client.start();
+		await flush();
+		sockets[0].emit('open');
+		assert.deepEqual(JSON.parse(sockets[0].sent[0] as string), {
+			t: 'hello',
+			version: '1.2.3',
+			clusterId: 'cl_test',
+			clusterCapabilities: { operatorRoutes: false, artifactStaging: true },
+			nodeIdentity: identity,
+		});
+		client.stop();
+	});
+
+	test('omits nodeIdentity and logs a warning when loadNodeIdentity rejects', async () => {
+		const warnings: unknown[] = [];
+		const { client, sockets } = makeHarness({
+			loadNodeIdentity: async () => { throw new Error('key file unreadable'); },
+			fastify: { inject: async () => ({ statusCode: 200, body: '{}', headers: {}, json: () => ({}) }) as never, log: { ...silentLogger, warn: (...args) => warnings.push(args) } },
+		});
+		client.start();
+		await flush();
+		sockets[0].emit('open');
+		const hello = JSON.parse(sockets[0].sent[0] as string);
+		assert.equal('nodeIdentity' in hello, false);
+		assert.equal(warnings.length, 1);
+		client.stop();
+	});
+
+	test('a slow loadNodeIdentity that exceeds the bound still connects, without nodeIdentity, and logs the timeout', async () => {
+		const warnings: unknown[] = [];
+		const { client, sockets } = makeHarness({
+			// Never resolves within the test — the bounded race must win via the
+			// timeout branch, not hang the first connect forever.
+			loadNodeIdentity: () => new Promise(() => {}),
+			nodeIdentityLoadTimeoutMs: 10,
+			fastify: { inject: async () => ({ statusCode: 200, body: '{}', headers: {}, json: () => ({}) }) as never, log: { ...silentLogger, warn: (...args) => warnings.push(args) } },
+		});
+		client.start();
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		assert.equal(sockets.length, 1, 'the first connect must still happen once the bound elapses');
+		sockets[0].emit('open');
+		const hello = JSON.parse(sockets[0].sent[0] as string);
+		assert.equal('nodeIdentity' in hello, false);
+		assert.equal(warnings.length, 1);
+		client.stop();
+	});
+
+	test('a slow loadNodeIdentity that later resolves is not discarded: the next reconnect hello carries it', async () => {
+		const identity = {
+			nodeId: 'local-node',
+			kid: 'VSIBfJ14VRCMkHzJw-1aOda1DVridqQxqPxsy8rZFOM',
+			publicJwk: { kty: 'EC' as const, crv: 'P-256' as const, x: 'x-coord', y: 'y-coord' },
+		};
+		let resolveLoad!: (value: typeof identity) => void;
+		const loadPromise = new Promise<typeof identity>((resolve) => { resolveLoad = resolve; });
+		const { client, sockets } = makeHarness({
+			loadNodeIdentity: () => loadPromise,
+			nodeIdentityLoadTimeoutMs: 10,
+			random: () => 0,
+		});
+		client.start();
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		assert.equal(sockets.length, 1);
+		sockets[0].emit('open');
+		const firstHello = JSON.parse(sockets[0].sent[0] as string);
+		assert.equal('nodeIdentity' in firstHello, false, 'the load lost the race, so the first hello must omit it');
+
+		// The original (still-pending) load finally succeeds — it must not have
+		// been discarded when the timeout won the race above.
+		resolveLoad(identity);
+		await flush();
+		sockets[0].emit('close', 4408, Buffer.from('handshake_timeout'));
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		assert.equal(sockets.length, 2, 'must reconnect after the close');
+		sockets[1].emit('open');
+		const secondHello = JSON.parse(sockets[1].sent[0] as string);
+		assert.deepEqual(secondHello.nodeIdentity, identity);
+		client.stop();
+	});
+
+	test('a rejected loadNodeIdentity is retried on the next reconnect and its later success reaches hello', async () => {
+		const identity = {
+			nodeId: 'local-node',
+			kid: 'VSIBfJ14VRCMkHzJw-1aOda1DVridqQxqPxsy8rZFOM',
+			publicJwk: { kty: 'EC' as const, crv: 'P-256' as const, x: 'x-coord', y: 'y-coord' },
+		};
+		let attempts = 0;
+		const { client, sockets } = makeHarness({
+			loadNodeIdentity: () => {
+				attempts++;
+				return attempts === 1 ? Promise.reject(new Error('key file unreadable')) : Promise.resolve(identity);
+			},
+			random: () => 0,
+		});
+		client.start();
+		await flush();
+		assert.equal(sockets.length, 1);
+		sockets[0].emit('open');
+		const firstHello = JSON.parse(sockets[0].sent[0] as string);
+		assert.equal('nodeIdentity' in firstHello, false, 'the first (rejected) load must not block or fake the first hello');
+
+		sockets[0].emit('close', 4408, Buffer.from('handshake_timeout'));
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		assert.equal(sockets.length, 2, 'must reconnect after the close');
+		sockets[1].emit('open');
+		const secondHello = JSON.parse(sockets[1].sent[0] as string);
+		assert.deepEqual(secondHello.nodeIdentity, identity);
+		assert.ok(attempts >= 2, 'the reconnect must have retried the load');
 		client.stop();
 	});
 });
@@ -208,7 +335,7 @@ describe('req dispatch via fastify.inject', () => {
 				log: silentLogger,
 			},
 		});
-		const socket = openFirst();
+		const socket = await openFirst();
 		socket.emit('message', JSON.stringify({ t: 'req', id: 'req-1', method: 'GET', path: '/api/v1/health', timeoutMs: 15000 }), false);
 		await flush();
 		assert.deepEqual(socket.lastFrame(), { t: 'res', id: 'req-1', status: 200, body: { status: 'ok', version: '0.1.0' } });
@@ -226,7 +353,7 @@ describe('req dispatch via fastify.inject', () => {
 				log: silentLogger,
 			},
 		});
-		const socket = openFirst();
+		const socket = await openFirst();
 		socket.emit('message', JSON.stringify({ t: 'req', id: 'req-2', method: 'POST', path: '/api/v1/deploy', query: { dryRun: 'true' }, timeoutMs: 15000 }), false);
 		await flush();
 		assert.equal(seenUrl, '/api/v1/deploy?dryRun=true');
@@ -245,7 +372,7 @@ describe('req dispatch via fastify.inject', () => {
 				log: silentLogger,
 			},
 		});
-		const socket = openFirst();
+		const socket = await openFirst();
 		socket.emit(
 			'message',
 			JSON.stringify({ t: 'req', id: 'req-3', method: 'PUT', path: '/api/v1/v3/runtimes/by-generation/gen-42', raw: true, rawBody: rawReqBody, timeoutMs: 30000 }),
@@ -265,7 +392,7 @@ describe('req dispatch via fastify.inject', () => {
 				log: silentLogger,
 			},
 		});
-		const socket = openFirst();
+		const socket = await openFirst();
 		socket.emit('message', JSON.stringify({ t: 'req', id: 'req-err', method: 'GET', path: '/x', timeoutMs: 1000 }), false);
 		await flush();
 		assert.deepEqual(socket.lastFrame(), { t: 'res', id: 'req-err', status: 500, body: { error: 'internal_error' } });
@@ -283,7 +410,7 @@ describe('req dispatch via fastify.inject', () => {
 				log: silentLogger,
 			},
 		});
-		const socket = openFirst();
+		const socket = await openFirst();
 		for (let i = 0; i < DEFAULT_CONCURRENCY_LIMIT + 1; i++) {
 			socket.emit('message', JSON.stringify({ t: 'req', id: `r${i}`, method: 'GET', path: '/x', timeoutMs: 1000 }), false);
 		}
@@ -309,7 +436,7 @@ describe('forward', () => {
 				return { status: 200, body: { ok: true } };
 			},
 		});
-		const socket = openFirst();
+		const socket = await openFirst();
 		socket.emit('message', JSON.stringify({ t: 'forward', id: 'fwd-1', runtimeId: 'a'.repeat(32), path: '/mcp', body: { jsonrpc: '2.0' }, timeoutMs: 1000 }), false);
 		await flush();
 		const frame = socket.lastFrame();
@@ -323,7 +450,7 @@ describe('forward', () => {
 		const { client, openFirst } = makeHarness({
 			forwardDispatch: async () => ({ status: 404, error: { code: 'not_found', message: 'unknown runtimeId' } }),
 		});
-		const socket = openFirst();
+		const socket = await openFirst();
 		socket.emit('message', JSON.stringify({ t: 'forward', id: 'fwd-2', runtimeId: 'b'.repeat(32), path: '/mcp', timeoutMs: 1000 }), false);
 		await flush();
 		const frame = socket.lastFrame();
@@ -336,7 +463,7 @@ describe('forward', () => {
 		const { client, openFirst } = makeHarness({
 			forwardDispatch: async () => { throw new Error('boom'); },
 		});
-		const socket = openFirst();
+		const socket = await openFirst();
 		socket.emit('message', JSON.stringify({ t: 'forward', id: 'fwd-3', runtimeId: 'c'.repeat(32), path: '/mcp', timeoutMs: 1000 }), false);
 		await flush();
 		const frame = socket.lastFrame();
@@ -346,9 +473,9 @@ describe('forward', () => {
 });
 
 describe('ping/pong liveness', () => {
-	test('answers a ping with a pong echoing the same at', () => {
+	test('answers a ping with a pong echoing the same at', async () => {
 		const { client, openFirst } = makeHarness();
-		const socket = openFirst();
+		const socket = await openFirst();
 		socket.emit('message', JSON.stringify({ t: 'ping', at: 1757600000000 }), false);
 		assert.deepEqual(socket.lastFrame(), { t: 'pong', at: 1757600000000 });
 		client.stop();
@@ -356,9 +483,9 @@ describe('ping/pong liveness', () => {
 });
 
 describe('malformed frames', () => {
-	test('closes the socket 4400 on malformed JSON', () => {
+	test('closes the socket 4400 on malformed JSON', async () => {
 		const { client, openFirst } = makeHarness();
-		const socket = openFirst();
+		const socket = await openFirst();
 		socket.emit('message', '{not json', false);
 		assert.equal(socket.closedWith?.code, 4400);
 		client.stop();
@@ -366,11 +493,11 @@ describe('malformed frames', () => {
 });
 
 describe('paired frame', () => {
-	test('persists the credential and removes the one-time pair token', () => {
+	test('persists the credential and removes the one-time pair token', async () => {
 		const stateDir = makeTmpDir();
 		writeStateFile(stateDir, PAIR_TOKEN_FILENAME, 'one-time-token');
 		const { client, openFirst } = makeHarness({ stateDir });
-		const socket = openFirst();
+		const socket = await openFirst();
 		socket.emit('message', JSON.stringify({ t: 'paired', clusterId: 'cl_test', credential: 'b64:new-credential' }), false);
 		assert.equal(readStateFile(stateDir, CREDENTIAL_FILENAME), 'b64:new-credential');
 		assert.equal(readStateFile(stateDir, PAIR_TOKEN_FILENAME), undefined);
@@ -380,10 +507,10 @@ describe('paired frame', () => {
 	// The Hub keys a tunnel cluster by its own row id and resolves it from the
 	// connect JWT's `kid`. Dropping the assigned id means every reconnect after a
 	// successful pairing presents the local default and is refused 401 forever.
-	test('persists the Hub-assigned cluster id', () => {
+	test('persists the Hub-assigned cluster id', async () => {
 		const stateDir = makeTmpDir();
 		const { client, openFirst } = makeHarness({ stateDir });
-		const socket = openFirst();
+		const socket = await openFirst();
 		socket.emit('message', JSON.stringify({ t: 'paired', clusterId: 'hub-assigned-id', credential: 'b64:c' }), false);
 		assert.equal(readStateFile(stateDir, CLUSTER_ID_FILENAME), 'hub-assigned-id');
 		client.stop();
@@ -392,11 +519,12 @@ describe('paired frame', () => {
 	// The Hub compares the hello frame's clusterId against the cluster it resolved
 	// from the connect JWT's kid, and closes 4401 on a mismatch. Both must use the
 	// assigned id, so this covers the second site that read the local default.
-	test('announces the Hub-assigned id in the hello frame', () => {
+	test('announces the Hub-assigned id in the hello frame', async () => {
 		const stateDir = makeTmpDir();
 		writeStateFile(stateDir, CLUSTER_ID_FILENAME, 'hub-assigned-id');
 		const { client, sockets } = makeHarness({ stateDir });
 		client.start();
+		await flush();
 		sockets[0].emit('open'); // openFirst() drops the hello frame, which is the point here
 		const hello = JSON.parse(sockets[0].sent[0] as string);
 		assert.equal(hello.t, 'hello');
@@ -404,7 +532,7 @@ describe('paired frame', () => {
 		client.stop();
 	});
 
-	test('signs later connects with the Hub-assigned id, not the local default', () => {
+	test('signs later connects with the Hub-assigned id, not the local default', async () => {
 		const stateDir = makeTmpDir();
 		writeStateFile(stateDir, CLUSTER_ID_FILENAME, 'hub-assigned-id');
 		const sockets: { headers: Record<string, string> }[] = [];
@@ -416,6 +544,7 @@ describe('paired frame', () => {
 			},
 		});
 		client.start();
+		await flush();
 		const token = sockets[0].headers.Authorization!.slice('Bearer '.length);
 		assert.equal(jwt.decode(token, { complete: true })?.header.kid, 'hub-assigned-id');
 		client.stop();
@@ -426,6 +555,7 @@ describe('reconnect / backoff', () => {
 	test('reconnects (creates a new socket) after the hub closes the connection, no process exit', async () => {
 		const { client, sockets } = makeHarness({ random: () => 0 });
 		client.start();
+		await flush();
 		sockets[0].emit('open');
 		assert.equal(sockets.length, 1);
 		sockets[0].emit('close', 4408, Buffer.from('handshake_timeout'));
@@ -437,6 +567,7 @@ describe('reconnect / backoff', () => {
 	test('stop() prevents any further reconnect attempt', async () => {
 		const { client, sockets } = makeHarness({ random: () => 0 });
 		client.start();
+		await flush();
 		sockets[0].emit('open');
 		client.stop();
 		sockets[0].emit('close', 1000, Buffer.from('shutdown'));
@@ -456,7 +587,7 @@ describe('req-chunk artifact staging (bypasses fastify.inject)', () => {
 				stored.push(artifact);
 			},
 		});
-		const socket = openFirst();
+		const socket = await openFirst();
 		const chunk1 = Buffer.from('hello ');
 		const chunk2 = Buffer.from('world');
 		socket.emit('message', JSON.stringify({ t: 'req-chunk', id: 'stage-7', seq: 0, byteLength: chunk1.byteLength, last: false }), false);
@@ -501,7 +632,7 @@ describe('req-chunk artifact staging (bypasses fastify.inject)', () => {
 				}
 			},
 		});
-		const socket = openFirst();
+		const socket = await openFirst();
 		socket.emit('message', JSON.stringify({ t: 'req-chunk', id: 'stage-oci', seq: 0, byteLength: fixture.tar.length, last: true }), false);
 		socket.emit('message', fixture.tar, true);
 		// The real store does stream + fs work, so this needs real timer turns —
@@ -513,10 +644,10 @@ describe('req-chunk artifact staging (bypasses fastify.inject)', () => {
 		client.stop();
 	});
 
-	test('an oversized chunk closes the socket 4413 and discards the partial temp file', () => {
+	test('an oversized chunk closes the socket 4413 and discards the partial temp file', async () => {
 		const stateDir = makeTmpDir();
 		const { client, openFirst } = makeHarness({ stateDir });
-		const socket = openFirst();
+		const socket = await openFirst();
 		const oversized = Buffer.alloc(MAX_CHUNK_BYTES + 1);
 		socket.emit('message', JSON.stringify({ t: 'req-chunk', id: 'stage-big', seq: 0, byteLength: oversized.byteLength, last: true }), false);
 		socket.emit('message', oversized, true);
@@ -526,9 +657,9 @@ describe('req-chunk artifact staging (bypasses fastify.inject)', () => {
 		client.stop();
 	});
 
-	test('a declared-vs-actual byteLength mismatch closes the socket 4413', () => {
+	test('a declared-vs-actual byteLength mismatch closes the socket 4413', async () => {
 		const { client, openFirst } = makeHarness();
-		const socket = openFirst();
+		const socket = await openFirst();
 		const payload = Buffer.from('short');
 		socket.emit('message', JSON.stringify({ t: 'req-chunk', id: 'stage-mismatch', seq: 0, byteLength: 999, last: true }), false);
 		socket.emit('message', payload, true);
@@ -536,10 +667,10 @@ describe('req-chunk artifact staging (bypasses fastify.inject)', () => {
 		client.stop();
 	});
 
-	test('a disconnect mid-stage discards the partial temp file', () => {
+	test('a disconnect mid-stage discards the partial temp file', async () => {
 		const stateDir = makeTmpDir();
 		const { client, sockets, openFirst } = makeHarness({ stateDir, random: () => 0 });
-		const socket = openFirst();
+		const socket = await openFirst();
 		const chunk = Buffer.from('partial');
 		socket.emit('message', JSON.stringify({ t: 'req-chunk', id: 'stage-partial', seq: 0, byteLength: chunk.byteLength, last: false }), false);
 		socket.emit('message', chunk, true);

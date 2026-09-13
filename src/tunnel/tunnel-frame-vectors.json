@@ -16,6 +16,29 @@
       "encoded": "{\"t\":\"hello\",\"version\":\"1.2.3\",\"clusterId\":\"cl_9f8e7d6c5b4a3210\",\"clusterCapabilities\":{\"operatorRoutes\":false,\"artifactStaging\":true}}"
     },
     {
+      "name": "hello-with-node-identity",
+      "decoded": {
+        "t": "hello",
+        "version": "1.2.3",
+        "clusterId": "cl_9f8e7d6c5b4a3210",
+        "clusterCapabilities": {
+          "operatorRoutes": false,
+          "artifactStaging": true
+        },
+        "nodeIdentity": {
+          "nodeId": "local-node",
+          "kid": "VSIBfJ14VRCMkHzJw-1aOda1DVridqQxqPxsy8rZFOM",
+          "publicJwk": {
+            "kty": "EC",
+            "crv": "P-256",
+            "x": "qoQC8jS-GsJ7_vq3v9HMDhDeNIra8GfZDW45jozDQJw",
+            "y": "rGUt006GYCpncLujBBoZqaLDmhhzMICjhl6KHOk_nFY"
+          }
+        }
+      },
+      "encoded": "{\"t\":\"hello\",\"version\":\"1.2.3\",\"clusterId\":\"cl_9f8e7d6c5b4a3210\",\"clusterCapabilities\":{\"operatorRoutes\":false,\"artifactStaging\":true},\"nodeIdentity\":{\"nodeId\":\"local-node\",\"kid\":\"VSIBfJ14VRCMkHzJw-1aOda1DVridqQxqPxsy8rZFOM\",\"publicJwk\":{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"qoQC8jS-GsJ7_vq3v9HMDhDeNIra8GfZDW45jozDQJw\",\"y\":\"rGUt006GYCpncLujBBoZqaLDmhhzMICjhl6KHOk_nFY\"}}}"
+    },
+    {
       "name": "req-json-clusterOps-call",
       "decoded": {
         "t": "req",

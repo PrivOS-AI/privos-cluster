@@ -26,8 +26,9 @@ import { config } from '../config.js';
 import { resolveClusterSecret } from '../cluster-secret.js';
 import { docker } from '../docker/index.js';
 import { getArtifactStore } from '../handlers/local-runtime.js';
+import { nodeIdentity } from '../services/mcp-broker.js';
 import { areOperatorRoutesEnabled } from '../services/settings-service.js';
-import { CLUSTER_ID_FILENAME, CREDENTIAL_FILENAME, PAIR_TOKEN_FILENAME, deleteStateFile, readStateFile, writeStateFile } from '../state-dir.js';
+import { CLUSTER_ID_FILENAME, CREDENTIAL_FILENAME, PAIR_TOKEN_FILENAME, deleteStateFile, readPairedClusterId, readStateFile, writeStateFile } from '../state-dir.js';
 import { signConnectToken } from './connect-token.js';
 import { dispatchForward, type ForwardRequest, type ForwardResponse } from './forward.js';
 import { handleRepairRequiredClose, readBootstrapTokenFromEnv, runCommunityBootstrap } from './pairing.js';
@@ -38,6 +39,7 @@ import {
 	decodeFrame,
 	encodeFrame,
 	type Frame,
+	type HelloFrame,
 	type PairedFrame,
 	type ForwardFrame,
 	type ReqChunkFrame,
@@ -45,12 +47,19 @@ import {
 	type ResFrame,
 } from './frames.js';
 
+/** The public identity summary a `hello` frame carries — see `frames.ts`'s `HelloFrameSchema`. */
+export type NodeIdentitySummary = NonNullable<HelloFrame['nodeIdentity']>;
+
 const TUNNEL_PATH = '/api/v1/app-clusters.tunnel';
 const WS_OPEN = 1;
 
 export const DEFAULT_CONCURRENCY_LIMIT = 8;
 export const BACKOFF_BASE_MS = 1000;
 export const BACKOFF_CAP_MS = 30_000;
+/** Hard ceiling on how long the first connect waits for the node identity load — a slow disk or a broken key file must never delay the tunnel's first connect attempt beyond this. */
+export const NODE_IDENTITY_LOAD_TIMEOUT_MS = 5000;
+/** Sentinel distinguishing "the timeout won the race" from any real resolved value, including `undefined`. */
+const TIMED_OUT = Symbol('node-identity-load-timed-out');
 
 /** Full-jitter exponential backoff, 1s -> 30s, forever (wire-contracts.md, tunnel reconnect rule). */
 export function fullJitterBackoffMs(attempt: number, random: () => number = Math.random): number {
@@ -80,8 +89,8 @@ export interface StagedArtifact {
 export type ArtifactStoreFn = (artifact: StagedArtifact) => Promise<void>;
 
 // ---------------------------------------------------------------------------
-// Phase-6 seam: `forward` (MCP RPC dispatch to a running local-runtime app
-// container). Injectable the same way `artifactStore` is, so tests never
+// `forward` seam: MCP RPC dispatch to a running local-runtime app
+// container. Injectable the same way `artifactStore` is, so tests never
 // touch Docker; the production default wires the real label-scoped dispatch
 // (`forward.ts`) against this process's own `docker` singleton.
 // ---------------------------------------------------------------------------
@@ -128,6 +137,26 @@ export interface TunnelClientOptions {
 	createSocket?: (url: string, headers: Record<string, string>) => TunnelSocket;
 	/** Injectable for deterministic backoff tests. */
 	random?: () => number;
+	/**
+	 * Loads this node's public identity (nodeId/kid/publicJwk, no private key
+	 * material) for the `hello` frame's optional `nodeIdentity` field — the Hub
+	 * enrols it on every accepted connect (idempotent upsert keyed by this
+	 * cluster's own row id), which is how a local-runtime replica's broker
+	 * attestation ends up verifiable Hub-side and how a key rotation re-enrols
+	 * on the next reconnect. Defaults to a no-op (no `nodeIdentity` sent) —
+	 * `startTunnelClient` wires the real `NodeIdentity` singleton. `start()`
+	 * awaits this (bounded by `NODE_IDENTITY_LOAD_TIMEOUT_MS`) before opening
+	 * the first connection, so the very first `hello` carries it whenever the
+	 * load actually succeeds in time — a background/fire-and-forget load could
+	 * lose the race against a fast socket `open` and send the first `hello`
+	 * with no identity at all. Loaded once and cached for the process
+	 * lifetime; a timeout or a rejected load is logged and leaves every
+	 * `hello` (this connect and later ones) without the field rather than
+	 * blocking the connection forever.
+	 */
+	loadNodeIdentity?: () => Promise<NodeIdentitySummary | undefined>;
+	/** Overrides `NODE_IDENTITY_LOAD_TIMEOUT_MS` — injectable only so a test can prove the timeout branch without a real 5s wait. */
+	nodeIdentityLoadTimeoutMs?: number;
 }
 
 interface StageSession {
@@ -190,6 +219,8 @@ export class TunnelClient {
 		forwardDispatch: ForwardDispatchFn;
 		createSocket: (url: string, headers: Record<string, string>) => TunnelSocket;
 		random: () => number;
+		loadNodeIdentity: () => Promise<NodeIdentitySummary | undefined>;
+		nodeIdentityLoadTimeoutMs: number;
 	};
 
 	private socket: TunnelSocket | undefined;
@@ -200,6 +231,22 @@ export class TunnelClient {
 	private pendingChunk: ReqChunkFrame | undefined;
 	private readonly stageSessions = new Map<string, StageSession>();
 	private bootstrapInFlight = false;
+	/**
+	 * Cached across reconnects — loaded once at `start()`, read synchronously
+	 * by every `hello` send. Kept synchronous at send time so a connect never
+	 * blocks on identity I/O and so `hello` stays the very first frame sent on
+	 * `open`, exactly like before this field existed.
+	 */
+	private cachedNodeIdentity: NodeIdentitySummary | undefined;
+	/**
+	 * True while an actual `loadNodeIdentity()` call is pending, independent of
+	 * whether `loadNodeIdentityBounded()`'s race already gave up on it. Guards
+	 * `connect()`'s retry from stacking a second concurrent load on top of one
+	 * that is merely running long, and is cleared as soon as that call settles
+	 * (success, rejection, or a later attempt) so the next empty-cache connect
+	 * tries again.
+	 */
+	private identityLoadInFlight = false;
 
 	constructor(options: TunnelClientOptions) {
 		this.options = {
@@ -209,13 +256,69 @@ export class TunnelClient {
 			forwardDispatch: options.forwardDispatch ?? defaultForwardDispatch,
 			createSocket: options.createSocket ?? defaultCreateSocket,
 			random: options.random ?? Math.random,
+			loadNodeIdentity: options.loadNodeIdentity ?? (async () => undefined),
+			nodeIdentityLoadTimeoutMs: options.nodeIdentityLoadTimeoutMs ?? NODE_IDENTITY_LOAD_TIMEOUT_MS,
 		};
 	}
 
-	/** Sweeps partial staged-artifact temp files left by a previous run, then opens the first connection. */
+	/**
+	 * Sweeps partial staged-artifact temp files left by a previous run, then
+	 * loads this node's public identity — bounded, so the first connect is
+	 * never blocked forever — before opening the first connection. This is
+	 * the only await standing between `start()` and the first `connect()`;
+	 * every later reconnect reuses whatever got cached here.
+	 */
 	start(): void {
 		cleanupStagingDir(this.options.stateDir);
-		this.connect();
+		void this.loadNodeIdentityBounded().then((identity) => {
+			this.cachedNodeIdentity = identity;
+			this.connect();
+		});
+	}
+
+	/**
+	 * Races the injected `loadNodeIdentity()` against a hard timeout so the
+	 * caller here never waits past `nodeIdentityLoadTimeoutMs`. The underlying
+	 * load keeps running after a timeout wins that race — it is never
+	 * discarded — and if it later resolves with an identity, `cachedNodeIdentity`
+	 * is set from that late result so a subsequent `hello` (this same
+	 * process's next reconnect) carries it, even though this call already
+	 * returned `undefined` to its own caller. A rejection is logged once here
+	 * and leaves the cache empty; `connect()` retries the whole bounded load
+	 * on its next call while the cache is still empty.
+	 */
+	private loadNodeIdentityBounded(): Promise<NodeIdentitySummary | undefined> {
+		this.identityLoadInFlight = true;
+		const rawLoad = this.options.loadNodeIdentity();
+		rawLoad
+			.then((identity) => {
+				if (identity) this.cachedNodeIdentity = identity;
+			})
+			.catch((err) => {
+				this.options.fastify.log.warn({ err }, 'tunnel: node identity unavailable, hello will omit it');
+			})
+			.finally(() => {
+				this.identityLoadInFlight = false;
+			});
+
+		let timer: NodeJS.Timeout | undefined;
+		const timeout = new Promise<typeof TIMED_OUT>((resolve) => {
+			timer = setTimeout(() => resolve(TIMED_OUT), this.options.nodeIdentityLoadTimeoutMs);
+			timer.unref?.();
+		});
+		return Promise.race([rawLoad, timeout])
+			.then((result) => {
+				if (result === TIMED_OUT) {
+					this.options.fastify.log.warn(
+						{ timeoutMs: this.options.nodeIdentityLoadTimeoutMs },
+						'tunnel: node identity load timed out, first hello will omit it',
+					);
+					return undefined;
+				}
+				return result;
+			})
+			.catch(() => undefined)
+			.finally(() => clearTimeout(timer));
 	}
 
 	/** Stops reconnecting and closes the current socket, if any. Idempotent. */
@@ -235,7 +338,7 @@ export class TunnelClient {
 	 * where the operator names the cluster.
 	 */
 	private resolveClusterId(): string {
-		return readStateFile(this.options.stateDir, CLUSTER_ID_FILENAME)?.trim() || this.options.clusterId;
+		return readPairedClusterId(this.options.stateDir, this.options.clusterId);
 	}
 
 	private buildAuthHeaders(): Record<string, string> {
@@ -287,6 +390,16 @@ export class TunnelClient {
 	private connect(): void {
 		if (this.stopped) return;
 		this.maybeRunCommunityBootstrap();
+		// The identity load that fed the very first `hello` may have timed out
+		// or rejected before ever populating the cache. Retry it on a
+		// reconnect (`reconnectAttempt > 0` — never on the very first connect,
+		// which just kicked its own load in `start()`) — bounded by the same
+		// cap, never awaited — so a later `hello` picks it up as soon as a load
+		// actually succeeds, without ever stacking a second load on top of one
+		// that is simply still running.
+		if (this.reconnectAttempt > 0 && !this.cachedNodeIdentity && !this.identityLoadInFlight) {
+			void this.loadNodeIdentityBounded();
+		}
 		const wsUrl = toWsUrl(this.options.hubUrl);
 		const headers = this.buildAuthHeaders();
 		this.options.fastify.log.info({ wsUrl }, 'tunnel: connecting');
@@ -303,6 +416,7 @@ export class TunnelClient {
 				// the cluster it resolved from that `kid` and closes 4401 on a mismatch.
 				clusterId: this.resolveClusterId(),
 				clusterCapabilities: this.options.clusterCapabilities,
+				...(this.cachedNodeIdentity ? { nodeIdentity: this.cachedNodeIdentity } : {}),
 			});
 		});
 		socket.on('message', (data, isBinary) => this.handleMessage(data, isBinary));
@@ -447,7 +561,7 @@ export class TunnelClient {
 	/**
 	 * MCP RPC dispatch to a running app container (wire-contracts.md
 	 * `forward`): resolves the target by its `privos.local-runtime.id` Docker
-	 * label (phase 6, `forward.ts`) and proxies the request, answered with a
+	 * label (`forward.ts`) and proxies the request, answered with a
 	 * correlated `res` frame.
 	 */
 	private handleForward(frame: ForwardFrame): void {
@@ -601,6 +715,13 @@ export function startTunnelClient(fastify: TunnelFastify): TunnelClient {
 		artifactStore: async ({ path: tempPath, sha256, sizeBytes }) => {
 			await getArtifactStore().stage({ path: tempPath, sha256, sizeBytes });
 		},
+		// Public identity only (no private key material crosses this boundary):
+		// the Hub enrols it from the hello frame and later verifies a
+		// local-runtime replica's broker attestation against it.
+		// `NodeIdentity.publicInfo()` returns a plain `JsonWebKey`; the wire
+		// contract narrows it to EC/P-256, which `NodeIdentity` already
+		// enforces at load time (`validateNodeIdentity`/`generateNodeIdentity`).
+		loadNodeIdentity: () => nodeIdentity.publicInfo() as Promise<NodeIdentitySummary>,
 	});
 	client.start();
 	return client;

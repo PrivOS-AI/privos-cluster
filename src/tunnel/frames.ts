@@ -24,11 +24,27 @@ const ClusterCapabilitiesSchema = z.object({
 	artifactStaging: z.boolean(),
 });
 
+/** Public identity summary only — never carries private key material. */
+const NodeIdentitySchema = z.object({
+	nodeId: z.string(),
+	kid: z.string(),
+	publicJwk: z.object({
+		kty: z.literal('EC'),
+		crv: z.literal('P-256'),
+		x: z.string(),
+		y: z.string(),
+	}),
+});
+
 const HelloFrameSchema = z.object({
 	t: z.literal('hello'),
 	version: z.string(),
 	clusterId: z.string(),
 	clusterCapabilities: ClusterCapabilitiesSchema,
+	// Additive (optional): a hub that predates this field still parses the
+	// frame fine, and a cluster that fails to load its node identity still
+	// connects — see `tunnel-client.ts`'s `loadNodeIdentity`.
+	nodeIdentity: NodeIdentitySchema.optional(),
 });
 
 const ReqFrameSchema = z.object({

@@ -56,6 +56,18 @@ export function readStateFile(stateDir: string, filename: string): string | unde
 	}
 }
 
+/**
+ * The Hub-assigned cluster id (see `CLUSTER_ID_FILENAME`), read fresh from
+ * disk on every call. Every caller that has to present or attest as "the
+ * cluster the Hub knows about" (the tunnel `hello` frame, a broker
+ * attestation's `iss`) must use this, not the local `FLEET_CLUSTER_ID`
+ * default, which exists only for the fleet-side deployment where an operator
+ * names the cluster. Falls back to `fallback` before pairing completes.
+ */
+export function readPairedClusterId(stateDir: string, fallback: string): string {
+	return readStateFile(stateDir, CLUSTER_ID_FILENAME)?.trim() || fallback;
+}
+
 /** Deletes `stateDir/filename`; a no-op if it does not exist. */
 export function deleteStateFile(stateDir: string, filename: string): void {
 	try {

@@ -35,6 +35,11 @@ class FakeSocket extends EventEmitter implements TunnelSocket {
 
 const silentLogger = { info: () => {}, warn: () => {}, error: () => {} };
 
+/** `start()` awaits a bounded node-identity load (a real timer race) before its first `connect()` — a real macrotask tick guarantees that has already run before assertions touch `sockets[0]`. */
+async function flush(): Promise<void> {
+	await new Promise((resolve) => setTimeout(resolve, 0));
+}
+
 let tmpDirs: string[] = [];
 function makeTmpDir(): string {
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'privos-pairing-test-'));
@@ -83,6 +88,7 @@ describe('paired-frame redemption (tunnel-client.ts integration)', () => {
 		const client = makeClient(stateDir, sockets);
 
 		client.start();
+		await flush();
 		assert.equal(sockets[0].headers['X-Privos-Pair-Token'], 'one-time-token');
 		assert.equal(sockets[0].headers.Authorization, undefined);
 
@@ -119,6 +125,7 @@ describe('re-pair required terminal state (tunnel-client.ts integration)', () =>
 		});
 
 		client.start();
+		await flush();
 		assert.ok(sockets[0].headers.Authorization?.startsWith('Bearer '));
 
 		sockets[0].close(4403, 'revoked');
@@ -142,6 +149,7 @@ describe('re-pair required terminal state (tunnel-client.ts integration)', () =>
 		const client = makeClient(stateDir, sockets);
 
 		client.start();
+		await flush();
 		sockets[0].close(4408, 'handshake_timeout');
 		await new Promise((resolve) => setTimeout(resolve, 10));
 
