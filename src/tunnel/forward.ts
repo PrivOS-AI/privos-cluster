@@ -73,9 +73,12 @@ class ForwardResponseTooLarge extends Error {}
 
 /** Resolves the single running container whose `privos.local-runtime.id` label matches — never a caller-supplied address. */
 async function findRuntimeContainer(docker: Docker, runtimeId: string): Promise<{ address: string; port: number } | null> {
+	// The tunnel frame carries the 32-hex part only (frozen forward vector); the
+	// container is labelled with the driver ABI's full `local-runtime-<hex>` id.
+	const labelValue = runtimeId.startsWith('local-runtime-') ? runtimeId : `local-runtime-${runtimeId}`;
 	const containers = await docker.listContainers({
 		all: false,
-		filters: { label: [`${LOCAL_RUNTIME_ID_LABEL}=${runtimeId}`] },
+		filters: { label: [`${LOCAL_RUNTIME_ID_LABEL}=${labelValue}`] },
 	});
 	const summary = containers[0] as any;
 	if (!summary) return null;

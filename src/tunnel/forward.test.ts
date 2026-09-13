@@ -38,6 +38,19 @@ test('reaches only the container carrying the matching privos.local-runtime.id l
 	assert.equal(calls[0], 'http://10.99.0.7:3001/mcp');
 });
 
+test('the tunnel frame carries only the 32-hex part and still resolves the container labelled with the full driver id', async () => {
+	const hex = RUNTIME_ID.slice('local-runtime-'.length);
+	const docker = fakeDocker([runningContainer(RUNTIME_ID)]);
+	const calls: string[] = [];
+	const transport: ForwardTransport = async (url) => {
+		calls.push(url);
+		return { status: 200, headers: { 'content-type': 'application/json' }, body: Buffer.from('{}') };
+	};
+	const result = await dispatchForward(docker, { runtimeId: hex, path: '/mcp', body: { jsonrpc: '2.0' } }, transport);
+	assert.equal(result.status, 200);
+	assert.equal(calls.length, 1);
+});
+
 test('an unknown runtimeId returns 404 without invoking the HTTP transport', async () => {
 	const docker = fakeDocker([runningContainer(RUNTIME_ID)]);
 	let transportCalled = false;
