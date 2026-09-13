@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, test } from 'node:test';
 
-import { ArtifactStore, type ArtifactStoreDocker } from './artifact-store.js';
+import { ArtifactStore, type ArtifactStoreDocker, createDockerArtifactStoreDocker } from './artifact-store.js';
 import { buildOciArchiveFixture } from './oci-archive-fixture.js';
 import { ArtifactError, ArtifactStagingRefused } from './errors.js';
 
@@ -45,6 +45,19 @@ class FakeDocker implements ArtifactStoreDocker {
 
 	async inspectImage(reference: string) {
 		return this.images.get(reference) ?? null;
+	}
+
+	removedRefs: string[] = [];
+	/** Set to simulate Docker refusing removal (409: a container still references the image). */
+	refuseRemoval = false;
+
+	async removeImage(reference: string): Promise<void> {
+		// Mirrors what `createDockerArtifactStoreDocker` raises for Docker's 409
+		// ("image is referenced by a running container") — the seam this fake stands in for
+		// is the post-wrap one, so it must fail the same way.
+		if (this.refuseRemoval) throw new ArtifactError('docker image removal failed: conflict: image is referenced by a container');
+		this.removedRefs.push(reference);
+		this.images.delete(reference);
 	}
 }
 
@@ -174,4 +187,74 @@ test('a tar whose sha256 differs from the declared digest is rejected and never 
 	);
 	assert.equal(docker.loadCount, 0);
 	assert.equal(store.resolve(wrongDigest), null);
+});
+
+test('remove erases the staged image and its index entry, proven by re-inspection', async () => {
+	const stateDir = tmpStateDir();
+	const fixture = buildOciArchiveFixture(['REMOVE=1']);
+	const docker = new FakeDocker();
+	docker.primeLoad(fixture);
+	const store = new ArtifactStore(stateDir, docker, 250_000_000, 3);
+	await store.stage({ path: writeArtifact(stateDir, fixture.tar), sha256: fixture.digest, sizeBytes: fixture.tar.length });
+	assert.ok(store.resolve(fixture.digest), 'precondition: the artifact is staged');
+
+	const absent = await store.remove(fixture.digest);
+
+	assert.deepEqual({ digest: absent.digest, state: absent.state, removed: absent.removed }, { digest: fixture.digest, state: 'ABSENT', removed: true });
+	assert.deepEqual(docker.removedRefs, [fixture.configDigest], 'the proven content address is what gets removed');
+	assert.equal(store.resolve(fixture.digest), null, 'the index entry must not survive removal');
+	assert.equal(await docker.inspectImage(fixture.configDigest), null, 'the image must be gone from Docker');
+});
+
+test('remove is idempotent: a digest that was never staged reports ABSENT instead of failing', async () => {
+	const stateDir = tmpStateDir();
+	const docker = new FakeDocker();
+	const store = new ArtifactStore(stateDir, docker, 250_000_000, 3);
+
+	const absent = await store.remove(`sha256:${'0'.repeat(64)}`);
+
+	assert.equal(absent.state, 'ABSENT');
+	assert.equal(absent.removed, false, 'nothing was removed, and that is not a failure');
+	assert.deepEqual(docker.removedRefs, [], 'an unknown digest must not reach Docker at all');
+});
+
+test('remove refuses to report erasure while a container still pins the image', async () => {
+	const stateDir = tmpStateDir();
+	const fixture = buildOciArchiveFixture(['PINNED=1']);
+	const docker = new FakeDocker();
+	docker.primeLoad(fixture);
+	const store = new ArtifactStore(stateDir, docker, 250_000_000, 3);
+	await store.stage({ path: writeArtifact(stateDir, fixture.tar), sha256: fixture.digest, sizeBytes: fixture.tar.length });
+	docker.refuseRemoval = true;
+
+	await assert.rejects(store.remove(fixture.digest), /docker image removal failed/);
+	assert.ok(store.resolve(fixture.digest), 'the record must survive a refused removal so the uninstall can retry');
+});
+
+// The 404/409 mapping lives in the production adapter, not in ArtifactStore, so
+// the fake above can never exercise it. This drives the REAL adapter over a
+// stub dockerode: 404 must be success (absence is the goal), anything else must
+// surface rather than be swallowed into a false erasure claim.
+test('the production Docker adapter treats a missing image as removed and surfaces an in-use conflict', async () => {
+	const calls: string[] = [];
+	const fakeDockerode = (statusCode: number | undefined) =>
+		({
+			getImage(reference: string) {
+				calls.push(reference);
+				return {
+					async remove() {
+						if (statusCode === undefined) return;
+						throw Object.assign(new Error('docker says no'), { statusCode });
+					},
+				};
+			},
+		}) as never;
+
+	await createDockerArtifactStoreDocker(fakeDockerode(404), {} as never).removeImage('sha256:missing');
+	await createDockerArtifactStoreDocker(fakeDockerode(undefined), {} as never).removeImage('sha256:present');
+	await assert.rejects(
+		createDockerArtifactStoreDocker(fakeDockerode(409), {} as never).removeImage('sha256:inuse'),
+		(err: Error) => err instanceof ArtifactError && /docker image removal failed/.test(err.message),
+	);
+	assert.deepEqual(calls, ['sha256:missing', 'sha256:present', 'sha256:inuse']);
 });

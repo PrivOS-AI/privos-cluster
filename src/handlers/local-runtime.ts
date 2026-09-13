@@ -221,6 +221,25 @@ const localRuntimeHandler: FastifyPluginAsync = async (fastify) => {
 			},
 		);
 
+		// Artifact erasure, the destructive half of the local-artifact lifecycle.
+		// Separate from runtime REMOVE on purpose: one artifact can back several
+		// generations, so it is erased only when its own resource is purged.
+		scoped.delete<{ Params: { digest: string } }>(
+			'/api/v1/v3/local-artifacts/:digest',
+			{ preHandler: scoped.authenticate },
+			async (req, reply) => {
+				const { digest } = req.params;
+				if (!SHA256_RE.test(digest)) {
+					return reply.status(400).send({ error: { code: 'bad_request', message: 'invalid artifact digest in path' } });
+				}
+				try {
+					return reply.send(await getArtifactStore().remove(digest));
+				} catch (err) {
+					return sendError(reply, err);
+				}
+			},
+		);
+
 		scoped.delete<{ Params: { runtimeId: string }; Body: unknown }>(
 			'/api/v1/v3/runtimes/:runtimeId',
 			{ preHandler: scoped.authenticate },

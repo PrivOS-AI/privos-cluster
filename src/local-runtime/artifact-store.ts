@@ -51,6 +51,8 @@ export interface ArtifactStoreDocker {
 	loadArchive(filePath: string): Promise<void>;
 	/** Inspects an image by content address; `null` on 404 (not present). */
 	inspectImage(reference: string): Promise<{ Id: string; Descriptor?: { mediaType: string; digest: string; size: number } } | null>;
+	/** Removes an image by content address. A 404 is success — the goal is absence, not a deletion event. */
+	removeImage(reference: string): Promise<void>;
 }
 
 /** Production adapter over the existing `docker/index.ts` singletons — `imageManager.loadFromStream` for load, raw `docker.getImage(...).inspect()` for content-address proof (dockerode's typed `ImageInspectInfo` doesn't model the containerd `Descriptor` field). */
@@ -67,6 +69,17 @@ export function createDockerArtifactStoreDocker(docker: Docker, imageManager: Im
 			} catch (err: any) {
 				if (err?.statusCode === 404) return null;
 				throw new ArtifactError(`docker image inspection failed: ${err?.message ?? String(err)}`);
+			}
+		},
+		async removeImage(reference: string): Promise<void> {
+			try {
+				await docker.getImage(reference).remove({ force: false, noprune: false });
+			} catch (err: any) {
+				if (err?.statusCode === 404) return;
+				// 409 = a container still references the image. The runtime must be
+				// removed before its artifact; surfacing this is what stops an
+				// uninstall from reporting erasure while the image is still in use.
+				throw new ArtifactError(`docker image removal failed: ${err?.message ?? String(err)}`);
 			}
 		},
 	};
@@ -176,6 +189,34 @@ export class ArtifactStore {
 		index.byDigest[record.digest] = record;
 		this.writeIndex(index);
 		return record;
+	}
+
+	/**
+	 * Erases one staged artifact: the Docker image it was loaded into, then its
+	 * index entry. Idempotent — a digest this store never held (or already
+	 * removed) reports ABSENT with `removed: false` rather than failing, so an
+	 * uninstall that retries, or one for an install that never got this far,
+	 * still converges.
+	 *
+	 * Absence is PROVEN, not assumed: the image is re-inspected after removal and
+	 * the index entry is dropped only once Docker confirms it is gone. A running
+	 * container pinning the image makes `removeImage` throw (409) — correct, the
+	 * runtime must be removed before its artifact, and erasure must never be
+	 * reported while the bytes are still on the machine.
+	 */
+	async remove(digest: string): Promise<{ digest: string; state: 'ABSENT'; removed: boolean; checkedAt: number }> {
+		const record = this.resolve(digest);
+		if (!record) return { digest, state: 'ABSENT', removed: false, checkedAt: this.now() };
+
+		await this.docker.removeImage(record.imageRef);
+		if (await this.docker.inspectImage(record.imageRef)) {
+			throw new ArtifactError('Docker still exposes the staged image after removal');
+		}
+		const index = this.readIndex();
+		delete index.byDigest[digest];
+		this.writeIndex(index);
+		if (this.resolve(digest)) throw new ArtifactError('the staged-artifact record survived removal');
+		return { digest, state: 'ABSENT', removed: true, checkedAt: this.now() };
 	}
 
 	private now(): number {

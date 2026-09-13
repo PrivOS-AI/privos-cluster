@@ -105,6 +105,10 @@ class FakeArtifactStoreDocker implements ArtifactStoreDocker {
 	prime(configDigest: string): void {
 		this.images.set(configDigest, { Id: configDigest });
 	}
+
+	async removeImage(reference: string): Promise<void> {
+		this.images.delete(reference);
+	}
 }
 
 function baseEnsureReadyRequest(overrides: Partial<Record<string, unknown>> = {}, artifactDigest: string) {

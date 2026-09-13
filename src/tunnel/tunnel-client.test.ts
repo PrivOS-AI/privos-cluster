@@ -484,6 +484,9 @@ describe('req-chunk artifact staging (bypasses fastify.inject)', () => {
 			async inspectImage(reference: string) {
 				return (this.images as Map<string, { Id: string }>).get(reference) ?? null;
 			},
+			async removeImage(reference: string) {
+				(this.images as Map<string, { Id: string }>).delete(reference);
+			},
 		} as ArtifactStoreDocker & { images: Map<string, { Id: string }> };
 		const store = new ArtifactStore(path.join(stateDir, 'artifacts'), docker, 250_000_000, 3);
 		let stageError: Error | undefined;
