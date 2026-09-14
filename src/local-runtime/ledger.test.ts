@@ -54,8 +54,8 @@ test('full CLAIMED -> READY -> ACTIVATING -> ACTIVE happy path', () => {
 	const ledger = new RuntimeLedger(tmpLedgerPath());
 	const input = claimInput();
 	ledger.claim(input);
-	ledger.recordContainer(input.generationId, input.requestHash, 'container-1', 1001);
-	const ready = ledger.markReady(input.generationId, input.requestHash, '{"ready":true}', '{"evidence":true}', 1002);
+	ledger.recordContainer(input.runtimeId, input.requestHash, 'container-1', 1001);
+	const ready = ledger.markReady(input.runtimeId, input.requestHash, '{"ready":true}', '{"evidence":true}', 1002);
 	assert.equal(ready.state, 'READY');
 
 	const activating = ledger.claimActivation({
@@ -84,7 +84,7 @@ test('markReady before recordContainer is refused (no supervised container ident
 	const ledger = new RuntimeLedger(tmpLedgerPath());
 	const input = claimInput();
 	ledger.claim(input);
-	assert.throws(() => ledger.markReady(input.generationId, input.requestHash, '{}', '{}', 1001), RuntimeUnavailable);
+	assert.throws(() => ledger.markReady(input.runtimeId, input.requestHash, '{}', '{}', 1001), RuntimeUnavailable);
 });
 
 test('claimActivation before READY is refused', () => {
@@ -109,8 +109,8 @@ test('repeated markActive with identical evidence replays instead of re-mutating
 	const ledger = new RuntimeLedger(tmpLedgerPath());
 	const input = claimInput();
 	ledger.claim(input);
-	ledger.recordContainer(input.generationId, input.requestHash, 'container-1', 1001);
-	ledger.markReady(input.generationId, input.requestHash, '{"ready":true}', '{}', 1002);
+	ledger.recordContainer(input.runtimeId, input.requestHash, 'container-1', 1001);
+	ledger.markReady(input.runtimeId, input.requestHash, '{"ready":true}', '{}', 1002);
 	ledger.claimActivation({
 		runtimeId: input.runtimeId,
 		requestHash: input.requestHash,
@@ -142,8 +142,8 @@ test('markActive with different evidence than what is persisted conflicts', () =
 	const ledger = new RuntimeLedger(tmpLedgerPath());
 	const input = claimInput();
 	ledger.claim(input);
-	ledger.recordContainer(input.generationId, input.requestHash, 'container-1', 1001);
-	ledger.markReady(input.generationId, input.requestHash, '{"ready":true}', '{}', 1002);
+	ledger.recordContainer(input.runtimeId, input.requestHash, 'container-1', 1001);
+	ledger.markReady(input.runtimeId, input.requestHash, '{"ready":true}', '{}', 1002);
 	ledger.claimActivation({
 		runtimeId: input.runtimeId,
 		requestHash: input.requestHash,
@@ -222,8 +222,8 @@ test('claimActivation mints a final activeReplicaId once and replay never re-min
 	const ledger = new RuntimeLedger(tmpLedgerPath());
 	const input = claimInput();
 	ledger.claim(input);
-	ledger.recordContainer(input.generationId, input.requestHash, 'container-1', 1001);
-	ledger.markReady(input.generationId, input.requestHash, '{"ready":true}', '{}', 1002);
+	ledger.recordContainer(input.runtimeId, input.requestHash, 'container-1', 1001);
+	ledger.markReady(input.runtimeId, input.requestHash, '{"ready":true}', '{}', 1002);
 	const activationInput = {
 		runtimeId: input.runtimeId,
 		requestHash: input.requestHash,
@@ -245,8 +245,8 @@ test('recordBrokerRegistered stamps the record; listActiveRecords/listKnownRepli
 	assert.deepEqual(ledger.listActiveRecords(), []);
 	assert.deepEqual(ledger.listKnownReplicaIds(), [claimed.replicaId]);
 
-	ledger.recordContainer(input.generationId, input.requestHash, 'container-1', 1001);
-	ledger.markReady(input.generationId, input.requestHash, '{"ready":true}', '{}', 1002);
+	ledger.recordContainer(input.runtimeId, input.requestHash, 'container-1', 1001);
+	ledger.markReady(input.runtimeId, input.requestHash, '{"ready":true}', '{}', 1002);
 	const activating = ledger.claimActivation({
 		runtimeId: input.runtimeId,
 		requestHash: input.requestHash,

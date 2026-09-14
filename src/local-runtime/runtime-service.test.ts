@@ -342,6 +342,67 @@ test('activate transitions the runtime to ACTIVE with activation evidence and re
 	assert.deepEqual(active, replay);
 });
 
+test('an in-place revision readies a second runtime for the same generation; activation moves the generation slot; removing the previous one leaves the new one live', async () => {
+	const { service, dockerode, ledger, staged } = await setup();
+	const activationFor = (ready: any, request: any) => ({
+		protocol_version: 3,
+		operation: 'ACTIVATE',
+		installation_id: ready.installation_id,
+		workspace_id: ready.workspace_id,
+		deployment_id: ready.deployment_id,
+		listing_id: ready.listing_id,
+		version_id: ready.version_id,
+		generation_id: ready.generation_id,
+		generation_number: ready.generation_number,
+		descriptor_artifact_hash: ready.descriptor_artifact_hash,
+		resource_manifest_hash: ready.resource_manifest_hash,
+		permission_contract_hash: ready.permission_contract_hash,
+		runtime_authorization: ready.runtime_authorization,
+		runtime_id: ready.runtime_id,
+		artifact_digest: ready.artifact_digest,
+		ensure_ready_request_hash: canonicalHash(request),
+		runtime_resource_inventory_hash: 'D'.repeat(43),
+		runtime_approval_receipt_hash: 'E'.repeat(43),
+		runtime_authorization_epoch: 1,
+	});
+	const previous = baseEnsureReadyRequest({}, staged.digest);
+	const readyPrevious = await service.ensureReady(previous);
+	await service.activate(activationFor(readyPrevious, previous));
+
+	// Same generation, next revision: a second runtime must come up next to the live one.
+	const next = baseEnsureReadyRequest({ generation_number: 2 }, staged.digest);
+	const readyNext = await service.ensureReady(next);
+	assert.notEqual(readyNext.runtime_id, readyPrevious.runtime_id);
+	assert.equal(ledger.get(readyPrevious.generation_id)!.runtimeId, readyPrevious.runtime_id);
+	assert.equal(ledger.getByRuntimeId(readyPrevious.runtime_id)!.state, 'ACTIVE');
+	assert.equal(dockerode.containers.size, 2);
+
+	await service.activate(activationFor(readyNext, next));
+	assert.equal(ledger.get(readyPrevious.generation_id)!.runtimeId, readyNext.runtime_id);
+
+	await service.remove({
+		protocol_version: 3,
+		operation: 'REMOVE',
+		installation_id: readyPrevious.installation_id,
+		workspace_id: readyPrevious.workspace_id,
+		deployment_id: readyPrevious.deployment_id,
+		listing_id: readyPrevious.listing_id,
+		version_id: readyPrevious.version_id,
+		generation_id: readyPrevious.generation_id,
+		generation_number: readyPrevious.generation_number,
+		descriptor_artifact_hash: readyPrevious.descriptor_artifact_hash,
+		resource_manifest_hash: readyPrevious.resource_manifest_hash,
+		permission_contract_hash: readyPrevious.permission_contract_hash,
+		runtime_authorization: readyPrevious.runtime_authorization,
+		runtime_id: readyPrevious.runtime_id,
+		artifact_digest: readyPrevious.artifact_digest,
+	});
+	assert.equal(ledger.getByRuntimeId(readyPrevious.runtime_id), null);
+	assert.equal(ledger.get(readyPrevious.generation_id)!.runtimeId, readyNext.runtime_id);
+	assert.equal(ledger.getByRuntimeId(readyNext.runtime_id)!.state, 'ACTIVE');
+	assert.equal(dockerode.containers.size, 1);
+});
+
 test('remove deletes the container and the ledger row and returns ABSENT with removal evidence; a repeat remove is idempotent', async () => {
 	const { service, dockerode, ledger, staged } = await setup();
 	const request = baseEnsureReadyRequest({}, staged.digest);

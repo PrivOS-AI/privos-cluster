@@ -570,7 +570,7 @@ export class RuntimeService {
 			await this.broker.registerProvisioningV3({ ...binding, dockerContainerId, runtimeResourceInventoryHash: undefined });
 			this.ledger.recordBrokerRegistered(runtimeId, this.now());
 		});
-		record = this.ledger.recordContainer(request.generation_id, requestHash, containerId, this.now());
+		record = this.ledger.recordContainer(runtimeId, requestHash, containerId, this.now());
 
 		const readyAt = this.now();
 		const readyWithoutHash: Record<string, unknown> = {
@@ -600,7 +600,7 @@ export class RuntimeService {
 		};
 		const responseJson = JSON.stringify(sortedCanonical(response));
 		const evidenceJson = JSON.stringify(sortedCanonical(evidence));
-		const marked = this.ledger.markReady(request.generation_id, requestHash, responseJson, evidenceJson, readyAt);
+		const marked = this.ledger.markReady(runtimeId, requestHash, responseJson, evidenceJson, readyAt);
 		return validateReady(JSON.parse(marked.readyResponseJson!));
 	}
 
@@ -685,7 +685,7 @@ export class RuntimeService {
 				await this.broker.register({ ...activeBinding, dockerContainerId });
 				this.ledger.recordBrokerRegistered(activation.runtime_id, this.now());
 			});
-			this.ledger.recordContainer(request.generation_id, canonicalHash(request), containerId, this.now());
+			this.ledger.recordContainer(activation.runtime_id, canonicalHash(request), containerId, this.now());
 
 			const activationHash = canonicalHash(activation);
 			const activeReadyAt = this.now();

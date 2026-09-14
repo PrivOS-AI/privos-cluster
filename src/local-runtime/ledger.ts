@@ -182,27 +182,22 @@ export class RuntimeLedger {
 		now: number;
 	}): RuntimeRecord {
 		const state = this.read();
-		const existingRuntimeId = state.generationToRuntimeId[input.generationId];
-		if (existingRuntimeId) {
-			const record = state.byRuntimeId[existingRuntimeId]!;
+		// Idempotency is per runtime id (the hash of the ENSURE_READY request). A second
+		// runtime for a generation is an in-place revision candidate: it coexists with the
+		// live runtime and the generation slot moves to it only when it becomes ACTIVE.
+		const existing = state.byRuntimeId[input.runtimeId];
+		if (existing) {
 			if (
-				record.requestHash !== input.requestHash ||
-				record.requestJson !== input.requestJson ||
-				record.runtimeId !== input.runtimeId ||
-				record.artifactDigest !== input.artifactDigest ||
-				record.imageManifestDigest !== input.imageManifestDigest ||
-				record.imageConfigDigest !== input.imageConfigDigest ||
-				record.containerSpecHash !== input.containerSpecHash
+				existing.requestHash !== input.requestHash ||
+				existing.requestJson !== input.requestJson ||
+				existing.artifactDigest !== input.artifactDigest ||
+				existing.imageManifestDigest !== input.imageManifestDigest ||
+				existing.imageConfigDigest !== input.imageConfigDigest ||
+				existing.containerSpecHash !== input.containerSpecHash
 			) {
 				throw new AffinityConflict();
 			}
-			return record;
-		}
-		if (state.byRuntimeId[input.runtimeId]) {
-			// A different generation_id already claimed this exact runtime_id
-			// (the deterministic affinity hash collided with different affinity
-			// fields feeding it) — refuse rather than overwrite.
-			throw new AffinityConflict();
+			return existing;
 		}
 		const record: RuntimeRecord = {
 			generationId: input.generationId,
@@ -233,15 +228,14 @@ export class RuntimeLedger {
 			brokerRegisteredAt: null,
 		};
 		state.byRuntimeId[input.runtimeId] = record;
-		state.generationToRuntimeId[input.generationId] = input.runtimeId;
+		if (!state.generationToRuntimeId[input.generationId]) state.generationToRuntimeId[input.generationId] = input.runtimeId;
 		this.writeAtomic(state);
 		return record;
 	}
 
-	recordContainer(generationId: string, requestHash: string, containerId: string, now: number): RuntimeRecord {
+	recordContainer(runtimeId: string, requestHash: string, containerId: string, now: number): RuntimeRecord {
 		const state = this.read();
-		const runtimeId = state.generationToRuntimeId[generationId];
-		const record = runtimeId ? state.byRuntimeId[runtimeId] : undefined;
+		const record = state.byRuntimeId[runtimeId];
 		if (!record || record.requestHash !== requestHash) throw new AffinityConflict();
 		record.containerId = containerId;
 		record.updatedAt = now;
@@ -249,12 +243,11 @@ export class RuntimeLedger {
 		return record;
 	}
 
-	markReady(generationId: string, requestHash: string, readyResponseJson: string, driverEvidenceJson: string, now: number): RuntimeRecord {
+	markReady(runtimeId: string, requestHash: string, readyResponseJson: string, driverEvidenceJson: string, now: number): RuntimeRecord {
 		JSON.parse(readyResponseJson);
 		JSON.parse(driverEvidenceJson);
 		const state = this.read();
-		const runtimeId = state.generationToRuntimeId[generationId];
-		const record = runtimeId ? state.byRuntimeId[runtimeId] : undefined;
+		const record = state.byRuntimeId[runtimeId];
 		if (!record || record.requestHash !== requestHash) throw new AffinityConflict();
 		if (record.state === 'READY' || record.state === 'ACTIVATING' || record.state === 'ACTIVE') {
 			if (record.readyResponseJson !== readyResponseJson || record.driverEvidenceJson !== driverEvidenceJson) {
@@ -398,6 +391,8 @@ export class RuntimeLedger {
 		record.activeResponseJson = input.activeResponseJson;
 		record.activationEvidenceJson = input.activationEvidenceJson;
 		record.updatedAt = input.now;
+		// The generation's live runtime is the one that most recently became ACTIVE.
+		state.generationToRuntimeId[record.generationId] = record.runtimeId;
 		this.writeAtomic(state);
 		return record;
 	}
@@ -408,7 +403,7 @@ export class RuntimeLedger {
 		const record = state.byRuntimeId[runtimeId];
 		if (!record) return false;
 		delete state.byRuntimeId[runtimeId];
-		delete state.generationToRuntimeId[record.generationId];
+		if (state.generationToRuntimeId[record.generationId] === runtimeId) delete state.generationToRuntimeId[record.generationId];
 		this.writeAtomic(state);
 		return true;
 	}
