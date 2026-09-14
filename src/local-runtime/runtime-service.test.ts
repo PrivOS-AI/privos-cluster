@@ -1,3 +1,4 @@
+import { AffinityConflict } from './errors.js';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -281,6 +282,48 @@ test('ensureReady is idempotent: a repeat call replays the exact stored READY do
 	const second = await service.ensureReady(request);
 	assert.deepEqual(first, second);
 	assert.equal(dockerode.createContainerCalls, 1);
+});
+
+test('a retried ENSURE_READY with a changed runtime spec replaces a never-activated candidate on the same runtime id', async () => {
+	const { service, dockerode, ledger, staged } = await setup();
+	const first = baseEnsureReadyRequest({}, staged.digest) as any;
+	const readyFirst = await service.ensureReady(first);
+	const corrected = { ...first, runtime_spec: { ...first.runtime_spec, port: first.runtime_spec.port + 1 } };
+	const readyCorrected = await service.ensureReady(corrected);
+	// Same affinity, same id: the candidate is replaced rather than refused.
+	assert.equal(readyCorrected.runtime_id, readyFirst.runtime_id);
+	assert.equal(JSON.parse(ledger.getByRuntimeId(readyFirst.runtime_id)!.requestJson).runtime_spec.port, first.runtime_spec.port + 1);
+	assert.equal(dockerode.containers.size, 1);
+	assert.equal(dockerode.createContainerCalls, 2);
+});
+
+test('an ACTIVE runtime is never replaced by an ENSURE_READY with a different spec on the same runtime id', async () => {
+	const { service, staged } = await setup();
+	const request = baseEnsureReadyRequest({}, staged.digest) as any;
+	const ready = await service.ensureReady(request);
+	await service.activate({
+		protocol_version: 3,
+		operation: 'ACTIVATE',
+		installation_id: ready.installation_id,
+		workspace_id: ready.workspace_id,
+		deployment_id: ready.deployment_id,
+		listing_id: ready.listing_id,
+		version_id: ready.version_id,
+		generation_id: ready.generation_id,
+		generation_number: ready.generation_number,
+		descriptor_artifact_hash: ready.descriptor_artifact_hash,
+		resource_manifest_hash: ready.resource_manifest_hash,
+		permission_contract_hash: ready.permission_contract_hash,
+		runtime_authorization: ready.runtime_authorization,
+		runtime_id: ready.runtime_id,
+		artifact_digest: ready.artifact_digest,
+		ensure_ready_request_hash: canonicalHash(request),
+		runtime_resource_inventory_hash: 'D'.repeat(43),
+		runtime_approval_receipt_hash: 'E'.repeat(43),
+		runtime_authorization_epoch: 1,
+	});
+	const changed = { ...request, runtime_spec: { ...request.runtime_spec, port: request.runtime_spec.port + 1 } };
+	await assert.rejects(() => service.ensureReady(changed), AffinityConflict);
 });
 
 test('status replays the stored READY document byte-identically', async () => {

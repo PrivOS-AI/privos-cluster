@@ -541,6 +541,16 @@ export class RuntimeService {
 			policyIdentity(request, artifact, runtimeId, this.config.privateNetwork, this.config.pidsLimit, null, BROKER_MOUNT_TARGET),
 		);
 
+		// The runtime id covers the affinity fields only, so a retried ENSURE_READY with a
+		// corrected runtime spec (port, resources) lands on the same id as the candidate it
+		// replaces. A candidate that never activated is not live — nothing routes to it — so
+		// a changed request tears it down and claims afresh; an activating or ACTIVE runtime
+		// is never replaced here (`ledger.claim` still refuses a mismatch against it).
+		const prior = this.ledger.getByRuntimeId(runtimeId);
+		if (prior && (prior.state === 'CLAIMED' || prior.state === 'READY') && prior.requestHash !== requestHash) {
+			await this.teardownRecorded(prior);
+		}
+
 		let record: RuntimeRecord = this.ledger.claim({
 			generationId: request.generation_id,
 			installationId: request.installation_id,
