@@ -448,6 +448,9 @@ export class AppLifecycleService {
 				? { replicaCount: app.replicas.length }
 				: { replicas: app.replicas }),
 			createdAt: app.createdAt.getTime(),
+			// Surface the last out-of-memory exit so the Hub can badge the app and offer
+			// a resize; null when the app has never been OOM-killed.
+			lastOomAt: app.lastOomAt ? app.lastOomAt.getTime() : null,
 		};
 	}
 }
