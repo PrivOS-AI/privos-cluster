@@ -55,7 +55,18 @@ export class ReconcileService {
 		if (app?.state === 'QUARANTINED') return 0;
 		// V3 recovery must resume from its persisted generation plan and exact
 		// inventory. Generic discovery must never invent a replica or mark it RUNNING.
-		if (container.mcpV3 || app?.kind === 'mcp-v3') return 0;
+		if (container.mcpV3 || app?.kind === 'mcp-v3') {
+			// The one exception: carrying the OOM diagnostic signal through is a
+			// read-only side channel, not a replica/state repair, so it is safe even
+			// on a generation the rest of this function refuses to touch.
+			if (app && container.oomKilledAt && app.lastOomAt?.getTime() !== container.oomKilledAt) {
+				await this.deps.repositories.apps.updateOne(
+					{ appId, workspaceId },
+					{ $set: { lastOomAt: new Date(container.oomKilledAt) } },
+				);
+			}
+			return 0;
+		}
 		if (app) {
 			if (app.replicas.some((replica) => replica.containerId === container.id)) return 0;
 			await this.deps.repositories.apps.updateOne(

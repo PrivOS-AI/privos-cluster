@@ -87,3 +87,25 @@ test('reconfigure envVars admit exactly the Hub-issued agent-bot pair and refuse
 		envVars: { ...request.envVars, PRIVOS_ANYTHING_ELSE: 'value' },
 	}).success, false);
 });
+
+test('an XL managed-runtime size package (4096MB/4cpu) reconfigure request parses at the agent', () => {
+	const { hubOrigin, hubKid, hubPublicJwk, ...reconfigureBinding } = provisioningBinding;
+	const request = {
+		appId: 'cluster-app-1',
+		workspaceId: 'workspace-1',
+		image: 'registry.example/marketplace/app',
+		digest: `sha256:${'a'.repeat(64)}`,
+		mcpV3Binding: { ...reconfigureBinding, imageDigest: `sha256:${'a'.repeat(64)}` },
+		configEpoch: 2,
+		runtimeResourceInventoryHash: 'i'.repeat(43),
+		resources: { memoryMb: 4096, cpus: 4, tmpSizeMb: 1024 },
+	};
+	const parsed = McpReconfigureRequestV3Schema.safeParse(request);
+	assert.equal(parsed.success, true);
+	assert.deepEqual(parsed.success ? parsed.data.resources : undefined, { memoryMb: 4096, cpus: 4, tmpSizeMb: 1024 });
+	// One step past the XL ceiling is refused — it is a ceiling, not a soft default.
+	assert.equal(McpReconfigureRequestV3Schema.safeParse({
+		...request,
+		resources: { memoryMb: 4097, cpus: 4, tmpSizeMb: 1024 },
+	}).success, false);
+});

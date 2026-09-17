@@ -14,7 +14,11 @@ export class SchedulingError extends Error {
 	}
 }
 
-function remaining(
+/** Per-node capacity left after subtracting `reservations` — exported so a
+ * resize can check the replica's CURRENT node with its own app excluded from
+ * the reservation set (there is no migration; the node either fits the new
+ * size or the resize is refused). */
+export function remainingNodeCapacity(
 	node: MasterNode,
 	reservations: NodeReservation[],
 ): { memoryMb: number; cpus: number; diskBytes: number } {
@@ -48,7 +52,7 @@ export function selectNodes(options: {
 		const candidates = active
 			.filter((node) => !selected.some((item) => item.nodeId === node.nodeId))
 			.filter((node) => !selected.some((item) => item.failureDomain === node.failureDomain))
-			.map((node) => ({ node, free: remaining(node, options.reservations) }))
+			.map((node) => ({ node, free: remainingNodeCapacity(node, options.reservations) }))
 			.filter(({ free }) =>
 				free.memoryMb >= options.resources.memoryMb &&
 				free.cpus >= options.resources.cpus &&

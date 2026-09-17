@@ -330,6 +330,20 @@ export class AppLifecycleService {
 			resources: app.resources,
 			at: now,
 		})));
+		// Closes the app's billable interval. A revoked app already had its
+		// interval closed by the revoke QUARANTINED event when it entered
+		// quarantine (see `quarantine` below) — this is then a no-op close, not a
+		// double-bill, because there is no open interval left to close. An app
+		// removed directly (never revoked, or never even activated) is closed
+		// here for the first and only time.
+		await this.deps.repositories.lifecycleEvents.insertOne({
+			eventId: crypto.randomUUID(),
+			workspaceId,
+			appId,
+			type: 'UNINSTALLED',
+			resources: app.resources,
+			at: now,
+		});
 	}
 
 	/** Reaper phase 2: permanently remove a still-QUARANTINED app after its grace
@@ -365,6 +379,7 @@ export class AppLifecycleService {
 			return [this.deps.agentClient.request(node, workspaceId, 'POST', `/api/v1/apps/${replica.containerId}/start`)];
 		}));
 		this.assertResponses(responses);
+		const startedAt = new Date();
 		await this.deps.repositories.lifecycleEvents.insertMany(app.replicas.map((replica) => ({
 			eventId: crypto.randomUUID(),
 			workspaceId,
@@ -372,8 +387,20 @@ export class AppLifecycleService {
 			replicaId: replica.replicaId,
 			type: 'STARTED' as const,
 			resources: app.resources,
-			at: new Date(),
+			at: startedAt,
 		})));
+		// Re-opens the billable interval the revoke QUARANTINED event closed —
+		// the workspace was resurrected inside the grace window.
+		await this.deps.repositories.lifecycleEvents.insertOne({
+			eventId: crypto.randomUUID(),
+			workspaceId,
+			appId,
+			type: 'INSTALLED',
+			resources: app.resources,
+			storageBytes: app.storageBytes,
+			replicaCount: Math.max(app.replicas.length, 1),
+			at: startedAt,
+		});
 	}
 
 	private async load(workspaceId: string, appId: string) {

@@ -112,8 +112,17 @@ export function portalAdminRoutes(deps: {
 			req.log.info({ workspaceId, action, affected: result.affected }, 'apps master workspace power changed');
 			return result;
 		});
-		fastify.get(`${root}/apps`, { preHandler: authenticate }, async () =>
-			deps.repositories.apps.find({}, { projection: { envVars: 0 } }).toArray());
+		fastify.get(`${root}/apps`, { preHandler: authenticate }, async (req) => {
+			const { workspaceId } = z.object({ workspaceId: z.string().min(1).optional() }).parse(req.query);
+			const apps = await deps.repositories.apps
+				.find(workspaceId ? { workspaceId } : {}, { projection: { envVars: 0 } })
+				.toArray();
+			// The portal billing/quota gate needs resources, replica count and
+			// lifecycle timestamps per app; the raw find already carries them
+			// (minus envVars), `replicaCount` is added for convenience so the
+			// caller doesn't need to know the replicas array shape.
+			return apps.map((app) => ({ ...app, replicaCount: app.replicas.length }));
+		});
 		fastify.post(`${root}/usage/rollup`, { preHandler: authenticate }, async (req) => {
 			const { date } = z.object({ date: z.string().date() }).parse(req.body);
 			return deps.usage.rollup(utcDay(date));

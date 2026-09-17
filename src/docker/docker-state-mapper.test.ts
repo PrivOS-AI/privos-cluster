@@ -122,6 +122,22 @@ test('stopped container has no internalUrl and derives stoppedAt', () => {
 	assert.equal(c.stoppedAt, new Date('2026-07-21T11:00:00.000Z').getTime());
 });
 
+test('mapInspectToContainer captures oomKilledAt from State.OOMKilled + FinishedAt, null otherwise', () => {
+	const oomKilled = mapInspectToContainer(
+		inspect({ State: { Status: 'exited', StartedAt: '2026-07-21T10:00:05.000Z', FinishedAt: '2026-07-21T11:00:00.000Z', OOMKilled: true } }),
+	);
+	assert.equal(oomKilled.oomKilledAt, new Date('2026-07-21T11:00:00.000Z').getTime());
+
+	const notOomKilled = mapInspectToContainer(
+		inspect({ State: { Status: 'exited', StartedAt: '2026-07-21T10:00:05.000Z', FinishedAt: '2026-07-21T11:00:00.000Z', OOMKilled: false } }),
+	);
+	assert.equal(notOomKilled.oomKilledAt, null);
+
+	// A runnning container is never OOM-killed by definition, regardless of the flag.
+	const running = mapInspectToContainer(inspect({ State: { Status: 'running', StartedAt: '2026-07-21T10:00:05.000Z', OOMKilled: false } }));
+	assert.equal(running.oomKilledAt, null);
+});
+
 test('pickActivePerId collapses rolling-redeploy duplicates to one active container', () => {
 	// Same id, two containers (rolling window): running old + newer created new → prefer running.
 	const oldRunning = { container: fakeContainer('x', 'running'), dockerCreatedMs: 100 };
@@ -390,4 +406,11 @@ test('mapListEntryToContainer maps a stopped entry with no published port', () =
 	assert.equal(c.state, 'stopped');
 	assert.equal(c.hostPort, null);
 	assert.equal(c.internalUrl, ''); // not running → no URL
+});
+
+test('mapListEntryToContainer overlays the ephemeral oomKilledAt provider value (docker ps carries none of its own)', () => {
+	const withOom = mapListEntryToContainer(listEntry({ State: 'exited' }), undefined, 1_700_000_000_000);
+	assert.equal(withOom.oomKilledAt, 1_700_000_000_000);
+	const withoutOom = mapListEntryToContainer(listEntry());
+	assert.equal(withoutOom.oomKilledAt, null);
 });

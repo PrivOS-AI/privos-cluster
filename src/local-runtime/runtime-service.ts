@@ -225,6 +225,9 @@ function buildPolicy(
 			// into the broker's own bookkeeping).
 			Mounts: [{ Type: 'bind', Source: brokerMount.source, Target: brokerMount.target, ReadOnly: true }],
 			NanoCpus: Math.round(cpus * 1_000_000_000),
+			// Fair CPU sharing under contention — mirrors the fleet driver's
+			// container-manager.ts (1024 = one full share; proportional to cpus).
+			CpuShares: Math.round(1024 * cpus),
 			NetworkMode: config.privateNetwork,
 			OomKillDisable: false,
 			PidsLimit: config.pidsLimit,

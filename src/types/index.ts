@@ -64,6 +64,11 @@ export interface Container {
 	healthPolicy?: HealthPolicy; // self-restart policy read from labels (in-memory health monitor)
 	mcpV2?: boolean; // compatibility proxy bit: MCP workloads expose UI only; private paths stay blocked
 	mcpV3?: boolean; // v3 workloads reconcile only through the signed generation-aware path
+	/** Epoch ms the container was last observed OOM-killed (Docker inspect's
+	 * `State.OOMKilled` + `State.FinishedAt`), captured by the in-memory health
+	 * monitor before any restart. Null when never observed OOM-killed since the
+	 * agent process started. */
+	oomKilledAt?: number | null;
 }
 
 export interface Setting<T = unknown> {

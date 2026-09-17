@@ -238,7 +238,7 @@ test('the reaper destroys a quarantined app; un-quarantine restarts it', async (
 					},
 				},
 				nodes: { find: () => ({ toArray: async () => (opts.nodeGone ? [] : [{ nodeId: 'node-1', address: 'https://node-1.internal' }]) }) },
-				lifecycleEvents: { insertMany: async () => undefined },
+				lifecycleEvents: { insertMany: async () => undefined, insertOne: async () => undefined },
 			} as never,
 			agentClient: { request: async (_n: unknown, _w: string, _m: string, path: string) => { paths.push(path); return { status: opts.deleteStatus ?? 200, body: {} }; } } as never,
 			ingress: { remove: async () => { ingressRemoved = true; } } as never,

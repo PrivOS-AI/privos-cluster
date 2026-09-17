@@ -11,6 +11,8 @@ import test from 'node:test';
 
 import { DeploymentService } from './deployment-service.js';
 import { KeyCipher } from './key-crypto.js';
+import { QuotaError } from './quota-service.js';
+import { SchedulingError } from './scheduler.js';
 import { McpProtocolV3Error, type ClusterReconfigureCommandPayloadV3 } from '../protocol/protocol-v3.js';
 import type { MasterApp, MasterNode } from './types.js';
 
@@ -92,18 +94,28 @@ function command(overrides: Partial<ClusterReconfigureCommandPayloadV3> = {}): C
 	};
 }
 
-function fixture(app: MasterApp = runningApp()) {
+function fixture(app: MasterApp = runningApp(), extra: {
+	nodes?: MasterNode[];
+	otherApps?: MasterApp[];
+	quota?: { assertResizeAllowed?: (...args: any[]) => Promise<void> };
+	failContainerIds?: string[];
+} = {}) {
 	const apps = [structuredClone(app)];
-	const nodes: MasterNode[] = [{
+	const otherApps = (extra.otherApps ?? []).map((candidate) => structuredClone(candidate));
+	const nodes: MasterNode[] = extra.nodes ?? [{
 		nodeId: 'node-1', url: 'https://node-1.internal', region: 'eu', failureDomain: 'fd-1',
 		capacity: { memoryMb: 4096, cpus: 4, diskBytes: 10_000_000_000 }, status: 'ACTIVE',
 		keyId: 'key-1', encryptedFleetKey: 'encrypted-1', createdAt: new Date(), updatedAt: new Date(),
 	}];
 	const agentCalls: Array<{ path: string; body: any }> = [];
+	const lifecycleEvents: Array<{ eventId: string; workspaceId: string; appId: string; type: string; resources: unknown; at: Date }> = [];
 	const service = new DeploymentService({
 		repositories: {
 			apps: {
 				findOne: async () => structuredClone(apps[0] ?? null),
+				find: (filter: { state?: string }) => ({
+					toArray: async () => structuredClone([...apps, ...otherApps].filter((candidate) => !filter.state || candidate.state === filter.state)),
+				}),
 				updateOne: async (filter: any, update: any) => {
 					const applied = apps[0]!.appliedConfigEpoch ?? 1;
 					if (filter.appliedConfigEpoch?.$lt !== undefined && !(applied < filter.appliedConfigEpoch.$lt)) {
@@ -115,21 +127,28 @@ function fixture(app: MasterApp = runningApp()) {
 				},
 			},
 			nodes: { find: () => ({ toArray: async () => structuredClone(nodes) }) },
+			lifecycleEvents: {
+				insertOne: async (event: any) => { lifecycleEvents.push(structuredClone(event)); },
+			},
 		} as any,
 		agentClient: {
 			request: async (_node: MasterNode, _ws: string, _method: string, path: string, body: any) => {
 				agentCalls.push({ path, body });
+				const containerId = path.split('/').at(-2);
+				if (extra.failContainerIds?.includes(containerId!)) {
+					return { status: 503, body: { error: 'injected_failure' } };
+				}
 				return { status: 200, body: { ok: true } };
 			},
 		} as any,
 		ingress: {} as any,
-		quota: {} as any,
+		quota: (extra.quota ?? { assertResizeAllowed: async () => undefined }) as any,
 		subdomains: {} as any,
 		locks: { run: async (_ws: string, work: () => Promise<unknown>) => work() } as any,
 		baseDomain: 'apps.example.com',
 		cipher: new KeyCipher(CIPHER_KEY),
 	});
-	return { apps, agentCalls, service };
+	return { apps, agentCalls, lifecycleEvents, service };
 }
 
 test('a verified epoch reaches every replica with the platform env injected', async () => {
@@ -261,4 +280,137 @@ test('an HA generation reconfigures its replicas one at a time', async () => {
 		state.agentCalls.map((call) => call.path),
 		['/api/v1/mcp/v3/apps/container-1/reconfigure', '/api/v1/mcp/v3/apps/container-2/reconfigure'],
 	);
+});
+
+// ---------------------------------------------------------------------------
+// resize (command.resources)
+// ---------------------------------------------------------------------------
+
+test('resources on the command resizes the replica in place, persists app.resources, and emits RESIZED', async () => {
+	const state = fixture();
+	const result = await state.service.reconfigureMcpV3('workspace-1', command({
+		resources: { memoryMb: 512, cpus: 1, tmpSizeMb: 64 },
+	}));
+	assert.equal(state.agentCalls.length, 1);
+	assert.deepEqual(state.agentCalls[0]!.body.resources, { memoryMb: 512, cpus: 1, tmpSizeMb: 64 });
+	assert.deepEqual(result.app.resources, { memoryMb: 512, cpus: 1, tmpSizeMb: 64 });
+	assert.deepEqual(state.apps[0]!.resources, { memoryMb: 512, cpus: 1, tmpSizeMb: 64 });
+	assert.equal(state.lifecycleEvents.length, 1);
+	assert.equal(state.lifecycleEvents[0]!.type, 'RESIZED');
+	assert.equal(state.lifecycleEvents[0]!.appId, 'cluster-app-1');
+	assert.deepEqual(state.lifecycleEvents[0]!.resources, { memoryMb: 512, cpus: 1, tmpSizeMb: 64 });
+});
+
+test('absent resources leaves app.resources untouched and never emits RESIZED — byte-identical to before this field existed', async () => {
+	const state = fixture();
+	await state.service.reconfigureMcpV3('workspace-1', command());
+	assert.deepEqual(state.apps[0]!.resources, { memoryMb: 256, cpus: 0.5, tmpSizeMb: 64 });
+	assert.equal(state.lifecycleEvents.length, 0);
+});
+
+test('a resize refused by the workspace quota delta touches no replica and leaves resources unchanged', async () => {
+	const state = fixture(runningApp(), {
+		quota: {
+			assertResizeAllowed: async () => {
+				throw new QuotaError('MEMORY_QUOTA_EXCEEDED', 'workspace reserved memory quota exceeded');
+			},
+		},
+	});
+	await assert.rejects(
+		state.service.reconfigureMcpV3('workspace-1', command({ resources: { memoryMb: 4096, cpus: 4, tmpSizeMb: 64 } })),
+		(error: unknown) => error instanceof QuotaError && error.code === 'MEMORY_QUOTA_EXCEEDED',
+	);
+	assert.equal(state.agentCalls.length, 0);
+	assert.deepEqual(state.apps[0]!.resources, { memoryMb: 256, cpus: 0.5, tmpSizeMb: 64 });
+});
+
+test('a resize refused for lack of room on the replica\'s current node touches no replica — there is no migration', async () => {
+	const state = fixture(runningApp(), {
+		nodes: [{
+			nodeId: 'node-1', url: 'https://node-1.internal', region: 'eu', failureDomain: 'fd-1',
+			capacity: { memoryMb: 300, cpus: 4, diskBytes: 10_000_000_000 }, status: 'ACTIVE',
+			keyId: 'key-1', encryptedFleetKey: 'encrypted-1', createdAt: new Date(), updatedAt: new Date(),
+		}],
+	});
+	// The app's own current 256MB is excluded from the reservation set, so the
+	// node has exactly 300MB free — a 301MB resize must be refused.
+	await assert.rejects(
+		state.service.reconfigureMcpV3('workspace-1', command({ resources: { memoryMb: 301, cpus: 0.5, tmpSizeMb: 64 } })),
+		(error: unknown) => error instanceof SchedulingError && error.code === 'CAPACITY_UNAVAILABLE',
+	);
+	assert.equal(state.agentCalls.length, 0);
+	assert.deepEqual(state.apps[0]!.resources, { memoryMb: 256, cpus: 0.5, tmpSizeMb: 64 });
+});
+
+test('the capacity check excludes the app\'s own current reservation from its node', async () => {
+	const state = fixture(runningApp(), {
+		nodes: [{
+			nodeId: 'node-1', url: 'https://node-1.internal', region: 'eu', failureDomain: 'fd-1',
+			// Exactly enough for the resize target — if the app's own CURRENT 256MB
+			// were counted against this node (i.e. not excluded), free would be
+			// 512-256=256MB and this resize would be wrongly refused.
+			capacity: { memoryMb: 512, cpus: 4, diskBytes: 10_000_000_000 }, status: 'ACTIVE',
+			keyId: 'key-1', encryptedFleetKey: 'encrypted-1', createdAt: new Date(), updatedAt: new Date(),
+		}],
+	});
+	await assert.doesNotReject(
+		state.service.reconfigureMcpV3('workspace-1', command({ resources: { memoryMb: 512, cpus: 0.5, tmpSizeMb: 64 } })),
+	);
+	assert.equal(state.agentCalls.length, 1);
+});
+
+test('a later replica failing mid-resize rolls back every already-resized replica to its previous resources', async () => {
+	const state = fixture(
+		runningApp({
+			availabilityTier: 'ha',
+			replicas: [
+				{ replicaId: 'replica-1', nodeId: 'node-1', containerId: 'container-1', state: 'running' },
+				{ replicaId: 'replica-2', nodeId: 'node-1', containerId: 'container-2', state: 'running' },
+			],
+		}),
+		{ failContainerIds: ['container-2'] },
+	);
+	await assert.rejects(
+		state.service.reconfigureMcpV3('workspace-1', command({ resources: { memoryMb: 512, cpus: 1, tmpSizeMb: 64 } })),
+		/agent MCP v3 reconfigure failed/,
+	);
+	assert.deepEqual(
+		state.agentCalls.map((call) => ({ path: call.path, resources: call.body.resources })),
+		[
+			// forward: replica-1 resized, replica-2 fails
+			{ path: '/api/v1/mcp/v3/apps/container-1/reconfigure', resources: { memoryMb: 512, cpus: 1, tmpSizeMb: 64 } },
+			{ path: '/api/v1/mcp/v3/apps/container-2/reconfigure', resources: { memoryMb: 512, cpus: 1, tmpSizeMb: 64 } },
+			// rollback: replica-1 restored to its previous resources
+			{ path: '/api/v1/mcp/v3/apps/container-1/reconfigure', resources: { memoryMb: 256, cpus: 0.5, tmpSizeMb: 64 } },
+		],
+	);
+	// The whole operation was refused — nothing persisted, no billing event.
+	assert.deepEqual(state.apps[0]!.resources, { memoryMb: 256, cpus: 0.5, tmpSizeMb: 64 });
+	assert.equal(state.apps[0]!.appliedConfigEpoch, 1);
+	assert.equal(state.lifecycleEvents.length, 0);
+});
+
+test('replaying the applied epoch with different resources is refused, even when the environment matches', async () => {
+	const state = fixture();
+	await state.service.reconfigureMcpV3('workspace-1', command({ resources: { memoryMb: 512, cpus: 1, tmpSizeMb: 64 } }));
+	await assert.rejects(
+		state.service.reconfigureMcpV3('workspace-1', command({
+			jti: '66666666-6666-4666-8666-666666666666',
+			resources: { memoryMb: 1024, cpus: 1, tmpSizeMb: 64 },
+		})),
+		(error: unknown) =>
+			error instanceof McpProtocolV3Error &&
+			error.code === 'CONFIG_EPOCH_INVALID' &&
+			error.message === 'epoch_reused',
+	);
+	assert.deepEqual(state.apps[0]!.resources, { memoryMb: 512, cpus: 1, tmpSizeMb: 64 });
+});
+
+test('replaying the applied epoch with the identical resources is idempotent', async () => {
+	const state = fixture();
+	await state.service.reconfigureMcpV3('workspace-1', command({ resources: { memoryMb: 512, cpus: 1, tmpSizeMb: 64 } }));
+	const repeat = await state.service.reconfigureMcpV3('workspace-1', command({ resources: { memoryMb: 512, cpus: 1, tmpSizeMb: 64 } }));
+	assert.equal(repeat.app.appliedConfigEpoch, 2);
+	assert.equal(state.agentCalls.length, 1, 'an idempotent repeat must not touch a replica again');
+	assert.equal(state.lifecycleEvents.length, 1, 'an idempotent repeat must not double-emit RESIZED');
 });

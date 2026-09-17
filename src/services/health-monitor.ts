@@ -8,7 +8,7 @@
 import pino from 'pino';
 import { config } from '../config.js';
 import { containerManager } from '../docker/index.js';
-import { listManaged, type HealthProvider } from '../docker/docker-state.js';
+import { listManaged, type HealthProvider, type OomProvider } from '../docker/docker-state.js';
 import { HEALTH_DEFAULTS } from '../docker/container-manager.js';
 import type { Container, HealthCheck, HealthPolicy } from '../types/index.js';
 
@@ -25,11 +25,20 @@ const FALLBACK_POLICY: HealthPolicy = {
 // containerId (privos.id) -> ephemeral health counters
 const healthState = new Map<string, HealthCheck>();
 
+// containerId (privos.id) -> epoch ms of the last observed OOM kill. Captured
+// once per exit (never re-inspected while the entry is already known) so a
+// container that keeps crash-looping for an unrelated reason doesn't pay a
+// Docker inspect every tick.
+const oomState = new Map<string, number>();
+
 let timer: NodeJS.Timeout | null = null;
 let busy = false;
 
 /** Overlay provider consumed by docker-state.ts / lifecycle-service.ts. */
 export const getHealth: HealthProvider = (id) => healthState.get(id);
+
+/** Overlay provider consumed by docker-state.ts for the container listing. */
+export const getOomKilledAt: OomProvider = (id) => oomState.get(id) ?? null;
 
 // ---------------------------------------------------------------------------
 // Pure decision logic — unit-testable without network or Docker.
@@ -121,16 +130,41 @@ async function checkOne(c: Container): Promise<void> {
 	}
 }
 
+/**
+ * A crash is a durable `exited`/`dead` Docker status ("stopped" in the coarse
+ * cluster vocabulary) — inspected BEFORE any restart so the evidence survives
+ * whatever recreates the container next (a manual start, a future redeploy).
+ * `docker ps` (what `listManaged` normally uses) carries no `State.OOMKilled`,
+ * so this is the one place a full inspect is worth paying for.
+ */
+async function captureOomSignal(c: Container): Promise<void> {
+	if (oomState.has(c.id)) return; // already captured for this exit
+	try {
+		const info = await containerManager.inspectContainer(c.dockerContainerId);
+		if (info.State?.OOMKilled) {
+			const finishedAt = info.State.FinishedAt ? Date.parse(info.State.FinishedAt) : NaN;
+			oomState.set(c.id, Number.isFinite(finishedAt) && finishedAt > 0 ? finishedAt : Date.now());
+		}
+	} catch (err: any) {
+		logger.error({ containerId: c.id, err: err.message }, 'oom inspect failed');
+	}
+}
+
 async function checkAll(): Promise<void> {
-	const containers = await listManaged(getHealth);
-	// Prune ephemeral health entries for containers that no longer exist, so the
-	// in-memory map can't grow unbounded across deploy/delete cycles.
+	const containers = await listManaged(getHealth, undefined, getOomKilledAt);
+	// Prune ephemeral health/OOM entries for containers that no longer exist, so
+	// neither in-memory map can grow unbounded across deploy/delete cycles.
 	const liveIds = new Set(containers.map((c) => c.id));
 	for (const id of healthState.keys()) {
 		if (!liveIds.has(id)) healthState.delete(id);
 	}
+	for (const id of oomState.keys()) {
+		if (!liveIds.has(id)) oomState.delete(id);
+	}
 	const running = containers.filter((c) => c.state === 'running');
 	await Promise.allSettled(running.map((c) => checkOne(c)));
+	const exited = containers.filter((c) => c.state === 'stopped');
+	await Promise.allSettled(exited.map((c) => captureOomSignal(c)));
 }
 
 async function tick(): Promise<void> {

@@ -146,6 +146,10 @@ export interface MasterApp {
 	mcpPreviousImageDigest?: string;
 	/** How the most recent upgrade actually swapped the container; echoed on an idempotent replay. */
 	mcpLastSwapStrategy?: 'ROLLING' | 'STOP_THEN_CREATE';
+	/** Most recent OOM kill observed on any replica's container, copied from the
+	 * agent's container listing during reconcile. Informational only — it never
+	 * gates a lifecycle transition, and is not cleared on a later successful start. */
+	lastOomAt?: Date;
 }
 
 export interface McpArtifactUse {
@@ -157,16 +161,45 @@ export interface McpArtifactUse {
 	createdAt: Date;
 }
 
-export type LifecycleEventType = 'STARTED' | 'STOPPED' | 'REDEPLOYED' | 'REMOVED' | 'QUARANTINED';
+/**
+ * STARTED/STOPPED/REDEPLOYED/REMOVED/QUARANTINED are per-REPLICA operational
+ * events (ops metrics: ramGbHours/cpuHours, and the reap/revoke lifecycle).
+ * INSTALLED/UNINSTALLED/REPLICAS_CHANGED/RESIZED are per-APP billing events,
+ * distinct from replica churn: an app is "installed" once (at first
+ * activation) and stays installed across restarts, redeploys, and individual
+ * replica STARTED/STOPPED — only an explicit uninstall or a workspace-revoke
+ * QUARANTINED event closes the billable interval. RESIZED re-bases the open
+ * interval's resources the same way REPLICAS_CHANGED re-bases its replica
+ * count — a size-package change mid-day is priced at the largest resources
+ * held that day (the portal prices it; the aggregator only carries segments).
+ */
+export type LifecycleEventType =
+	| 'STARTED'
+	| 'STOPPED'
+	| 'REDEPLOYED'
+	| 'REMOVED'
+	| 'QUARANTINED'
+	| 'INSTALLED'
+	| 'UNINSTALLED'
+	| 'REPLICAS_CHANGED'
+	| 'RESIZED';
 
 export interface AppLifecycleEvent {
 	eventId: string;
 	workspaceId: string;
 	appId: string;
-	replicaId: string;
+	/** Absent on app-level events (INSTALLED/UNINSTALLED/REPLICAS_CHANGED, and
+	 * a revoke-teardown QUARANTINED), which describe the app as a whole rather
+	 * than one replica. */
+	replicaId?: string;
 	type: LifecycleEventType;
 	resources: ContainerResources;
+	/** Carried on INSTALLED (and REPLICAS_CHANGED, if storage changed with it)
+	 * so a billing rollup can re-derive storage from events alone, without
+	 * reading the current (mutable) app document. */
 	storageBytes?: number;
+	/** App-level replica count at the time of the event (INSTALLED/REPLICAS_CHANGED). */
+	replicaCount?: number;
 	at: Date;
 }
 
@@ -181,6 +214,14 @@ export interface AppUsageDaily {
 		ramGbHours: number;
 		cpuHours: number;
 		storageGbDay: number;
+		/** Largest resource reservation billed for this app on this day — see
+		 * `aggregateWorkspaceDay` for why "largest observed" is the correct
+		 * pricing input. */
+		resources: { memoryMb: number; cpus: number; tmpSizeMb?: number };
+		/** Largest replica count billed for this app on this day. */
+		replicaCount: number;
+		/** Share of the UTC day (0-1) the app was installed-and-running. */
+		installedDayFraction: number;
 	}>;
 	computedAt: Date;
 }

@@ -260,6 +260,11 @@ export class ContainerManager {
                 Memory: cfg.resources.memoryMb * 1024 * 1024,
                 MemorySwap: cfg.resources.memoryMb * 1024 * 1024, // disable swap
                 NanoCpus: Math.round(cfg.resources.cpus * 1e9),
+                // Fair CPU sharing under contention: NanoCpus alone is a hard cap, not a
+                // weight, so every container competes equally for idle CPU regardless of
+                // its own size package. CpuShares (1024 = one full share) makes an XL
+                // package get proportionally more of a contended host than an S package.
+                CpuShares: Math.round(1024 * cfg.resources.cpus),
                 PidsLimit: 100,
                 RestartPolicy: { Name: 'no' }, // health monitor handles restarts
 				Mounts: [

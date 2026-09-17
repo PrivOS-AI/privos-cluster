@@ -307,7 +307,8 @@ test('v3 provisioning persists exact partial resources, resumes deterministicall
 	assert.equal(running.state, 'RUNNING');
 	assert.ok(running.mcpInventoryAttestationEstablishedAt);
 	assert.equal(state.ingressCalls, 1);
-	assert.equal(state.lifecycleEvents.length, 2);
+	// 2 per-replica STARTED events plus 1 app-level INSTALLED event (opens the billable interval).
+	assert.equal(state.lifecycleEvents.length, 3);
 	const identicalActivation = await state.service.activateMcpV3('workspace-1', {
 		runtimeInstallationId: deploymentGrant.runtimeInstallationId,
 		compact: attestationCompact,

@@ -4,10 +4,11 @@ import type { JsonWebKey } from 'node:crypto';
 import { z } from 'zod';
 import type { MasterRepositories } from './repositories.js';
 import type { AvailabilityTier, AppReplica, MasterApp, MasterNode, RuntimeResourceInventory } from './types.js';
+import type { ContainerResources } from '../types/index.js';
 import { AgentClient } from './agent-client.js';
 import { IngressRouteProgrammer } from './ingress-route-programmer.js';
 import { QuotaService } from './quota-service.js';
-import { selectNodes, type NodeReservation, SchedulingError } from './scheduler.js';
+import { selectNodes, remainingNodeCapacity, type NodeReservation, SchedulingError } from './scheduler.js';
 import { SubdomainRegistry } from './subdomain-registry.js';
 import { WorkspaceLock } from './workspace-lock.js';
 import { KeyCipher } from './key-crypto.js';
@@ -581,6 +582,11 @@ export class DeploymentService {
 				throw new Error('mcp_v3_activation_conflict');
 			}
 			await this.recordMcpV3StartedEvents(app, establishedAt);
+			// First activation (the atomic QUARANTINED->RUNNING write above only
+			// succeeds once per generation) is the moment the app becomes billable.
+			// A revived tombstone reaches this same path under the same appId with
+			// a fresh createdAt, so this opens a new billable interval, not a stale one.
+			await this.recordAppInstalledEvent(app, establishedAt);
 			return { ...app, state: 'RUNNING', mcpInventoryAttestationEstablishedAt: establishedAt, updatedAt: establishedAt };
 		});
 	}
@@ -721,6 +727,12 @@ export class DeploymentService {
 	 * attested resource inventory — because the environment is only readable by
 	 * a process at start. HA runs one replica at a time so the ingress always
 	 * has a healthy upstream.
+	 *
+	 * `command.resources` additionally drives an in-place SIZE-PACKAGE RESIZE of
+	 * the same generation: every replica is recreated on its CURRENT node with
+	 * the new limits — never a new deployment grant, never a node migration.
+	 * Absent `resources`, this is byte-identical to the environment-only
+	 * reconfigure this method already was.
 	 */
 	async reconfigureMcpV3(
 		workspaceId: string,
@@ -734,6 +746,18 @@ export class DeploymentService {
 				state: { $ne: 'REMOVED' },
 			});
 			if (!app) throw new McpProtocolV3Error('RUNTIME_NOT_RECONFIGURABLE', 'app_not_found');
+			// A crash-looping/OOM-killed replica does NOT flip this to anything but
+			// RUNNING: generic reconcile explicitly skips mcp-v3 apps (its own
+			// generation-aware recovery path owns them), so nothing ever syncs
+			// app.state from the live container here. A resize therefore already
+			// reaches and recreates a crash-looped app below — no special-casing
+			// needed for that path.
+			// KNOWN LIMITATION (also true of the plain env-only reconfigure this
+			// gate already guarded): an app an OPERATOR explicitly stopped (state
+			// STOPPED/QUARANTINED/PROVISIONING) cannot be resized here. Starting it
+			// is a separate, explicit lifecycle action — this command has no way to
+			// fold "start" into the same operation without silently resurrecting an
+			// app the operator deliberately stopped. Start it first, then resize.
 			if (app.state !== 'RUNNING') throw new McpProtocolV3Error('RUNTIME_NOT_RECONFIGURABLE', `state_${app.state}`);
 			if (
 				app.appId !== command.clusterAppId ||
@@ -747,16 +771,30 @@ export class DeploymentService {
 				app.mcpAuthorizationEpoch !== command.authorizationEpoch
 			) throw new McpProtocolV3Error('GENERATION_AFFINITY_MISMATCH');
 
+			const requestedResources: ContainerResources | undefined = command.resources
+				? { memoryMb: command.resources.memoryMb, cpus: command.resources.cpus, tmpSizeMb: command.resources.tmpSizeMb }
+				: undefined;
+
 			const applied = app.appliedConfigEpoch ?? 1;
 			// A repeat of the epoch that is already running is idempotent only when
-			// the environment is byte-identical; anything else — including an equal
-			// epoch with different values — is a downgrade or a forgery attempt.
+			// the environment AND the resources are byte-identical; anything else —
+			// including an equal epoch with a different value of either — is a
+			// downgrade or a forgery attempt.
 			if (command.configEpoch < applied) throw new McpProtocolV3Error('CONFIG_EPOCH_INVALID', 'epoch_downgrade');
 			if (command.configEpoch === applied) {
-				if (canonicalJson(this.operatorEnvOf(app)) !== canonicalJson(command.envVars)) {
+				const sameEnv = canonicalJson(this.operatorEnvOf(app)) === canonicalJson(command.envVars);
+				const sameResources = !requestedResources || canonicalJson(app.resources) === canonicalJson(requestedResources);
+				if (!sameEnv || !sameResources) {
 					throw new McpProtocolV3Error('CONFIG_EPOCH_INVALID', 'epoch_reused');
 				}
 				return { app, appliedKeys: Object.keys(command.envVars).sort() };
+			}
+
+			// Resize is not a new app (no maxApps test) — only the workspace's
+			// memory/cpu headroom for the DELTA between the new and current
+			// per-replica resources.
+			if (requestedResources) {
+				await this.deps.quota.assertResizeAllowed(workspaceId, app, requestedResources);
 			}
 
 			const nodes = await this.deps.repositories.nodes.find({
@@ -769,9 +807,75 @@ export class DeploymentService {
 				throw new Error('mcp_replica_node_missing');
 			}
 
+			if (requestedResources) {
+				// Per-replica capacity on its CURRENT node, excluding this app's own
+				// existing reservation there — there is no migration, so a node that
+				// cannot fit the new size in place is a hard refusal.
+				const otherRunningApps = (await this.deps.repositories.apps.find({ state: 'RUNNING' }).toArray())
+					.filter((candidate) => candidate.appId !== app.appId);
+				const reservations: NodeReservation[] = otherRunningApps.flatMap((candidate) =>
+					candidate.replicas.map((replica) => ({
+						nodeId: replica.nodeId,
+						memoryMb: candidate.resources.memoryMb,
+						cpus: candidate.resources.cpus,
+						diskBytes: (candidate as MasterApp & { storageBytes?: number }).storageBytes ?? 0,
+					})),
+				);
+				for (const replica of app.replicas) {
+					const node = nodes.find((candidate) => candidate.nodeId === replica.nodeId)!;
+					const free = remainingNodeCapacity(node, reservations);
+					if (free.memoryMb < requestedResources.memoryMb || free.cpus < requestedResources.cpus) {
+						throw new SchedulingError('CAPACITY_UNAVAILABLE', `node ${node.nodeId} has no room to resize replica ${replica.replicaId} in place`);
+					}
+				}
+			}
+
 			const sealed = this.sealOperatorEnv(command.envVars, command.secretKeys);
 			const secretKeys = sealed.secretEnvKeys;
 
+			const agentBody = (node: MasterNode, replica: AppReplica, resources: ContainerResources) => ({
+				appId: app.appId,
+				workspaceId,
+				listingId: app.listingId,
+				versionDigest: app.versionDigest,
+				image: app.image,
+				digest: app.imageDigest,
+				tag: 'latest',
+				port: app.port,
+				resources,
+				envVars: command.envVars,
+				platformEnvVars: this.platformEnvVarsV3(app.subdomain),
+				secretEnvKeys: secretKeys,
+				volumes: app.volumes,
+				availabilityTier: app.availabilityTier,
+				stateless: app.stateless,
+				subdomain: app.subdomain,
+				domain: this.deps.baseDomain,
+				configEpoch: command.configEpoch,
+				runtimeResourceInventoryHash: command.runtimeResourceInventoryHash,
+				mcpV3Binding: {
+					protocolVersion: 3 as const,
+					clusterId: command.clusterId,
+					nodeId: node.nodeId,
+					workspaceId,
+					deploymentId: command.deploymentId,
+					generationId: command.generationId,
+					generationNumber: command.generationNumber,
+					runtimeInstallationId: command.runtimeInstallationId,
+					mcpAppId: command.mcpAppId,
+					replicaId: replica.replicaId,
+					containerId: replica.containerId,
+					imageDigest: app.imageDigest,
+					manifestDigest: command.manifestDigest,
+					approvalReceiptHash: app.mcpApprovalReceiptHash,
+					authorizationEpoch: command.authorizationEpoch,
+					deploymentGrantHash: app.mcpDeploymentGrantHash,
+					resourceManifestHash: command.resourceManifestHash,
+				},
+			});
+
+			const previousResources = app.resources;
+			const resizedReplicas: AppReplica[] = [];
 			for (const replica of app.replicas) {
 				const node = nodes.find((candidate) => candidate.nodeId === replica.nodeId)!;
 				const response = await this.deps.agentClient.request(
@@ -779,50 +883,39 @@ export class DeploymentService {
 					workspaceId,
 					'POST',
 					`/api/v1/mcp/v3/apps/${replica.containerId}/reconfigure`,
-					{
-						appId: app.appId,
-						workspaceId,
-						listingId: app.listingId,
-						versionDigest: app.versionDigest,
-						image: app.image,
-						digest: app.imageDigest,
-						tag: 'latest',
-						port: app.port,
-						resources: app.resources,
-						envVars: command.envVars,
-						platformEnvVars: this.platformEnvVarsV3(app.subdomain),
-						secretEnvKeys: secretKeys,
-						volumes: app.volumes,
-						availabilityTier: app.availabilityTier,
-						stateless: app.stateless,
-						subdomain: app.subdomain,
-						domain: this.deps.baseDomain,
-						configEpoch: command.configEpoch,
-						runtimeResourceInventoryHash: command.runtimeResourceInventoryHash,
-						mcpV3Binding: {
-							protocolVersion: 3,
-							clusterId: command.clusterId,
-							nodeId: node.nodeId,
-							workspaceId,
-							deploymentId: command.deploymentId,
-							generationId: command.generationId,
-							generationNumber: command.generationNumber,
-							runtimeInstallationId: command.runtimeInstallationId,
-							mcpAppId: command.mcpAppId,
-							replicaId: replica.replicaId,
-							containerId: replica.containerId,
-							imageDigest: app.imageDigest,
-							manifestDigest: command.manifestDigest,
-							approvalReceiptHash: app.mcpApprovalReceiptHash,
-							authorizationEpoch: command.authorizationEpoch,
-							deploymentGrantHash: app.mcpDeploymentGrantHash,
-							resourceManifestHash: command.resourceManifestHash,
-						},
-					},
+					agentBody(node, replica, requestedResources ?? app.resources),
 				);
 				if (response.status >= 300) {
+					// A later replica failing mid-resize must not leave the ones that
+					// already moved to the new size stranded there while the app
+					// document (below) never gets touched — roll each of them back to
+					// the limits they held before this operation started.
+					if (requestedResources) {
+						for (const done of resizedReplicas) {
+							const doneNode = nodes.find((candidate) => candidate.nodeId === done.nodeId)!;
+							try {
+								const rollback = await this.deps.agentClient.request(
+									doneNode,
+									workspaceId,
+									'POST',
+									`/api/v1/mcp/v3/apps/${done.containerId}/reconfigure`,
+									agentBody(doneNode, done, previousResources),
+								);
+								if (rollback.status >= 300) {
+									throw new Error(`rollback agent call returned ${rollback.status}: ${JSON.stringify(rollback.body)}`);
+								}
+							} catch (rollbackError) {
+								throw new Error(
+									`agent MCP v3 reconfigure failed: ${JSON.stringify(response.body)}; ` +
+									`additionally, rolling back already-resized replica ${done.replicaId} to its previous resources failed: ` +
+									`${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
+								);
+							}
+						}
+					}
 					throw new Error(`agent MCP v3 reconfigure failed: ${JSON.stringify(response.body)}`);
 				}
+				if (requestedResources) resizedReplicas.push(replica);
 			}
 
 			const appliedAt = new Date();
@@ -836,6 +929,7 @@ export class DeploymentService {
 						appliedConfigAt: appliedAt,
 						updatedAt: appliedAt,
 						...(sealed.secretEnvVarsEnc ? { secretEnvVarsEnc: sealed.secretEnvVarsEnc } : {}),
+						...(requestedResources ? { resources: requestedResources } : {}),
 					},
 					// A removed secret must not leave its previous value behind.
 					...(sealed.secretEnvVarsEnc ? {} : { $unset: { secretEnvVarsEnc: 1 as const } }),
@@ -845,6 +939,16 @@ export class DeploymentService {
 			const reconfigured = await this.deps.repositories.apps.findOne({ appId: app.appId, workspaceId });
 			if (!reconfigured || reconfigured.appliedConfigEpoch !== command.configEpoch) {
 				throw new Error('mcp_v3_reconfigure_persistence_conflict');
+			}
+			if (requestedResources) {
+				await this.deps.repositories.lifecycleEvents.insertOne({
+					eventId: crypto.randomUUID(),
+					workspaceId,
+					appId: app.appId,
+					type: 'RESIZED',
+					resources: requestedResources,
+					at: appliedAt,
+				});
 			}
 			return { app: reconfigured, appliedKeys: Object.keys(command.envVars).sort() };
 		});
@@ -1144,6 +1248,28 @@ export class DeploymentService {
 		}
 	}
 
+	/** Open (or re-open) the app's billable interval: emitted once, the moment an
+	 * app FIRST reaches RUNNING — a fresh deploy or a revived tombstone under the
+	 * same appId. A deploy that never activates never calls this, so it is never
+	 * billed. Deliberately app-level (no replicaId): billing tracks the app, not
+	 * any one replica. */
+	private async recordAppInstalledEvent(app: MasterApp, at: Date): Promise<void> {
+		try {
+			await this.deps.repositories.lifecycleEvents.insertOne({
+				eventId: `installed:${app.appId}:${at.getTime()}`,
+				workspaceId: app.workspaceId,
+				appId: app.appId,
+				type: 'INSTALLED',
+				resources: app.resources,
+				storageBytes: app.storageBytes,
+				replicaCount: Math.max(app.replicas.length, 1),
+				at,
+			});
+		} catch (error: unknown) {
+			if ((error as { code?: number }).code !== 11000) throw error;
+		}
+	}
+
 	private assertMcpV3AppAffinity(
 		app: MasterApp,
 		grant: McpDeploymentGrantPayloadV3,
@@ -1369,11 +1495,16 @@ export class DeploymentService {
 			const nodes = await this.deps.repositories.nodes.find({ nodeId: { $in: app.replicas.map((replica) => replica.nodeId) } }).toArray();
 			if (nodes.length !== app.replicas.length) throw new Error('mcp_replica_node_missing');
 			await this.deps.ingress.upsert(app.subdomain, nodes);
-			await this.deps.repositories.apps.updateOne(
+			const activatedAt = new Date();
+			const activated = await this.deps.repositories.apps.updateOne(
 				{ appId: app.appId, state: 'QUARANTINED' },
-				{ $set: { state: 'RUNNING', updatedAt: new Date() } },
+				{ $set: { state: 'RUNNING', updatedAt: activatedAt } },
 			);
-			return { ...app, state: 'RUNNING', updatedAt: new Date() };
+			// Only the transition's winner opens the billable interval — a losing
+			// concurrent call (matchedCount 0, app already flipped to RUNNING by
+			// another request) must not double-emit INSTALLED.
+			if (activated.matchedCount === 1) await this.recordAppInstalledEvent(app, activatedAt);
+			return { ...app, state: 'RUNNING', updatedAt: activatedAt };
 		});
 	}
 
@@ -1456,6 +1587,9 @@ export class DeploymentService {
 			storageBytes,
 			at: now,
 		})));
+		// A raw app has no separate quarantine/activate step — it reaches RUNNING
+		// in this same call, so it becomes billable here.
+		await this.recordAppInstalledEvent(app, now);
 		return app;
 	}
 
@@ -1545,6 +1679,12 @@ export class DeploymentService {
 					eventId: crypto.randomUUID(), workspaceId, appId, replicaId: replica.replicaId,
 					type: 'STARTED', resources: app.resources, at: now,
 				});
+				// The app stays installed across this tier change — re-base the open
+				// billable interval's replica count instead of opening a new one.
+				await this.deps.repositories.lifecycleEvents.insertOne({
+					eventId: crypto.randomUUID(), workspaceId, appId,
+					type: 'REPLICAS_CHANGED', resources: app.resources, replicaCount: app.replicas.length + 1, at: now,
+				});
 			} else {
 				const [keep, ...remove] = app.replicas;
 				if (!keep) throw new Error('app has no replicas');
@@ -1566,6 +1706,12 @@ export class DeploymentService {
 						eventId: crypto.randomUUID(), workspaceId, appId, replicaId: replica.replicaId,
 						type: 'REMOVED' as const, resources: app.resources, at: now,
 					})));
+					// Same reasoning as the HA branch above: the app stays installed,
+					// only its billed replica count drops.
+					await this.deps.repositories.lifecycleEvents.insertOne({
+						eventId: crypto.randomUUID(), workspaceId, appId,
+						type: 'REPLICAS_CHANGED', resources: app.resources, replicaCount: 1, at: now,
+					});
 				}
 			}
 			return this.deps.repositories.apps.findOne({ workspaceId, appId }) as Promise<MasterApp>;

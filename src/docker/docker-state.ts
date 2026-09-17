@@ -16,27 +16,35 @@ const MANAGED_LABEL = 'privos.managed=true';
 /** Optional provider of ephemeral health per container id (in-memory monitor). */
 export type HealthProvider = (id: string) => HealthCheck | undefined;
 
+/** Optional provider of the ephemeral last-OOM-kill epoch ms per container id
+ * (in-memory health monitor — `docker ps` carries no `State.OOMKilled`). */
+export type OomProvider = (id: string) => number | null | undefined;
+
 /**
  * Inspect every matching managed container and collapse transient duplicate ids
  * (rolling-redeploy overlap) to one active container per id — prefer running,
  * then newest by Docker's real creation time (see pickActivePerId).
  */
-async function inspectManaged(filters: Record<string, string[]>, health?: HealthProvider): Promise<Container[]> {
+async function inspectManaged(
+	filters: Record<string, string[]>,
+	health?: HealthProvider,
+	oom?: OomProvider,
+): Promise<Container[]> {
 	// One `containers/json` (docker ps) call — the list entry already carries labels,
 	// state, ports, networks and mounts, so there is no per-container inspect here.
 	const list = (await containerManager.listContainers(filters, true)) as Docker.ContainerInfo[];
 	const items = list.map((entry) => {
-		const mapped = mapListEntryToContainer(entry);
+		const mapped = mapListEntryToContainer(entry, undefined, oom ? oom(entry.Labels?.['privos.id'] ?? entry.Id) ?? null : null);
 		const container = health ? { ...mapped, healthCheck: health(mapped.id) ?? mapped.healthCheck } : mapped;
 		return { container, dockerCreatedMs: (entry.Created ?? 0) * 1000 };
 	});
 	return pickActivePerId(items);
 }
 
-export async function listManaged(health?: HealthProvider, workspaceId?: string): Promise<Container[]> {
+export async function listManaged(health?: HealthProvider, workspaceId?: string, oom?: OomProvider): Promise<Container[]> {
 	const labels = [MANAGED_LABEL];
 	if (workspaceId) labels.push(`privos.workspace=${workspaceId}`);
-	const all = await inspectManaged({ label: labels }, health);
+	const all = await inspectManaged({ label: labels }, health, oom);
 	return all.sort((a, b) => b.createdAt - a.createdAt);
 }
 
@@ -44,10 +52,11 @@ export async function getById(
 	id: string,
 	health?: HealthProvider,
 	workspaceId?: string,
+	oom?: OomProvider,
 ): Promise<Container | null> {
 	const labels = [MANAGED_LABEL, `privos.id=${id}`];
 	if (workspaceId) labels.push(`privos.workspace=${workspaceId}`);
-	const found = await inspectManaged({ label: labels }, health);
+	const found = await inspectManaged({ label: labels }, health, oom);
 	return found[0] ?? null;
 }
 

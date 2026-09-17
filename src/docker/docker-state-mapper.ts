@@ -150,8 +150,11 @@ interface DockerFacts {
 	mounts: Array<{ Type?: string; Name?: string; Destination?: string }>;
 }
 
-/** Shared label-driven assembly for both the inspect and the list mappers. */
-function buildContainer(facts: DockerFacts, health: HealthCheck): Container {
+/** Shared label-driven assembly for both the inspect and the list mappers.
+ * `oomKilledAt` overlays the ephemeral in-memory OOM signal (health monitor) —
+ * `docker ps` carries no OOM information, and a full inspect is only ever done
+ * once, off the hot listing path, so neither mapper can derive it locally. */
+function buildContainer(facts: DockerFacts, health: HealthCheck, oomKilledAt: number | null = null): Container {
 	const { labels } = facts;
 	const id = labels['privos.id'] || facts.dockerContainerId;
 	const port = parseInt(labels['privos.port'] ?? '0', 10) || 0;
@@ -196,17 +199,21 @@ function buildContainer(facts: DockerFacts, health: HealthCheck): Container {
 		// protocol so v3 cannot expose /mcp/bootstrap/identity publicly.
 		mcpV2: labels['privos.mcp.schema'] === '2' || labels['privos.mcp.schema'] === '3',
 		mcpV3: labels['privos.mcp.schema'] === '3',
+		oomKilledAt,
 	};
 }
 
 /**
  * PURE mapper: Docker inspect object + labels → API `Container`.
  * `health` overlays the ephemeral in-memory counters (default = unknown/0/0/null).
+ * A full inspect carries `State.OOMKilled` directly, so — unlike the list
+ * mapper — this one needs no external OOM overlay.
  */
 export function mapInspectToContainer(info: Docker.ContainerInspectInfo, health: HealthCheck = DEFAULT_HEALTH): Container {
 	const state = mapState(info.State?.Status);
 	const labels = (info.Config?.Labels ?? {}) as Record<string, string>;
 	const port = parseInt(labels['privos.port'] ?? '0', 10) || 0;
+	const oomKilledAt = info.State?.OOMKilled ? (toEpoch(info.State.FinishedAt) ?? Date.now()) : null;
 	return buildContainer(
 		{
 			labels,
@@ -222,6 +229,7 @@ export function mapInspectToContainer(info: Docker.ContainerInspectInfo, health:
 			mounts: info.Mounts ?? [],
 		},
 		health,
+		oomKilledAt,
 	);
 }
 
@@ -235,9 +243,15 @@ function listHostPortFor(entry: Docker.ContainerInfo, port: number): number | nu
  * PURE mapper: a `docker ps` (`listContainers`) entry + labels → API `Container`.
  * Avoids a per-container inspect on the health-tick hot path. `startedAt`/`stoppedAt`
  * are not exposed by the list API, so they map to null (they drive no cluster logic;
- * the uptime endpoint inspects the one container it needs directly).
+ * the uptime endpoint inspects the one container it needs directly). `oomKilledAt`
+ * overlays the ephemeral in-memory OOM signal the health monitor captured via its
+ * own one-off inspect — `docker ps` itself carries no `State.OOMKilled`.
  */
-export function mapListEntryToContainer(entry: Docker.ContainerInfo, health: HealthCheck = DEFAULT_HEALTH): Container {
+export function mapListEntryToContainer(
+	entry: Docker.ContainerInfo,
+	health: HealthCheck = DEFAULT_HEALTH,
+	oomKilledAt: number | null = null,
+): Container {
 	const labels = (entry.Labels ?? {}) as Record<string, string>;
 	const port = parseInt(labels['privos.port'] ?? '0', 10) || 0;
 	return buildContainer(
@@ -256,5 +270,6 @@ export function mapListEntryToContainer(entry: Docker.ContainerInfo, health: Hea
 			mounts: entry.Mounts ?? [],
 		},
 		health,
+		oomKilledAt,
 	);
 }

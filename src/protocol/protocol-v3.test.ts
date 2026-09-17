@@ -740,3 +740,44 @@ test('the reconfigure command envelope admits the Hub-issued agent-bot pair and 
 		envVars: { ...payload.envVars, PRIVOS_ANYTHING_ELSE: 'value' },
 	}).success, false);
 });
+
+test('the reconfigure command admits an optional size-package resize and keeps its bounds strict', () => {
+	const payload = {
+		...timed(affinity.issuer),
+		type: 'cluster-reconfigure-command',
+		aud: 'privos-apps-master',
+		action: 'RECONFIGURE_RUNTIME',
+		operationId: '33333333-3333-4333-8333-333333333333',
+		clusterId: affinity.clusterId,
+		workspaceId: affinity.workspaceId,
+		deploymentId: affinity.deploymentId,
+		generationId: affinity.generationId,
+		generationNumber: 1,
+		runtimeInstallationId: affinity.runtimeInstallationId,
+		clusterAppId: 'cluster-app-1',
+		mcpAppId: 'mcp-app-1',
+		manifestDigest: contentDigest('c'),
+		resourceManifestHash: affinity.resourceManifestHash,
+		runtimeResourceInventoryHash: affinity.runtimeResourceInventoryHash,
+		authorizationEpoch: 1,
+		configEpoch: 2,
+		envVars: {},
+		secretKeys: [],
+	};
+	// Absent resources — today's environment-only reconfigure — still parses.
+	assert.equal(ClusterReconfigureCommandPayloadV3Schema.safeParse(payload).success, true);
+	// The XL ceiling (4096MB/4cpu) parses; one step past it does not.
+	assert.equal(ClusterReconfigureCommandPayloadV3Schema.safeParse({
+		...payload,
+		resources: { memoryMb: 4096, cpus: 4, tmpSizeMb: 1024 },
+	}).success, true);
+	assert.equal(ClusterReconfigureCommandPayloadV3Schema.safeParse({
+		...payload,
+		resources: { memoryMb: 4097, cpus: 4, tmpSizeMb: 1024 },
+	}).success, false);
+	// resources stays as strict as the envelope it lives in.
+	assert.equal(ClusterReconfigureCommandPayloadV3Schema.safeParse({
+		...payload,
+		resources: { memoryMb: 256, cpus: 0.5, tmpSizeMb: 64, gpuCount: 1 },
+	}).success, false);
+});

@@ -7,7 +7,7 @@ import fp from 'fastify-plugin';
 import { config } from '../config.js';
 import * as dockerState from '../docker/docker-state.js';
 import { containerManager, imageManager } from '../docker/index.js';
-import { getHealth } from '../services/health-monitor.js';
+import { getHealth, getOomKilledAt } from '../services/health-monitor.js';
 import { checkResourceRequest } from '../services/resource-check.js';
 import {
     getImageRegistryAllowlist,
@@ -251,7 +251,7 @@ const appsHandler: FastifyPluginAsync = async (fastify) => {
     // GET /api/v1/apps
     fastify.get('/api/v1/apps', { preHandler: fastify.authenticate }, async (req, reply) => {
         try {
-            const containers = await dockerState.listManaged(getHealth, authorizedWorkspaceId(req));
+            const containers = await dockerState.listManaged(getHealth, authorizedWorkspaceId(req), getOomKilledAt);
             return reply.send(containers);
         } catch (err: any) {
             fastify.log.error({ err }, 'list apps error');

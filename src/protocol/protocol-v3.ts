@@ -195,12 +195,29 @@ export const McpDeploymentGrantPayloadV3Schema = z.object({
 export type McpDeploymentGrantPayloadV3 = z.infer<typeof McpDeploymentGrantPayloadV3Schema>;
 
 /**
+ * A managed-runtime size package's resource envelope. Bounds mirror the
+ * Cluster's own `ResourcesSchema` (agent-side) — max 4096MB/4cpu is the XL
+ * package ceiling, never the wider range a raw (non-managed) deploy allows.
+ */
+export const RuntimeResizeResourcesV3Schema = z.object({
+	memoryMb: z.number().int().min(64).max(4096),
+	cpus: z.number().min(0.1).max(4),
+	tmpSizeMb: z.number().int().min(16).max(1024),
+}).strict();
+
+export type RuntimeResizeResourcesV3 = z.infer<typeof RuntimeResizeResourcesV3Schema>;
+
+/**
  * Configuration-only redeploy of an existing generation.
  *
  * Deliberately NOT a re-issued deployment grant: a grant is bound to a fresh
  * generation identity (reuse raises GENERATION_IDENTITY_REUSED), and nothing
- * about the image, permissions, or resources may move here. The command
- * restates the generation only so the Cluster can bind it to what it holds.
+ * about the image or permissions may move here. The command restates the
+ * generation only so the Cluster can bind it to what it holds. `resources` is
+ * the one exception to "nothing about resources moves": it drives an in-place
+ * resize of the SAME generation/replicas — never a new deployment grant, never
+ * a node migration. Absent `resources` is today's environment-only reconfigure,
+ * byte-identical to before this field existed.
  */
 export const ClusterReconfigureCommandPayloadV3Schema = z.object({
 	...TimedArtifactShape,
@@ -226,6 +243,7 @@ export const ClusterReconfigureCommandPayloadV3Schema = z.object({
 		{ message: 'at most 32 environment values' },
 	),
 	secretKeys: z.array(EnvName).max(32),
+	resources: RuntimeResizeResourcesV3Schema.optional(),
 }).strict().superRefine((value, ctx) => {
 	for (const key of value.secretKeys) {
 		if (!(key in value.envVars)) {

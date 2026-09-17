@@ -4,7 +4,8 @@ import { config } from '../config.js';
 import { SubdomainLabelSchema } from './settings-schemas.js';
 
 export const ResourcesSchema = z.object({
-    memoryMb: z.number().int().min(64).max(2048).default(256),
+    // Max 4096 so an XL managed-runtime size (4096MB/4cpu) deploys and reconfigures.
+    memoryMb: z.number().int().min(64).max(4096).default(256),
     cpus: z.number().min(0.1).max(4).default(0.5),
     tmpSizeMb: z.number().int().min(16).max(1024).default(64),
 });
