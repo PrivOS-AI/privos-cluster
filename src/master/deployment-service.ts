@@ -196,10 +196,14 @@ export class DeploymentService {
 			!/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(grant.deployment.subdomain)
 		) throw new Error('mcp_v3_deployment_subdomain_invalid');
 		return this.deps.locks.run(workspaceId, async () => {
+			// Scoped to this app: a Hub deployment hosts many v3 apps, and matching
+			// on the deployment alone returned a sibling app's row, whose identity
+			// then failed the affinity check as existing_mcp_v3_generation_binding_mismatch.
 			let app: MasterApp | null = await this.deps.repositories.apps.findOne({
 				workspaceId,
 				kind: 'mcp-v3',
 				mcpDeploymentId: grant.deploymentId,
+				appId: grant.deployment.clusterAppId,
 				state: { $ne: 'REMOVED' },
 			});
 			if (app) this.assertMcpV3AppAffinity(app, grant, deploymentGrantHash);
@@ -313,6 +317,7 @@ export class DeploymentService {
 							workspaceId,
 							kind: 'mcp-v3',
 							mcpDeploymentId: grant.deploymentId,
+							appId: grant.deployment.clusterAppId,
 							state: { $ne: 'REMOVED' },
 						});
 						if (!concurrent) {

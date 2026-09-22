@@ -372,16 +372,16 @@ export class McpSecurityVerifier {
 		}
 		let previousGeneration = input.previousGeneration;
 		if (!previousGeneration) {
-			// Generation numbers are per app (the Hub counts them per listing on
-			// one deployment), so the previous generation must be looked up for
-			// the SAME listing. Keyed on the deployment alone, another app's higher
-			// generation on the same Hub refused every fresh install of this one
-			// as GENERATION_IDENTITY_REUSED.
+			// A Hub deployment hosts many apps and numbers generations per app
+			// (`clusterAppId`, the Portal's per-listing deployment app), so the
+			// previous generation must be looked up for the SAME app. Keyed on the
+			// deployment alone, another app's higher generation on the same Hub
+			// refused every fresh install of this one as GENERATION_IDENTITY_REUSED.
 			const previous = await this.repositories.apps.findOne({
 				workspaceId: input.workspaceId,
 				kind: 'mcp-v3',
 				mcpDeploymentId: unverified.deploymentId,
-				listingId: unverified.deployment.listingId,
+				appId: unverified.deployment.clusterAppId,
 				mcpGenerationId: { $ne: unverified.generationId },
 			}, { sort: { mcpGenerationNumber: -1 } });
 			if (

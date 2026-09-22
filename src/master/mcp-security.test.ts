@@ -749,13 +749,13 @@ test('v3 dispatch binds the runtime parent, exact room child, stored grant epoch
 // roxane-dev HRM 1.2.6 (2026-09-22): another app on the same Hub deployment sat
 // at generation 7, and the previous-generation lookup — keyed on the deployment
 // alone — refused HRM's fresh generation 4 as GENERATION_IDENTITY_REUSED.
-test('v3 provisioning grants compare against the previous generation of the SAME listing only', async () => {
+test('v3 provisioning grants compare against the previous generation of the SAME app only', async () => {
 	const clusterId = 'privos-app-cluster';
 	const workspaceId = 'workspace-a';
 	const state = repositories([workspaceId]);
 	const rows = [
-		{ workspaceId, kind: 'mcp-v3', mcpDeploymentId: 'deployment-1', listingId: 'listing-other', mcpGenerationId: 'generation-other', mcpGenerationNumber: 7, mcpRuntimeInstallationId: 'runtime-other' },
-		{ workspaceId, kind: 'mcp-v3', mcpDeploymentId: 'deployment-1', listingId: 'listing-1', mcpGenerationId: 'generation-1', mcpGenerationNumber: 1, mcpRuntimeInstallationId: 'runtime-1' },
+		{ workspaceId, kind: 'mcp-v3', mcpDeploymentId: 'deployment-1', appId: 'cluster-app-other', mcpGenerationId: 'generation-other', mcpGenerationNumber: 7, mcpRuntimeInstallationId: 'runtime-other' },
+		{ workspaceId, kind: 'mcp-v3', mcpDeploymentId: 'deployment-1', appId: 'cluster-app-1', mcpGenerationId: 'generation-1', mcpGenerationNumber: 1, mcpRuntimeInstallationId: 'runtime-1' },
 	];
 	(state.repositories.apps as any).findOne = async (filter: Record<string, any>) => {
 		const matches = rows.filter((row) =>

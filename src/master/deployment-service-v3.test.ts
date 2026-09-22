@@ -430,3 +430,38 @@ test('a duplicate-key collision with no REMOVED row and no live match reports a 
 	assert.equal(state.apps.length, 1);
 	assert.equal(state.apps[0]!.mcpDeploymentId, 'deployment-unrelated');
 });
+
+// roxane-dev HRM 1.2.6 (2026-09-22): the "existing app" lookup was keyed on the
+// Hub deployment alone, so the Demo app's QUARANTINED row was taken for HRM's
+// and failed the affinity check as existing_mcp_v3_generation_binding_mismatch.
+test('a second v3 app on the same Hub deployment is not mistaken for the first one', async () => {
+	const state = fixture();
+	const deploymentGrant = grant();
+	const deploymentGrantHash = 'g'.repeat(43);
+	state.apps.push({
+		_id: 'oid-sibling',
+		appId: 'cluster-app-other',
+		listingId: 'listing-other',
+		workspaceId: 'workspace-1',
+		kind: 'mcp-v3',
+		state: 'QUARANTINED',
+		replicas: [],
+		mcpDeploymentId: 'deployment-1',
+		mcpGenerationId: 'generation-other',
+		mcpGenerationNumber: 7,
+		mcpRuntimeInstallationId: 'runtime-other',
+	} as unknown as MasterApp);
+
+	// Same terminal point as every other deploy in this fixture (no agent) — the
+	// sibling row must not stop the install before it gets there.
+	await assert.rejects(
+		state.service.deployMcpV3('workspace-1', deploymentGrant, deploymentGrantHash, state.hubIdentity),
+		/agent MCP v3 deploy failed/,
+	);
+
+	assert.equal(state.apps.length, 2);
+	const own = state.apps.find((row) => row.appId === deploymentGrant.deployment.clusterAppId);
+	assert.equal(own?.state, 'PROVISIONING');
+	assert.equal(own?.mcpGenerationId, deploymentGrant.generationId);
+	assert.equal(state.apps.find((row) => row.appId === 'cluster-app-other')?.state, 'QUARANTINED');
+});
