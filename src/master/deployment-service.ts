@@ -51,6 +51,21 @@ const DeploySchema = z.object({
 	stateless: z.boolean().default(false),
 });
 
+/**
+ * The slot a live v3 app occupies, unique per workspace. A Hub deployment
+ * hosts many apps, so the slot is the deployment AND the app: keyed on the
+ * deployment alone, the unique index refused every second app on a Hub as
+ * DUPLICATE_APP_ROW.
+ */
+export function mcpActiveDeploymentKeyV3(grant: McpDeploymentGrantPayloadV3): string {
+	return `${grant.deploymentId}:${grant.deployment.clusterAppId}`;
+}
+
+/** Rows written before the key carried the app id hold the bare deployment id. */
+export function mcpActiveDeploymentKeyMatchesV3(stored: string | undefined, grant: McpDeploymentGrantPayloadV3): boolean {
+	return stored === mcpActiveDeploymentKeyV3(grant) || stored === grant.deploymentId;
+}
+
 export class DeploymentService {
 	constructor(private readonly deps: {
 		repositories: MasterRepositories;
@@ -264,7 +279,7 @@ export class DeploymentService {
 					kind: 'mcp-v3',
 					protocolVersion: 3,
 					mcpDeploymentId: grant.deploymentId,
-					mcpActiveDeploymentKey: grant.deploymentId,
+					mcpActiveDeploymentKey: mcpActiveDeploymentKeyV3(grant),
 					mcpGenerationId: grant.generationId,
 					mcpGenerationNumber: grant.generationNumber,
 					mcpRuntimeInstallationId: grant.runtimeInstallationId,
@@ -1282,7 +1297,7 @@ export class DeploymentService {
 	): void {
 		if (
 			app.appId !== grant.deployment.clusterAppId ||
-			app.mcpActiveDeploymentKey !== grant.deploymentId ||
+			!mcpActiveDeploymentKeyMatchesV3(app.mcpActiveDeploymentKey, grant) ||
 			app.mcpGenerationId !== grant.generationId ||
 			app.mcpGenerationNumber !== grant.generationNumber ||
 			app.mcpRuntimeInstallationId !== grant.runtimeInstallationId ||

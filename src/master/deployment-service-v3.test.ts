@@ -3,7 +3,7 @@ import crypto from 'node:crypto';
 import test from 'node:test';
 
 import { jwkThumbprint, sha256Base64Url } from '../security/artifacts.js';
-import { DeploymentService } from './deployment-service.js';
+import { DeploymentService, mcpActiveDeploymentKeyMatchesV3, mcpActiveDeploymentKeyV3 } from './deployment-service.js';
 import { KeyCipher } from './key-crypto.js';
 import type { McpDeploymentGrantPayloadV3 } from '../protocol/protocol-v3.js';
 import type { AppLifecycleEvent, MasterApp, MasterNode, RuntimeResourceInventory } from './types.js';
@@ -75,6 +75,13 @@ function fixture() {
 			// an immutable `_id`.
 			row._id = row._id ?? `oid-${apps.length + 1}`;
 			if (apps.some((candidate) => candidate.appId === row.appId)) throw Object.assign(new Error('duplicate'), { code: 11000 });
+			// The partial unique index on { workspaceId, mcpActiveDeploymentKey } — the
+			// one a second v3 app on the same Hub used to hit while the key was the
+			// bare deployment id.
+			if (
+				typeof row.mcpActiveDeploymentKey === 'string' &&
+				apps.some((candidate) => candidate.workspaceId === row.workspaceId && candidate.mcpActiveDeploymentKey === row.mcpActiveDeploymentKey)
+			) throw Object.assign(new Error('duplicate'), { code: 11000 });
 			apps.push(clone(row));
 			return { acknowledged: true };
 		},
@@ -252,7 +259,7 @@ test('v3 provisioning persists exact partial resources, resumes deterministicall
 	assert.equal(state.apps[0]!.replicas.length, 1);
 	assert.equal(state.apps[0]!.mcpProvisioningReplicas?.length, 2);
 	assert.equal(state.apps[0]!.mcpRoomBindingCount, 0);
-	assert.equal(state.apps[0]!.mcpActiveDeploymentKey, 'deployment-1');
+	assert.equal(state.apps[0]!.mcpActiveDeploymentKey, 'deployment-1:cluster-app-1');
 	assert.equal((state.apps[0] as any).approvedPermissionCeiling, undefined);
 	assert.deepEqual(
 		Object.keys(state.apps[0]!).filter((key) => key.toLowerCase().includes('permission')),
@@ -447,6 +454,8 @@ test('a second v3 app on the same Hub deployment is not mistaken for the first o
 		state: 'QUARANTINED',
 		replicas: [],
 		mcpDeploymentId: 'deployment-1',
+		// Written before the slot key carried the app id: the bare deployment id.
+		mcpActiveDeploymentKey: 'deployment-1',
 		mcpGenerationId: 'generation-other',
 		mcpGenerationNumber: 7,
 		mcpRuntimeInstallationId: 'runtime-other',
@@ -463,5 +472,15 @@ test('a second v3 app on the same Hub deployment is not mistaken for the first o
 	const own = state.apps.find((row) => row.appId === deploymentGrant.deployment.clusterAppId);
 	assert.equal(own?.state, 'PROVISIONING');
 	assert.equal(own?.mcpGenerationId, deploymentGrant.generationId);
+	assert.equal(own?.mcpActiveDeploymentKey, 'deployment-1:cluster-app-1');
 	assert.equal(state.apps.find((row) => row.appId === 'cluster-app-other')?.state, 'QUARANTINED');
+});
+
+test('the active-deployment slot key is per app, and a row written with the bare deployment id still matches its own grant', () => {
+	const deploymentGrant = grant();
+	assert.equal(mcpActiveDeploymentKeyV3(deploymentGrant), 'deployment-1:cluster-app-1');
+	assert.equal(mcpActiveDeploymentKeyMatchesV3('deployment-1:cluster-app-1', deploymentGrant), true);
+	assert.equal(mcpActiveDeploymentKeyMatchesV3('deployment-1', deploymentGrant), true);
+	assert.equal(mcpActiveDeploymentKeyMatchesV3('deployment-1:cluster-app-other', deploymentGrant), false);
+	assert.equal(mcpActiveDeploymentKeyMatchesV3(undefined, deploymentGrant), false);
 });
