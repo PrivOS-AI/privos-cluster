@@ -745,3 +745,46 @@ test('v3 dispatch binds the runtime parent, exact room child, stored grant epoch
 		(error: unknown) => (error as { code?: string }).code === 'GENERATION_AFFINITY_MISMATCH',
 	);
 });
+
+// roxane-dev HRM 1.2.6 (2026-09-22): another app on the same Hub deployment sat
+// at generation 7, and the previous-generation lookup — keyed on the deployment
+// alone — refused HRM's fresh generation 4 as GENERATION_IDENTITY_REUSED.
+test('v3 provisioning grants compare against the previous generation of the SAME listing only', async () => {
+	const clusterId = 'privos-app-cluster';
+	const workspaceId = 'workspace-a';
+	const state = repositories([workspaceId]);
+	const rows = [
+		{ workspaceId, kind: 'mcp-v3', mcpDeploymentId: 'deployment-1', listingId: 'listing-other', mcpGenerationId: 'generation-other', mcpGenerationNumber: 7, mcpRuntimeInstallationId: 'runtime-other' },
+		{ workspaceId, kind: 'mcp-v3', mcpDeploymentId: 'deployment-1', listingId: 'listing-1', mcpGenerationId: 'generation-1', mcpGenerationNumber: 1, mcpRuntimeInstallationId: 'runtime-1' },
+	];
+	(state.repositories.apps as any).findOne = async (filter: Record<string, any>) => {
+		const matches = rows.filter((row) =>
+			Object.entries(filter).every(([field, expected]) => {
+				const value = (row as Record<string, unknown>)[field];
+				return expected && typeof expected === 'object' && '$ne' in expected ? value !== expected.$ne : value === expected;
+			}),
+		);
+		return matches.sort((a, b) => b.mcpGenerationNumber - a.mcpGenerationNumber)[0] ?? null;
+	};
+	const verifier = new McpSecurityVerifier(state.repositories, clusterId);
+	const key = identity();
+	await verifier.enrollHubIdentity({
+		workspaceId,
+		publicJwk: key.publicJwk,
+		compact: enrollmentProof({ clusterId, workspaceId, deploymentId: 'deployment-1', key }),
+	});
+
+	const accepted = await verifier.consumeProvisioningDeploymentGrantV3({
+		compact: deploymentGrantV3({ clusterId, workspaceId, key, generationId: 'generation-2', generationNumber: 2, runtimeInstallationId: 'runtime-2' }),
+		workspaceId,
+	});
+	assert.equal(accepted.generationNumber, 2);
+
+	await assert.rejects(
+		verifier.consumeProvisioningDeploymentGrantV3({
+			compact: deploymentGrantV3({ clusterId, workspaceId, key, generationId: 'generation-0', generationNumber: 1, runtimeInstallationId: 'runtime-0' }),
+			workspaceId,
+		}),
+		(error: unknown) => (error as { code?: string }).code === 'GENERATION_IDENTITY_REUSED',
+	);
+});
