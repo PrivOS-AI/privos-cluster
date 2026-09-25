@@ -66,6 +66,13 @@ export interface MasterNode {
 	 * INGRESS node at a RUNTIME node without a public hop. Absent on a node
 	 * that predates public-hostnames. */
 	meshIp?: string;
+	/** Ed25519 public key an INGRESS/BOTH node signs its forwarded requests
+	 * with (generated locally at PROXY_INGRESS_SIGNING_KEY_PATH, registered
+	 * here at edge setup). The publisher distributes this to RUNTIME nodes so a
+	 * runtime listener can verify a forward. Distinct from mcpIdentity, which
+	 * attests containers, not proxy hops. */
+	ingressSigningKid?: string;
+	ingressSigningPublicJwk?: JsonWebKey;
 }
 
 export interface AppReplica {

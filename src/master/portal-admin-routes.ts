@@ -58,6 +58,14 @@ const NodeSchema = z.object({
 	// only ever ran app containers) — the Portal sends both for an APPS node.
 	role: z.enum(['INGRESS', 'RUNTIME', 'BOTH']).optional(),
 	meshIp: z.string().min(1).max(64).optional(),
+	// The INGRESS/BOTH node's own Ed25519 signing public key, generated locally
+	// at edge setup and registered here so the publisher can hand it to RUNTIME
+	// nodes as the key that verifies a forwarded request.
+	ingressSigningKid: z.string().min(1).max(128).optional(),
+	ingressSigningPublicJwk: z
+		.object({ kty: z.literal('OKP'), crv: z.literal('Ed25519'), x: z.string().min(1) })
+		.passthrough()
+		.optional(),
 });
 
 const SlugSchema = z.object({ slug: z.string().regex(/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/) });

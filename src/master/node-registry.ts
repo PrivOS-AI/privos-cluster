@@ -1,3 +1,4 @@
+import type { JsonWebKey } from 'node:crypto';
 import type { MasterRepositories } from './repositories.js';
 import { KeyCipher } from './key-crypto.js';
 import type { MasterNode, NodeCapacity, NodeRole, NodeStatus } from './types.js';
@@ -22,6 +23,8 @@ export class NodeRegistry {
 		/** Absent = RUNTIME (today's every-node default; see `MasterNode.role`). */
 		role?: NodeRole;
 		meshIp?: string;
+		ingressSigningKid?: string;
+		ingressSigningPublicJwk?: JsonWebKey;
 	}): Promise<void> {
 		const now = new Date();
 		await this.repositories.nodes.updateOne(
@@ -39,6 +42,8 @@ export class NodeRegistry {
 					status: input.status ?? 'ACTIVE',
 					...(input.role ? { role: input.role } : {}),
 					...(input.meshIp ? { meshIp: input.meshIp } : {}),
+					...(input.ingressSigningKid ? { ingressSigningKid: input.ingressSigningKid } : {}),
+					...(input.ingressSigningPublicJwk ? { ingressSigningPublicJwk: input.ingressSigningPublicJwk } : {}),
 					updatedAt: now,
 				},
 				$setOnInsert: { createdAt: now },

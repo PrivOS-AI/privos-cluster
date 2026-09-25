@@ -176,9 +176,13 @@ export class HostTablePublisher {
 		const hostsByApp = new Map<string, typeof hosts>();
 		for (const host of hosts) hostsByApp.set(host.appId, [...(hostsByApp.get(host.appId) ?? []), host]);
 
-		const signingKeys: IngressSigningKey[] = runtimeNodes.flatMap((node) =>
-			node.mcpIdentityKid && node.mcpIdentityPublicJwk
-				? [{ nodeId: node.nodeId, kid: node.mcpIdentityKid, publicJwk: node.mcpIdentityPublicJwk }]
+		// A runtime listener verifies a request SIGNED BY AN INGRESS NODE, so it
+		// needs the ingress nodes' own signing keys, keyed by the kid the ingress
+		// actually puts on the wire (its PROXY_INGRESS_SIGNING_KEY_PATH key) — not
+		// the mcpIdentity key, which attests containers and never signs a hop.
+		const signingKeys: IngressSigningKey[] = ingressNodes.flatMap((node) =>
+			node.ingressSigningKid && node.ingressSigningPublicJwk
+				? [{ nodeId: node.nodeId, kid: node.ingressSigningKid, publicJwk: node.ingressSigningPublicJwk }]
 				: []);
 
 		const rules: IngressRule[] = [];

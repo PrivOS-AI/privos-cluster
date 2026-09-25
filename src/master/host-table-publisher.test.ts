@@ -201,3 +201,34 @@ test('an ingress rule marks a non-RUNNING app suspended, and a workspace-suspend
 	const rule = ingressCall.body.rules.find((r: { host: string }) => r.host === 'app-1.privos.link');
 	assert.equal(rule.suspended, true);
 });
+
+test('the ingress table distributes an INGRESS node\'s own ingress signing key — never its mcpIdentity key', async () => {
+	const { publisher, nodes, apps, calls } = fixture();
+	// A BOTH node that carries BOTH keys: mcpIdentity (attests containers) and
+	// the ingress signing key (signs a forwarded hop). The runtime verifies a
+	// FORWARD, so only the ingress key must be distributed — using mcpIdentity
+	// here would 403 every real request (the kid on the wire would not match).
+	nodes.push(node({
+		nodeId: 'app-eu-01', role: 'BOTH', meshIp: '10.88.0.11',
+		mcpIdentityKid: 'mcp-identity-kid', mcpIdentityPublicJwk: { kty: 'OKP', crv: 'Ed25519', x: 'MCP_IDENTITY' },
+		ingressSigningKid: 'ingress-kid', ingressSigningPublicJwk: { kty: 'OKP', crv: 'Ed25519', x: 'INGRESS_KEY' },
+	}));
+	apps.push(app({ replicas: [{ replicaId: 'r-1', nodeId: 'app-eu-01', containerId: 'c-1', state: 'running' }] }));
+
+	await publisher.publishOnce();
+	const ingressCall = calls.find((call) => call.path.includes('/ingress'))!;
+	assert.deepEqual(ingressCall.body.signingKeys, [
+		{ nodeId: 'app-eu-01', kid: 'ingress-kid', publicJwk: { kty: 'OKP', crv: 'Ed25519', x: 'INGRESS_KEY' } },
+	]);
+	const kids = ingressCall.body.signingKeys.map((k: { kid: string }) => k.kid);
+	assert.ok(!kids.includes('mcp-identity-kid'), 'mcpIdentity key must never be distributed as an ingress verification key');
+});
+
+test('an INGRESS node without a registered ingress signing key contributes no verification key', async () => {
+	const { publisher, nodes, apps, calls } = fixture();
+	nodes.push(node({ nodeId: 'app-eu-01', role: 'BOTH', meshIp: '10.88.0.11', mcpIdentityKid: 'mcp-kid', mcpIdentityPublicJwk: { kty: 'OKP', crv: 'Ed25519', x: 'MCP' } }));
+	apps.push(app({ replicas: [{ replicaId: 'r-1', nodeId: 'app-eu-01', containerId: 'c-1', state: 'running' }] }));
+	await publisher.publishOnce();
+	const ingressCall = calls.find((call) => call.path.includes('/ingress'))!;
+	assert.deepEqual(ingressCall.body.signingKeys, []);
+});
