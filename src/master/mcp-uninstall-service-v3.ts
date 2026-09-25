@@ -23,6 +23,8 @@ import {
 } from '../protocol/protocol-v3.js';
 import { canonicalJson, sha256Base64Url } from '../security/artifacts.js';
 import type { ClusterLifecycleOperation, MasterNode, RuntimeResourceInventory } from './types.js';
+import type { AppHostRegistry } from './app-host-registry.js';
+import type { HostTablePublisher } from './host-table-publisher.js';
 
 type NodeCleanupOutcome = {
 	kind: string;
@@ -74,6 +76,9 @@ export class McpUninstallServiceV3 {
 			ingress: IngressRouteProgrammer;
 			clusterMasterIdentity: ClusterMasterIdentity;
 			clusterId: string;
+			/** E: its own uninstall step, run once this operation reaches COMPLETED. Optional so an unwired caller is unaffected. */
+			appHosts?: AppHostRegistry;
+			hostTablePublisher?: HostTablePublisher;
 		},
 	) {}
 
@@ -189,6 +194,12 @@ export class McpUninstallServiceV3 {
 				{ appId: command.clusterAppId, workspaceId: command.workspaceId },
 				{ $set: { state: 'REMOVED', updatedAt: new Date() }, $unset: { mcpActiveDeploymentKey: '' } },
 			);
+			// E: its own uninstall step, run for whatever this generation's
+			// inventory actually contains — scoped to `generationId` so a
+			// reinstall of the same `appId` under a NEW generation keeps that
+			// generation's hosts.
+			await this.deps.appHosts?.removeAllAppHosts(command.clusterAppId, command.generationId);
+			this.deps.hostTablePublisher?.markDirty();
 		}
 		return {
 			state,

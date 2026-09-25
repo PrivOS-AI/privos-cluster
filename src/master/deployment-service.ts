@@ -27,6 +27,7 @@ import {
 	finalizeRuntimeResourceInventoryV3,
 	normalizeRuntimeResourcesV3,
 } from './runtime-resource-inventory.js';
+import type { AppHostRegistry } from './app-host-registry.js';
 
 const DeploySchema = z.object({
 	appId: z.string().min(1).max(128).optional(),
@@ -76,6 +77,27 @@ export class DeploymentService {
 		locks: WorkspaceLock;
 		baseDomain: string;
 		cipher: KeyCipher;
+		/** MCP_V3_NO_DEFAULT_HOST === 'on': a v3 create with no Hub-chosen
+		 * subdomain allocates NO label at all, rather than the legacy random one.
+		 * Default false (flag off) is byte-identical to pre-phase-3 behaviour. */
+		noDefaultHost?: boolean;
+		/** MCP_EMIT_APP_PUBLIC_URL === 'on' (default false/undefined): emit the
+		 * renamed PRIVOS_APP_PUBLIC_URL at all. Default OFF is byte-identical to
+		 * pre-phase-3 behaviour — control (master) and gen (agent) nodes deploy
+		 * separately and non-atomically, and an older agent's PlatformEnvNameSchema
+		 * enum 400s on a key it does not recognize, so this stays off until every
+		 * agent has rolled (operator flips it on in phase 7). */
+		emitAppPublicUrl?: boolean;
+		/** MCP_LEGACY_PUBLIC_URL_ALIAS === 'on' (default true): while
+		 * `emitAppPublicUrl` is also on, also emit the pre-rename PRIVOS_PUBLIC_URL
+		 * alongside PRIVOS_APP_PUBLIC_URL (D18) with the same value. Irrelevant
+		 * (PRIVOS_PUBLIC_URL is emitted regardless) while `emitAppPublicUrl` is off. */
+		legacyPublicUrlAlias?: boolean;
+		/** D-requirement host registry. Optional so every existing/unwired
+		 * caller (tests, a fleet that has not deployed phase 3's registry) is
+		 * unaffected — its absence just means the env builder falls back to
+		 * `app.subdomain`, exactly as it always has. */
+		appHosts?: AppHostRegistry;
 	}) {}
 
 	async deploy(workspaceId: string, raw: unknown): Promise<MasterApp> {
@@ -249,7 +271,13 @@ export class DeploymentService {
 					replicas: replicaCount,
 				});
 				const now = new Date();
-				const subdomain = grant.deployment.subdomain ?? await this.deps.subdomains.allocate(input.listingId);
+				// MCP_V3_NO_DEFAULT_HOST: an app the Hub deploys with no explicit
+				// subdomain gets NO label at all when the flag is on — the D-registry
+				// (`AppHostRegistry`) owns host allocation for it instead. Flag off
+				// (default) is byte-identical to pre-phase-3 behaviour: always
+				// allocate the legacy random label.
+				const subdomain = grant.deployment.subdomain
+					?? (this.deps.noDefaultHost ? undefined : await this.deps.subdomains.allocate(input.listingId, workspaceId));
 				// Operator secrets never rest in the clear in the master DB: only
 				// the non-secret half is queryable, the rest is sealed with the
 				// same master key that protects node and identity material.
@@ -269,8 +297,7 @@ export class DeploymentService {
 					storageBytes,
 					availabilityTier: input.availabilityTier as AvailabilityTier,
 					stateless: input.stateless,
-					subdomain,
-					uiUrl: `https://${subdomain}.${this.deps.baseDomain}`,
+					...(subdomain ? { subdomain, uiUrl: `https://${subdomain}.${this.deps.baseDomain}` } : {}),
 					secretEnvKeys: sealed.secretEnvKeys,
 					appliedConfigEpoch: grant.configEpoch ?? 1,
 					appliedConfigAt: now,
@@ -309,7 +336,24 @@ export class DeploymentService {
 				try {
 					await this.deps.repositories.apps.insertOne(app);
 				} catch (error: unknown) {
-					if ((error as { code?: number }).code !== 11000) throw error;
+					const mongoError = error as { code?: number; keyPattern?: Record<string, unknown> };
+					if (mongoError.code !== 11000) throw error;
+					// Two different unique indexes can raise this same E11000: `appId`
+					// (a reinstall landing on the slot a prior uninstall tombstoned —
+					// the revive path below) and `subdomain` (an explicit Hub-chosen
+					// label another workspace/app already owns or tombstoned forever,
+					// D10). Only the FIRST is a revive; the second is a genuine
+					// allocation conflict the Hub must pick a new label for, and must
+					// never be papered over as a duplicate-app-row retry. `keyPattern`
+					// is undefined on a fake/older driver error — that case falls
+					// through to the pre-existing revive logic unchanged.
+					if (mongoError.keyPattern && 'subdomain' in mongoError.keyPattern && !('appId' in mongoError.keyPattern)) {
+						throw Object.assign(new Error('mcp_v3_deployment_subdomain_conflict'), {
+							code: 'mcp_v3_deployment_subdomain_conflict',
+							statusCode: 409,
+							cause: error,
+						});
+					}
 					// Uninstall retains the row at REMOVED, and the Portal reuses one
 					// `deploymentAppId` per (listing, deployment) slot — so the appId of a
 					// reinstall always equals that of the removed install and collides on the
@@ -323,10 +367,39 @@ export class DeploymentService {
 					// `_id` — error 66, a 500 to the Hub, and an install stranded at
 					// PROVISIONING. Every reinstall-after-uninstall hit it.
 					const { _id: _insertStampedId, ...replacement } = app as MasterApp & { _id?: unknown };
-					const revived = await this.deps.repositories.apps.replaceOne(
-						{ appId: app.appId, state: 'REMOVED' },
-						replacement as MasterApp,
-					);
+					let revived: { matchedCount: number };
+					try {
+						revived = await this.deps.repositories.apps.replaceOne(
+							{ appId: app.appId, state: 'REMOVED' },
+							replacement as MasterApp,
+						);
+					} catch (replaceError: unknown) {
+						// L8: the tombstone-revive `replaceOne` writes the FULL new
+						// document — including its own `subdomain` — which can collide
+						// with a live/tombstoned row elsewhere even though the `appId`
+						// match above succeeded. Left uncaught, this was a raw driver
+						// E11000 reaching the Hub as an unhandled 500; tell it apart from
+						// a genuine duplicate-app-row the same way the initial insert
+						// does, falling back to a direct existence check when the driver
+						// error carries no `keyPattern` (a fake/older driver).
+						const replaceMongoError = replaceError as { code?: number; keyPattern?: Record<string, unknown> };
+						if (replaceMongoError.code === 11000) {
+							const isSubdomainCollision = replaceMongoError.keyPattern
+								? 'subdomain' in replaceMongoError.keyPattern && !('appId' in replaceMongoError.keyPattern)
+								: Boolean(app.subdomain) && Boolean(await this.deps.repositories.apps.findOne({
+									subdomain: app.subdomain,
+									appId: { $ne: app.appId },
+								}));
+							if (isSubdomainCollision) {
+								throw Object.assign(new Error('mcp_v3_deployment_subdomain_conflict'), {
+									code: 'mcp_v3_deployment_subdomain_conflict',
+									statusCode: 409,
+									cause: replaceError,
+								});
+							}
+						}
+						throw replaceError;
+					}
 					if (revived.matchedCount !== 1) {
 						const concurrent = await this.deps.repositories.apps.findOne({
 							workspaceId,
@@ -410,9 +483,9 @@ export class DeploymentService {
 							...input,
 							appId: grant.deployment.clusterAppId,
 							workspaceId,
-							subdomain: app.subdomain,
+							subdomain: app.subdomain ?? null,
 							domain: this.deps.baseDomain,
-							platformEnvVars: this.platformEnvVarsV3(app.subdomain),
+							platformEnvVars: await this.platformEnvVarsV3(app),
 							secretEnvKeys: app.secretEnvKeys ?? [],
 							mcpV3Binding: {
 								protocolVersion: 3,
@@ -467,23 +540,36 @@ export class DeploymentService {
 			}
 
 			app = (await this.deps.repositories.apps.findOne({ appId: app.appId, workspaceId })) ?? app;
-			const ingressResource: RuntimeResourceDescriptorV3 = {
-				kind: 'INGRESS',
-				resourceId: `route-${sha256Base64Url(`${app.subdomain}.${this.deps.baseDomain}`)}`,
-				ownershipScope: 'INSTALLATION_GENERATION',
-				nodeId: null,
-				replicaId: null,
-				// `subdomain` is what teardown hands to the route programmer;
-				// without it the uninstall's ingress removal could never run
-				// (it used to read a key this descriptor never carried).
-				attributes: { host: `${app.subdomain}.${this.deps.baseDomain}`, subdomain: app.subdomain },
-			};
+			// PHASE1-GATE (phase-1 check 3 in the plan): whether the Hub accepts an
+			// inventory with no INGRESS resource at all is an open spike gate. The
+			// safe default taken here is to omit the descriptor entirely when the
+			// generation has no label — declaring one from an absent `app.subdomain`
+			// would hash the literal string "undefined.privos.link" into the
+			// inventory, which is exactly the class of bug this phase exists to
+			// close. `finalizeRuntimeResourceInventoryV3` only requires >=1 total
+			// resource, which every generation's REPLICA/CONTAINER pair already
+			// satisfies, so this never produces an empty inventory.
+			const ingressResource: RuntimeResourceDescriptorV3 | undefined = app.subdomain
+				? {
+					kind: 'INGRESS',
+					resourceId: `route-${sha256Base64Url(`${app.subdomain}.${this.deps.baseDomain}`)}`,
+					ownershipScope: 'INSTALLATION_GENERATION',
+					nodeId: null,
+					replicaId: null,
+					// `subdomain` is what teardown hands to the route programmer;
+					// without it the uninstall's ingress removal could never run
+					// (it used to read a key this descriptor never carried).
+					attributes: { host: `${app.subdomain}.${this.deps.baseDomain}`, subdomain: app.subdomain },
+				}
+				: undefined;
 
 			if (inventory.state === 'CAPTURING') {
-				await this.deps.repositories.runtimeResourceInventories.updateOne(
-					{ inventoryId, state: 'CAPTURING' },
-					{ $addToSet: { expectedResources: ingressResource }, $set: { updatedAt: new Date() } },
-				);
+				if (ingressResource) {
+					await this.deps.repositories.runtimeResourceInventories.updateOne(
+						{ inventoryId, state: 'CAPTURING' },
+						{ $addToSet: { expectedResources: ingressResource }, $set: { updatedAt: new Date() } },
+					);
+				}
 				inventory = (await this.deps.repositories.runtimeResourceInventories.findOne({ inventoryId }))!;
 				const finalized = finalizeRuntimeResourceInventoryV3(
 					inventory,
@@ -510,7 +596,7 @@ export class DeploymentService {
 			}
 			const resourcesPersistedOnApp = normalizeRuntimeResourcesV3([
 				...app.replicas.flatMap((replica) => replica.mcpV3Resources ?? []),
-				ingressResource,
+				...(ingressResource ? [ingressResource] : []),
 			]);
 			if (
 				app.replicas.length !== plans.length ||
@@ -590,7 +676,10 @@ export class DeploymentService {
 				status: 'ACTIVE',
 			}).toArray();
 			if (nodes.length !== app.replicas.length) throw new Error('mcp_replica_node_missing');
-			await this.deps.ingress.upsert(app.subdomain, nodes);
+			// No label (MCP_V3_NO_DEFAULT_HOST) means nothing for the legacy
+			// CNAME/route programmer to point anywhere — the D-registry + async CF
+			// worker own real routing for this generation instead.
+			if (app.subdomain) await this.deps.ingress.upsert(app.subdomain, nodes);
 			const establishedAt = new Date();
 			const activated = await this.deps.repositories.apps.updateOne(
 				{ appId: app.appId, workspaceId, state: 'QUARANTINED' },
@@ -611,9 +700,9 @@ export class DeploymentService {
 		});
 	}
 
-	/** The public origin of a managed runtime; also what the app sees as PRIVOS_PUBLIC_URL. */
-	publicUrlFor(subdomain: string): string {
-		return `https://${subdomain}.${this.deps.baseDomain}`;
+	/** The public origin of a managed runtime; also what the app sees as PRIVOS_APP_PUBLIC_URL. Absent primary → undefined (D9), never `undefined.<domain>`. */
+	publicUrlFor(subdomain: string | undefined): string | undefined {
+		return subdomain ? `https://${subdomain}.${this.deps.baseDomain}` : undefined;
 	}
 
 	/**
@@ -682,16 +771,21 @@ export class DeploymentService {
 						});
 					}
 				}
-				const ingressResource: RuntimeResourceDescriptorV3 = {
-					kind: 'INGRESS',
-					resourceId: `route-${sha256Base64Url(`${app.subdomain}.${this.deps.baseDomain}`)}`,
-					ownershipScope: 'INSTALLATION_GENERATION',
-					nodeId: null,
-					replicaId: null,
-					attributes: { host: `${app.subdomain}.${this.deps.baseDomain}`, subdomain: app.subdomain },
-				};
-				if (!present.has(`${ingressResource.kind}\0${ingressResource.resourceId}`)) {
-					additions.push(ingressResource);
+				// PHASE1-GATE — same open spike gate as the install path above: a
+				// host-less generation (MCP_V3_NO_DEFAULT_HOST) declares no INGRESS
+				// resource at all rather than one hashing "undefined.<domain>".
+				if (app.subdomain) {
+					const ingressResource: RuntimeResourceDescriptorV3 = {
+						kind: 'INGRESS',
+						resourceId: `route-${sha256Base64Url(`${app.subdomain}.${this.deps.baseDomain}`)}`,
+						ownershipScope: 'INSTALLATION_GENERATION',
+						nodeId: null,
+						replicaId: null,
+						attributes: { host: `${app.subdomain}.${this.deps.baseDomain}`, subdomain: app.subdomain },
+					};
+					if (!present.has(`${ingressResource.kind}\0${ingressResource.resourceId}`)) {
+						additions.push(ingressResource);
+					}
 				}
 				const finalized = finalizeRuntimeResourceInventoryV3(
 					inventory,
@@ -732,12 +826,46 @@ export class DeploymentService {
 	 * Injected here rather than carried in the Hub's grant on purpose: the
 	 * PRIVOS_ namespace is refused on every grant-supplied env map, so a value
 	 * bearing these names can only have come from the Cluster.
+	 *
+	 * D18/M5: emission matrix, D9's "no primary host → neither key, never
+	 * `undefined`" applying to every cell —
+	 *   - `emitAppPublicUrl` off (default, byte-identical to pre-rename): only
+	 *     `PRIVOS_PUBLIC_URL`. Control (master) and gen (agent) nodes deploy
+	 *     separately and non-atomically, so a rolled-ahead master emitting the
+	 *     new key unconditionally would 400 every v3 deploy/reconfigure/upgrade
+	 *     against an older agent whose `PlatformEnvNameSchema` enum does not
+	 *     accept it yet — this flag exists precisely to prevent that.
+	 *   - `emitAppPublicUrl` on + `legacyPublicUrlAlias` on (default): both keys,
+	 *     same value.
+	 *   - `emitAppPublicUrl` on + `legacyPublicUrlAlias` off: only the renamed
+	 *     `PRIVOS_APP_PUBLIC_URL`.
 	 */
-	private platformEnvVarsV3(subdomain: string): Record<string, string> {
+	private async platformEnvVarsV3(app: MasterApp): Promise<Record<string, string>> {
+		const primaryUrl = await this.resolvePrimaryUrl(app);
+		const emitAppPublicUrl = this.deps.emitAppPublicUrl === true;
+		const emitLegacyAlias = this.deps.legacyPublicUrlAlias !== false;
 		return {
-			PRIVOS_PUBLIC_URL: this.publicUrlFor(subdomain),
+			...(primaryUrl
+				? {
+					...(emitAppPublicUrl ? { PRIVOS_APP_PUBLIC_URL: primaryUrl } : {}),
+					...(!emitAppPublicUrl || emitLegacyAlias ? { PRIVOS_PUBLIC_URL: primaryUrl } : {}),
+				}
+				: {}),
 			PRIVOS_ACCESS_MODE: 'managed-runtime',
 		};
+	}
+
+	/**
+	 * D: "At v3 create, the env builder reads the primary from the registry."
+	 * Falls back to `app.subdomain` whenever the D-registry is not wired
+	 * (existing/pre-phase-3 deployments) — byte-identical to today's builder.
+	 */
+	private async resolvePrimaryUrl(app: MasterApp): Promise<string | undefined> {
+		if (this.deps.appHosts) {
+			const primary = await this.deps.appHosts.primaryOf(app.workspaceId, app.appId);
+			if (primary) return `https://${primary._id}`;
+		}
+		return this.publicUrlFor(app.subdomain);
 	}
 
 	/**
@@ -852,6 +980,7 @@ export class DeploymentService {
 
 			const sealed = this.sealOperatorEnv(command.envVars, command.secretKeys);
 			const secretKeys = sealed.secretEnvKeys;
+			const platformEnvVars = await this.platformEnvVarsV3(app);
 
 			const agentBody = (node: MasterNode, replica: AppReplica, resources: ContainerResources) => ({
 				appId: app.appId,
@@ -864,12 +993,12 @@ export class DeploymentService {
 				port: app.port,
 				resources,
 				envVars: command.envVars,
-				platformEnvVars: this.platformEnvVarsV3(app.subdomain),
+				platformEnvVars,
 				secretEnvKeys: secretKeys,
 				volumes: app.volumes,
 				availabilityTier: app.availabilityTier,
 				stateless: app.stateless,
-				subdomain: app.subdomain,
+				subdomain: app.subdomain ?? null,
 				domain: this.deps.baseDomain,
 				configEpoch: command.configEpoch,
 				runtimeResourceInventoryHash: command.runtimeResourceInventoryHash,
@@ -1065,7 +1194,7 @@ export class DeploymentService {
 			}
 
 			const envVars = this.operatorEnvOf(app);
-			const platformEnvVars = this.platformEnvVarsV3(app.subdomain);
+			const platformEnvVars = await this.platformEnvVarsV3(app);
 			const secretEnvKeys = app.secretEnvKeys ?? [];
 
 			// `app.image` is pinned to the digest currently RUNNING. Both directions
@@ -1406,7 +1535,7 @@ export class DeploymentService {
 	): Promise<MasterApp> {
 		const appId = input.appId!;
 		const storageBytes = (input.volumes[0]?.sizeMb ?? 0) * 1024 * 1024;
-		const subdomain = grant.deployment.subdomain ?? await this.deps.subdomains.allocate(input.listingId);
+		const subdomain = grant.deployment.subdomain ?? await this.deps.subdomains.allocate(input.listingId, workspaceId);
 		const replicas = [];
 		try {
 			for (const node of nodes) {
@@ -1514,7 +1643,8 @@ export class DeploymentService {
 			if (app.state !== 'QUARANTINED') throw new Error('mcp_app_not_quarantined');
 			const nodes = await this.deps.repositories.nodes.find({ nodeId: { $in: app.replicas.map((replica) => replica.nodeId) } }).toArray();
 			if (nodes.length !== app.replicas.length) throw new Error('mcp_replica_node_missing');
-			await this.deps.ingress.upsert(app.subdomain, nodes);
+			// mcp-v2 always allocates the legacy label (no NO_DEFAULT_HOST path here).
+			await this.deps.ingress.upsert(app.subdomain!, nodes);
 			const activatedAt = new Date();
 			const activated = await this.deps.repositories.apps.updateOne(
 				{ appId: app.appId, state: 'QUARANTINED' },
@@ -1535,7 +1665,7 @@ export class DeploymentService {
 	): Promise<MasterApp> {
 		const appId = input.appId ?? crypto.randomUUID();
 		const storageBytes = (input.volumes[0]?.sizeMb ?? 0) * 1024 * 1024;
-		const subdomain = await this.deps.subdomains.allocate(input.listingId);
+		const subdomain = await this.deps.subdomains.allocate(input.listingId, workspaceId);
 		const replicas = [];
 		try {
 			for (const node of nodes) {
@@ -1680,14 +1810,16 @@ export class DeploymentService {
 					envVars: app.envVars ?? {},
 					volumes: [],
 					workspaceId,
-					subdomain: app.subdomain,
+					// Raw apps only reach this branch (mcp-v2/v3 refuse earlier) and always
+					// hold the legacy label.
+					subdomain: app.subdomain!,
 					domain: this.deps.baseDomain,
 				});
 				if (response.status >= 300) throw new Error(`agent deploy failed: ${JSON.stringify(response.body)}`);
 				const container = response.body as { id: string; state: string };
 				const replica = { replicaId: crypto.randomUUID(), nodeId: node.nodeId, containerId: container.id, state: container.state };
 				const now = new Date();
-				await this.deps.ingress.upsert(app.subdomain, [
+				await this.deps.ingress.upsert(app.subdomain!, [
 					...nodes.filter((candidate) => occupiedNodes.has(candidate.nodeId)),
 					node,
 				]);
@@ -1716,7 +1848,7 @@ export class DeploymentService {
 					if (response.status >= 300 && response.status !== 404) throw new Error(`agent remove failed: ${JSON.stringify(response.body)}`);
 				}
 				const now = new Date();
-				await this.deps.ingress.upsert(app.subdomain, nodes.filter((node) => node.nodeId === keep.nodeId));
+				await this.deps.ingress.upsert(app.subdomain!, nodes.filter((node) => node.nodeId === keep.nodeId));
 				await this.deps.repositories.apps.updateOne(
 					{ workspaceId, appId },
 					{ $set: { availabilityTier: 'single', replicas: [keep], updatedAt: now } },

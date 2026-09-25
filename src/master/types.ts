@@ -20,6 +20,8 @@ export interface WorkspaceQuota {
 
 export interface MasterWorkspace {
 	workspaceId: string;
+	/** VANITY/TENANT slug suffix (D1). Set only via the dedicated slug PATCH — never through `upsertWorkspace`. */
+	slug?: string;
 	keyHash: string;
 	encryptedKey: string;
 	mcpHubIdentityKid?: string;
@@ -38,6 +40,8 @@ export interface NodeCapacity {
 	diskBytes: number;
 }
 
+export type NodeRole = 'INGRESS' | 'RUNTIME' | 'BOTH';
+
 export interface MasterNode {
 	nodeId: string;
 	portalNodeId?: string;
@@ -54,6 +58,14 @@ export interface MasterNode {
 	updatedAt: Date;
 	mcpIdentityKid?: string;
 	mcpIdentityPublicJwk?: JsonWebKey;
+	/** Absent on a node registered before public-hostnames rolled — treated as
+	 * RUNTIME-only by every reader, which is byte-identical to today's fleet
+	 * (every node currently only ever runs app containers). */
+	role?: NodeRole;
+	/** WireGuard mesh address, used by the host-table publisher to point an
+	 * INGRESS node at a RUNTIME node without a public hop. Absent on a node
+	 * that predates public-hostnames. */
+	meshIp?: string;
 }
 
 export interface AppReplica {
@@ -93,8 +105,16 @@ export interface MasterApp {
 	storageBytes: number;
 	availabilityTier: AvailabilityTier;
 	stateless: boolean;
-	subdomain: string;
-	uiUrl: string;
+	/**
+	 * Absent for a v3 app installed while MCP_V3_NO_DEFAULT_HOST is on: it never
+	 * allocated a legacy label and has no default host. Every reader of this
+	 * field (env building, `publicUrlFor`, ingress upsert, the CNAME on
+	 * removal, `view()`) must treat its absence as "no primary host", never as
+	 * `undefined.privos.link`. A raw/mcp-v2 app and a v3 app with the flag off
+	 * always carry both fields — that path is unchanged.
+	 */
+	subdomain?: string;
+	uiUrl?: string;
 	replicas: AppReplica[];
 	/** RUNNING | STOPPED | REMOVING | REMOVED | QUARANTINED. QUARANTINED = the
 	 * workspace was revoked (offboard/purge): the app is stopped but retained

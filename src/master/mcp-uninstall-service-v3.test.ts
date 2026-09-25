@@ -47,6 +47,8 @@ type World = {
 	signedState?: string;
 	signedResults?: unknown[];
 	signerFailuresRemaining?: number;
+	removeAllAppHostsCalls?: Array<{ appId: string; generationId?: string }>;
+	markDirtyCalls?: number;
 };
 
 function buildService(world: World) {
@@ -117,6 +119,15 @@ function buildService(world: World) {
 			},
 		} as any,
 		clusterId: 'cluster-1',
+		appHosts: world.removeAllAppHostsCalls ? {
+			removeAllAppHosts: async (appId: string, generationId?: string) => {
+				world.removeAllAppHostsCalls!.push({ appId, generationId });
+				return 0;
+			},
+		} as any : undefined,
+		hostTablePublisher: world.markDirtyCalls !== undefined ? {
+			markDirty: () => { world.markDirtyCalls = (world.markDirtyCalls ?? 0) + 1; },
+		} as any : undefined,
 	});
 }
 
@@ -152,6 +163,14 @@ test('removes every declared resource and only then signs a completed acknowledg
 	assert.equal(world.appUpdates[0].$set?.state, 'REVOKING');
 	assert.equal(world.appUpdates.at(-1)?.$set?.state, 'REMOVED');
 	assert.ok(world.checkpoints.size >= 5);
+});
+
+test('E: a COMPLETED uninstall runs its own removeAllAppHosts teardown step, scoped to this generation', async () => {
+	const world = freshWorld({ removeAllAppHostsCalls: [], markDirtyCalls: 0 });
+	const result = await buildService(world).uninstall({ workspaceId: 'workspace-1', command, commandHash: 'D'.repeat(43) });
+	assert.equal(result.state, 'COMPLETED');
+	assert.deepEqual(world.removeAllAppHostsCalls, [{ appId: 'cluster-app-1', generationId: 'generation-1' }]);
+	assert.equal(world.markDirtyCalls, 1);
 });
 
 test('a volume the node cannot prove absent blocks completion instead of passing', async () => {

@@ -3,12 +3,20 @@ import type { MasterApp } from './types.js';
 import type { MasterRepositories } from './repositories.js';
 import { AgentClient, type AgentResponse } from './agent-client.js';
 import { IngressRouteProgrammer } from './ingress-route-programmer.js';
+import type { AppHostRegistry } from './app-host-registry.js';
+import type { HostTablePublisher } from './host-table-publisher.js';
 
 export class AppLifecycleService {
 	constructor(private readonly deps: {
 		repositories: MasterRepositories;
 		agentClient: AgentClient;
 		ingress: IngressRouteProgrammer;
+		/** D-registry — optional so every existing/unwired caller (tests, a
+		 * fleet that has not deployed phase 3) is unaffected. */
+		appHosts?: AppHostRegistry;
+		/** F publisher — optional for the same reason; its absence just means
+		 * nothing is pushed, never an error. */
+		hostTablePublisher?: HostTablePublisher;
 	}) {}
 
 	async list(workspaceId: string): Promise<unknown[]> {
@@ -63,6 +71,7 @@ export class AppLifecycleService {
 				at: now,
 			})));
 		}
+		this.deps.hostTablePublisher?.markDirty();
 		return this.get(workspaceId, appId);
 	}
 
@@ -98,7 +107,14 @@ export class AppLifecycleService {
 			? { workspaceId, state: 'RUNNING' }
 			: { workspaceId, state: { $ne: 'REMOVED' }, suspendedWithWorkspace: true };
 		const apps = await this.deps.repositories.apps.find(selector).toArray();
-		if (apps.length === 0) return { workspaceId, action, affected: 0 };
+		// D19: independent of the early return below — a workspace with zero
+		// RUNNING apps to stop can still have suspended hosts from an earlier
+		// sweep that must resume with it.
+		const affectedHosts = (await this.deps.appHosts?.setWorkspaceHostsSuspended(workspaceId, suspending)) ?? 0;
+		if (apps.length === 0) {
+			if (affectedHosts > 0) this.deps.hostTablePublisher?.markDirty();
+			return { workspaceId, action, affected: 0 };
+		}
 
 		const nodes = await this.loadNodes(apps.flatMap((app) => app.replicas.map((replica) => replica.nodeId)));
 		const now = new Date();
@@ -139,6 +155,7 @@ export class AppLifecycleService {
 				at: now,
 			})));
 		}
+		this.deps.hostTablePublisher?.markDirty();
 		return { workspaceId, action, affected: apps.length };
 	}
 
@@ -292,6 +309,7 @@ export class AppLifecycleService {
 			resources: app.resources,
 			at: now,
 		})));
+		this.deps.hostTablePublisher?.markDirty();
 	}
 
 	/** Destroy an app for real: remove every replica container, unbind ingress,
@@ -315,12 +333,19 @@ export class AppLifecycleService {
 			return [this.deps.agentClient.request(node, workspaceId, 'DELETE', `/api/v1/apps/${replica.containerId}`)];
 		}));
 		this.assertResponses(responses, { tolerateNotFound: options.tolerant });
-		await this.deps.ingress.remove(app.subdomain);
+		// No label (MCP_V3_NO_DEFAULT_HOST) means there was never a CNAME to
+		// remove; the D-registry teardown below owns this generation's hosts.
+		if (app.subdomain) await this.deps.ingress.remove(app.subdomain);
+		// E: its own uninstall step, run for whatever the app's inventory
+		// actually contains — scoped to this generation for a v3 app so a
+		// reinstall under the same appId (a new generation) keeps ITS hosts.
+		await this.deps.appHosts?.removeAllAppHosts(appId, app.mcpGenerationId);
 		const now = new Date();
 		await this.deps.repositories.apps.updateOne(
 			{ appId, workspaceId },
 			{ $set: { state: 'REMOVED', updatedAt: now } },
 		);
+		this.deps.hostTablePublisher?.markDirty();
 		await this.deps.repositories.lifecycleEvents.insertMany(app.replicas.map((replica) => ({
 			eventId: crypto.randomUUID(),
 			workspaceId,
@@ -401,6 +426,7 @@ export class AppLifecycleService {
 			replicaCount: Math.max(app.replicas.length, 1),
 			at: startedAt,
 		});
+		this.deps.hostTablePublisher?.markDirty();
 	}
 
 	private async load(workspaceId: string, appId: string) {
@@ -440,9 +466,12 @@ export class AppLifecycleService {
 			versionDigest: app.versionDigest,
 			state: app.state.toLowerCase(),
 			resources: app.resources,
-			subdomain: app.subdomain,
-			domain: new URL(app.uiUrl).hostname.split('.').slice(1).join('.'),
-			uiUrl: app.uiUrl,
+			// No label (MCP_V3_NO_DEFAULT_HOST): omit every host-derived field
+			// rather than dereference an absent `uiUrl` (`new URL(undefined)`
+			// throws) or surface the literal string "undefined" anywhere.
+			...(app.subdomain && app.uiUrl
+				? { subdomain: app.subdomain, domain: new URL(app.uiUrl).hostname.split('.').slice(1).join('.'), uiUrl: app.uiUrl }
+				: {}),
 			availabilityTier: app.availabilityTier,
 			...(app.kind === 'mcp-v3'
 				? { replicaCount: app.replicas.length }

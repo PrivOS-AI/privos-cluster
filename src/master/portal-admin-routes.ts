@@ -7,6 +7,26 @@ import type { MasterRepositories } from './repositories.js';
 import type { AppLifecycleService } from './app-lifecycle-service.js';
 import type { UsageAggregator } from './usage-aggregator.js';
 import { utcDay } from './usage-aggregator.js';
+import type { AppHostRegistry } from './app-host-registry.js';
+
+const ReserveHostSchema = z.object({
+	hostname: z.string().min(1).max(253),
+	kind: z.enum(['TENANT', 'VANITY', 'CUSTOM']),
+	listingId: z.string().min(1).max(128),
+}).strict();
+
+const DesiredHostSchema = z.object({
+	hostname: z.string().min(1).max(253),
+	kind: z.enum(['TENANT', 'VANITY', 'CUSTOM']),
+	primary: z.boolean(),
+	state: z.enum(['ACTIVE', 'SUSPENDED']),
+}).strict();
+
+const SetHostsSchema = z.object({
+	listingId: z.string().min(1).max(128),
+	generationId: z.string().min(1).max(160).optional(),
+	hosts: z.array(DesiredHostSchema).max(20),
+}).strict();
 
 const QuotaSchema = z.object({
 	maxMemoryMb: z.number().int().positive(),
@@ -34,7 +54,13 @@ const NodeSchema = z.object({
 	keyId: z.string().optional(),
 	tunnelId: z.string().optional(),
 	status: z.enum(['ACTIVE', 'DRAINING', 'RETIRED']).default('ACTIVE'),
+	// Absent = RUNTIME (every node registered before public-hostnames rolled
+	// only ever ran app containers) — the Portal sends both for an APPS node.
+	role: z.enum(['INGRESS', 'RUNTIME', 'BOTH']).optional(),
+	meshIp: z.string().min(1).max(64).optional(),
 });
+
+const SlugSchema = z.object({ slug: z.string().regex(/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/) });
 
 export function portalAdminRoutes(deps: {
 	serviceKey: string;
@@ -43,6 +69,10 @@ export function portalAdminRoutes(deps: {
 	repositories: MasterRepositories;
 	lifecycle: AppLifecycleService;
 	usage: UsageAggregator;
+	/** D-requirement registry. Optional so an unwired deployment (tests, a
+	 * fleet that has not deployed phase 3) never loses the rest of this route
+	 * set — only the hosts routes below need it. */
+	appHosts?: AppHostRegistry;
 }): FastifyPluginAsync {
 	return async (fastify) => {
 		const authenticate = async (req: FastifyRequest, reply: FastifyReply) => {
@@ -70,6 +100,19 @@ export function portalAdminRoutes(deps: {
 		fastify.put(`${root}/workspaces/:workspaceId/quota`, { preHandler: authenticate }, async (req) => {
 			const { workspaceId } = req.params as { workspaceId: string };
 			await deps.workspaces.updateQuota(workspaceId, QuotaSchema.parse(req.body));
+			return { ok: true };
+		});
+		// C: sets ONLY slug — never routed through `upsertWorkspace`, and refuses
+		// (404) a workspace that is not ACTIVE rather than silently creating one.
+		fastify.patch(`${root}/workspaces/:workspaceId/slug`, { preHandler: authenticate }, async (req, reply) => {
+			const { workspaceId } = req.params as { workspaceId: string };
+			const { slug } = SlugSchema.parse(req.body);
+			try {
+				await deps.workspaces.setSlug(workspaceId, slug);
+			} catch {
+				return reply.code(404).send({ error: 'workspace not found' });
+			}
+			req.log.info({ workspaceId, slug }, 'apps master workspace slug set');
 			return { ok: true };
 		});
 		fastify.get(`${root}/workspaces/:workspaceId`, { preHandler: authenticate }, async (req, reply) => {
@@ -111,6 +154,54 @@ export function portalAdminRoutes(deps: {
 			const result = await deps.lifecycle.setWorkspacePower(workspaceId, action);
 			req.log.info({ workspaceId, action, affected: result.affected }, 'apps master workspace power changed');
 			return result;
+		});
+		// D: public-hostname registry. Service-key only (the `authenticate`
+		// preHandler shared by this whole route set) — a Hub bearer token is a
+		// workspace-scoped JWT, never the raw service key, so it always fails
+		// the `timingSafeEqual` above and gets a 401, exactly like every other
+		// admin route.
+		fastify.post(`${root}/workspaces/:workspaceId/apps/:appId/hosts/reserve`, { preHandler: authenticate }, async (req, reply) => {
+			if (!deps.appHosts) return reply.code(404).send({ error: 'app_host_registry_disabled' });
+			const { workspaceId, appId } = req.params as { workspaceId: string; appId: string };
+			const body = ReserveHostSchema.safeParse(req.body);
+			if (!body.success) return reply.code(400).send({ error: 'validation_error', details: body.error.issues });
+			try {
+				const row = await deps.appHosts.reserve({
+					workspaceId,
+					appId,
+					listingId: body.data.listingId,
+					hostname: body.data.hostname,
+					kind: body.data.kind,
+				});
+				return reply.code(201).send(row);
+			} catch (error) {
+				const code = (error as { code?: string }).code ?? 'HOST_RESERVE_FAILED';
+				return reply.code((error as { statusCode?: number }).statusCode ?? 409).send({ error: code });
+			}
+		});
+		fastify.put(`${root}/workspaces/:workspaceId/apps/:appId/hosts`, { preHandler: authenticate }, async (req, reply) => {
+			if (!deps.appHosts) return reply.code(404).send({ error: 'app_host_registry_disabled' });
+			const { workspaceId, appId } = req.params as { workspaceId: string; appId: string };
+			const body = SetHostsSchema.safeParse(req.body);
+			if (!body.success) return reply.code(400).send({ error: 'validation_error', details: body.error.issues });
+			try {
+				const rows = await deps.appHosts.setDesiredHosts({
+					workspaceId,
+					appId,
+					listingId: body.data.listingId,
+					generationId: body.data.generationId,
+					hosts: body.data.hosts,
+				});
+				return reply.send({ hosts: rows });
+			} catch (error) {
+				const code = (error as { code?: string }).code ?? 'HOST_SET_FAILED';
+				return reply.code((error as { statusCode?: number }).statusCode ?? 409).send({ error: code, hostname: (error as { hostname?: string }).hostname });
+			}
+		});
+		fastify.get(`${root}/workspaces/:workspaceId/apps/:appId/hosts`, { preHandler: authenticate }, async (req, reply) => {
+			if (!deps.appHosts) return reply.code(404).send({ error: 'app_host_registry_disabled' });
+			const { workspaceId, appId } = req.params as { workspaceId: string; appId: string };
+			return reply.send({ hosts: await deps.appHosts.get(workspaceId, appId) });
 		});
 		fastify.get(`${root}/apps`, { preHandler: authenticate }, async (req) => {
 			const { workspaceId } = z.object({ workspaceId: z.string().min(1).optional() }).parse(req.query);

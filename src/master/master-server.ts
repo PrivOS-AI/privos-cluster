@@ -19,6 +19,10 @@ import { UsageAggregator } from './usage-aggregator.js';
 import { McpSecurityVerifier } from './mcp-security.js';
 import { ClusterMasterIdentity } from './cluster-master-identity.js';
 import { McpUninstallServiceV3 } from './mcp-uninstall-service-v3.js';
+import { LabelNamespace } from './label-namespace.js';
+import { AppHostRegistry } from './app-host-registry.js';
+import { CfCustomHostnameWorker } from './cf-custom-hostname-worker.js';
+import { HostTablePublisher } from './host-table-publisher.js';
 
 /** `body.error` is a wire contract: bounded, upper-snake, never the raw text underneath. */
 const BOUNDED_ERROR_CODE = /^[A-Z][A-Z0-9_]{0,127}$/;
@@ -99,7 +103,23 @@ export function buildMasterServer(config: MasterConfig, repositories: MasterRepo
 		apiToken: config.CF_APPS_API_TOKEN,
 		baseDomain: config.APPS_BASE_DOMAIN,
 	});
-	const lifecycle = new AppLifecycleService({ repositories, agentClient, ingress });
+	const workspaceLocks = new WorkspaceLock();
+	const labelNamespace = new LabelNamespace(repositories);
+	const hostTablePublisher = new HostTablePublisher({ repositories, agentClient, baseDomain: config.APPS_BASE_DOMAIN });
+	const cfCustomHostnameWorker = new CfCustomHostnameWorker({
+		repositories,
+		enabled: config.APPS_INGRESS_ENABLED,
+		zoneId: config.CF_APPS_ZONE_ID,
+		apiToken: config.CF_APPS_SAAS_API_TOKEN,
+	});
+	const appHosts = new AppHostRegistry({
+		repositories,
+		namespace: labelNamespace,
+		locks: workspaceLocks,
+		cfWorker: cfCustomHostnameWorker,
+		publisher: hostTablePublisher,
+	});
+	const lifecycle = new AppLifecycleService({ repositories, agentClient, ingress, appHosts, hostTablePublisher });
 	const usage = new UsageAggregator(repositories);
 	const deployment = new DeploymentService({
 		repositories,
@@ -107,9 +127,13 @@ export function buildMasterServer(config: MasterConfig, repositories: MasterRepo
 		ingress,
 		quota: new QuotaService(repositories),
 		subdomains: new SubdomainRegistry(repositories),
-		locks: new WorkspaceLock(),
+		locks: workspaceLocks,
 		baseDomain: config.APPS_BASE_DOMAIN,
 		cipher,
+		noDefaultHost: config.MCP_V3_NO_DEFAULT_HOST === 'on',
+		emitAppPublicUrl: config.MCP_EMIT_APP_PUBLIC_URL === 'on',
+		legacyPublicUrlAlias: config.MCP_LEGACY_PUBLIC_URL_ALIAS === 'on',
+		appHosts,
 	});
 	const mcpSecurity = config.APP_CLUSTER_MCP_INSTALL_V2 === 'on' || config.APP_CLUSTER_MCP_INSTALL_V3 === 'on'
 		? new McpSecurityVerifier(repositories, config.APP_MASTER_CLUSTER_ID)
@@ -139,9 +163,12 @@ export function buildMasterServer(config: MasterConfig, repositories: MasterRepo
 				ingress,
 				clusterMasterIdentity,
 				clusterId: config.APP_MASTER_CLUSTER_ID,
+				appHosts,
+				hostTablePublisher,
 			})
 			: undefined,
 		mcpReleaseAuthorityJwks: (JSON.parse(config.MCP_RELEASE_AUTHORITY_JWKS_JSON) as { keys: JsonWebKey[] }).keys,
+		labelNamespace,
 	}));
 	fastify.register(portalAdminRoutes({
 		serviceKey: config.APP_MASTER_SERVICE_KEY,
@@ -150,6 +177,7 @@ export function buildMasterServer(config: MasterConfig, repositories: MasterRepo
 		repositories,
 		lifecycle,
 		usage,
+		appHosts,
 	}));
 	fastify.setErrorHandler((error, req, reply) => {
 		const { statusCode, body } = masterErrorResponse(error);
@@ -158,5 +186,9 @@ export function buildMasterServer(config: MasterConfig, repositories: MasterRepo
 		req.log.error({ err: error, correlationId: body.correlationId }, 'apps master request failed');
 		return reply.code(statusCode).send(body);
 	});
-	return fastify;
+	// Returned alongside `fastify` so `master-entry.ts` can drive the same
+	// registry/publisher/CF-worker instances from its boot-time jobs (the
+	// reaper's own lifecycle service, the daily CF-release sweep, the initial
+	// host-table publish) instead of constructing a second, divergent set.
+	return { fastify, appHosts, cfCustomHostnameWorker, hostTablePublisher };
 }

@@ -13,6 +13,7 @@ import { jwkThumbprint, sha256, sha256Base64Url } from '../security/artifacts.js
 import { clusterMcpSafeReason, recordClusterMcpEvent } from '../services/mcp-observability.js';
 import type { ClusterMasterIdentity } from './cluster-master-identity.js';
 import type { McpUninstallServiceV3 } from './mcp-uninstall-service-v3.js';
+import type { LabelNamespace } from './label-namespace.js';
 
 const DispatchRpcSchema = z.object({
 	jsonrpc: z.string().optional(),
@@ -135,6 +136,9 @@ export function hubFacingRoutes(deps: {
 	clusterMasterIdentity: ClusterMasterIdentity;
 	mcpUninstall?: McpUninstallServiceV3;
 	mcpReleaseAuthorityJwks: JsonWebKey[];
+	/** D10 namespace. Optional so an unwired caller falls back to the legacy
+	 * `apps.subdomain` existence probe this route always used. */
+	labelNamespace?: LabelNamespace;
 }): FastifyPluginAsync {
 	return async (fastify) => {
 		const authenticate = async (req: FastifyRequest, reply: FastifyReply) => {
@@ -179,8 +183,19 @@ export function hubFacingRoutes(deps: {
 		}));
 		fastify.get(`${root}/cluster/subdomain-check`, { preHandler: authenticate }, async (req) => {
 			const value = (req.query as { value?: string }).value;
-			const exists = value ? await deps.repositories.apps.findOne({ subdomain: value }) : null;
-			return { available: Boolean(value) && !exists };
+			if (!value) return { available: false };
+			// Scoped to the caller's own workspace (D): the shared D10 namespace
+			// check reports a label the caller ALREADY holds as available, so a
+			// workspace re-checking its own current label never sees it "taken".
+			// L10: intentional semantics change from the pre-phase-3 global
+			// existence probe below — reviewed and accepted as an improvement,
+			// not a regression, since it only ever makes a caller's OWN label
+			// read as available, never someone else's.
+			if (deps.labelNamespace) {
+				return { available: await deps.labelNamespace.isAvailableFor(value, workspaceId(req)) };
+			}
+			const exists = await deps.repositories.apps.findOne({ subdomain: value });
+			return { available: !exists };
 		});
 		fastify.post(`${root}/apps/deploy/validate`, { preHandler: authenticate }, async () => ({
 			ok: true,
@@ -611,11 +626,14 @@ export function hubFacingRoutes(deps: {
 				deploymentGrantJti: grant.jti,
 				inventoryId: inventory.inventoryId,
 			});
+			// D9: no primary host → the key is OMITTED, never `undefined` — the
+			// Hub `$unset`s its own `publicUrl` whenever a response omits it.
+			const installPublicUrl = deps.deployment.publicUrlFor(app.subdomain);
 			return reply.code(201).send({
 				state: 'PROVISIONING',
 				clusterAppId: app.appId,
 				runtimeInstallationId: grant.runtimeInstallationId,
-				publicUrl: deps.deployment.publicUrlFor(app.subdomain),
+				...(installPublicUrl ? { publicUrl: installPublicUrl } : {}),
 				runtimeInventoryAttestation: {
 					compact: attestation.compact,
 					artifactHash: attestation.artifactHash,
@@ -776,12 +794,13 @@ export function hubFacingRoutes(deps: {
 				reason: 'reconfigured',
 				correlationId: runtimeInstallationId,
 			});
+			const reconfigurePublicUrl = deps.deployment.publicUrlFor(applied.app.subdomain);
 			return reply.code(200).send({
 				state: 'RUNNING',
 				clusterAppId: applied.app.appId,
 				runtimeInstallationId,
 				configEpoch: command.configEpoch,
-				publicUrl: deps.deployment.publicUrlFor(applied.app.subdomain),
+				...(reconfigurePublicUrl ? { publicUrl: reconfigurePublicUrl } : {}),
 				acknowledgement: {
 					compact: acknowledgement.compact,
 					artifactHash: acknowledgement.artifactHash,
@@ -1011,12 +1030,13 @@ export function hubFacingRoutes(deps: {
 				reason: 'upgraded',
 				correlationId: runtimeInstallationId,
 			});
+			const upgradePublicUrl = deps.deployment.publicUrlFor(applied.app.subdomain);
 			return reply.code(200).send({
 				state: 'UPGRADED',
 				clusterAppId: applied.app.appId,
 				runtimeInstallationId,
 				revision: command.revision,
-				publicUrl: deps.deployment.publicUrlFor(applied.app.subdomain),
+				...(upgradePublicUrl ? { publicUrl: upgradePublicUrl } : {}),
 				acknowledgement: {
 					compact: acknowledgement.compact,
 					artifactHash: acknowledgement.artifactHash,

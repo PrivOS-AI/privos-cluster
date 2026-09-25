@@ -54,6 +54,20 @@ export class WorkspaceClusterService {
 		if (result.matchedCount !== 1) throw new Error('workspace not found');
 	}
 
+	/**
+	 * C: sets ONLY `slug`, filtered on `{workspaceId, status: 'ACTIVE'}`, no
+	 * upsert — a slug PATCH for a workspace that does not exist (or is
+	 * REVOKED) must fail loud, never silently create a bare row the way
+	 * `upsert()` would.
+	 */
+	async setSlug(workspaceId: string, slug: string): Promise<void> {
+		const result = await this.repositories.workspaces.updateOne(
+			{ workspaceId, status: 'ACTIVE' },
+			{ $set: { slug, updatedAt: new Date() } },
+		);
+		if (result.matchedCount !== 1) throw new Error('workspace not found');
+	}
+
 	async revoke(workspaceId: string): Promise<void> {
 		await this.repositories.workspaces.updateOne(
 			{ workspaceId },

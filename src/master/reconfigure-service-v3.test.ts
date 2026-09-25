@@ -162,6 +162,10 @@ test('a verified epoch reaches every replica with the platform env injected', as
 		HRM_COMPANY_NAME: 'Acme GmbH',
 		HRM_SMTP_PASSWORD: 'canary-secret-value',
 	});
+	// M5: MCP_EMIT_APP_PUBLIC_URL defaults off (this fixture never sets
+	// `emitAppPublicUrl`) — byte-identical to pre-rename behaviour, only the
+	// legacy key, never the renamed PRIVOS_APP_PUBLIC_URL. See
+	// `deployment-service-null-safe.test.ts` for the emit-on matrix.
 	assert.deepEqual(call!.body.platformEnvVars, {
 		PRIVOS_PUBLIC_URL: 'https://library-app.apps.example.com',
 		PRIVOS_ACCESS_MODE: 'managed-runtime',

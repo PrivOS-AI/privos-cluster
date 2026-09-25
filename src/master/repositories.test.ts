@@ -63,4 +63,20 @@ test('master repositories install additive v3 inventory, lifecycle, replay, and 
 		generationId: 1,
 	}, { unique: true, partialFilterExpression: { kind: 'deployment-grant' } }), true);
 	assert.equal(hasIndex('apps_master_cluster_signing_identities', { clusterId: 1 }, { unique: true }), true);
+
+	// D10: the legacy `subdomain_1` index is now PARTIAL — a host-less v3 app
+	// (MCP_V3_NO_DEFAULT_HOST) must never collide with a second one on a
+	// shared `null` key.
+	assert.equal(hasIndex('apps_master_apps', { subdomain: 1 }, {
+		unique: true,
+		partialFilterExpression: { subdomain: { $type: 'string' } },
+	}), true);
+	assert.equal(hasIndex('host_labels', { workspaceId: 1, listingId: 1 }, {}), true);
+	assert.equal(hasIndex('host_labels', { state: 1 }, {}), true);
+	assert.equal(hasIndex('app_hosts', { workspaceId: 1, appId: 1 }, {}), true);
+	assert.equal(hasIndex('app_hosts', { appId: 1, generationId: 1 }, {}), true);
+	assert.equal(hasIndex('app_hosts', { cfHostnameId: 1 }, {
+		unique: true,
+		partialFilterExpression: { cfHostnameId: { $type: 'string' } },
+	}), true);
 });

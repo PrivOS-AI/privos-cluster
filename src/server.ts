@@ -29,6 +29,7 @@ import clusterHandler from './handlers/cluster.js';
 import authRoutesHandler from './handlers/auth.js';
 import usageHandler from './handlers/usage.js';
 import mcpHandler from './handlers/mcp.js';
+import hostTableHandler from './handlers/host-table.js';
 import localRuntimeHandler from './handlers/local-runtime.js';
 import { areOperatorRoutesEnabled } from './services/settings-service.js';
 import { mcpBrokerManager, rebindMcpBrokers } from './services/mcp-broker.js';
@@ -108,6 +109,9 @@ export async function buildFastifyServer(): Promise<FastifyInstance> {
 	await fastify.register(logsHandler);
 	await fastify.register(usageHandler);
 	await fastify.register(mcpHandler);
+	// Fleet-wide host-table push (phase-3 F) — the only route whose caller
+	// carries no tenant workspaceId; see host-table.ts for why that is safe.
+	await fastify.register(hostTableHandler);
 	// `privos-local-runtime-driver-v1` ABI — on by default in tunnel mode
 	// (customer-owned/BYO App Clusters), off by default otherwise (e.g. a
 	// fleet/master HTTP deployment that never wants this surface).

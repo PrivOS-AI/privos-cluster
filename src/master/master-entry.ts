@@ -14,7 +14,7 @@ const { client, repositories } = await connectMasterRepositories(
 	config.MASTER_MONGODB_URL,
 	config.MASTER_MONGODB_DB,
 );
-const server = buildMasterServer(config, repositories);
+const { fastify: server, appHosts, cfCustomHostnameWorker, hostTablePublisher } = buildMasterServer(config, repositories);
 const reconcile = new ReconcileService({
 	repositories,
 	agentClient: new AgentClient(
@@ -46,6 +46,10 @@ const reaperLifecycle = new AppLifecycleService({
 		apiToken: config.CF_APPS_API_TOKEN,
 		baseDomain: config.APPS_BASE_DOMAIN,
 	}),
+	// Same registry/publisher the HTTP routes use — the reaper's own destroy()
+	// path is E's "also runs from ... the reaper" call site.
+	appHosts,
+	hostTablePublisher,
 });
 const quarantineGraceMs = resolveQuarantineGraceMs();
 const runReaper = () =>
@@ -58,10 +62,31 @@ await runReaper();
 const reaperTimer = setInterval(() => void runReaper(), 60 * 60 * 1000);
 reaperTimer.unref();
 
+// D19 daily job: release the CF custom hostname of every WS_SUSPENDED CUSTOM
+// host past its retention window (default 30 days; DEV E2E sets 0).
+const runCfRetentionSweep = () =>
+	cfCustomHostnameWorker.releaseSuspendedCfHostnames(config.APP_HOST_SUSPEND_CF_RETENTION_DAYS)
+		.then((result) => {
+			if (result.released > 0) server.log.info(result, 'CF custom-hostname retention sweep');
+		})
+		.catch((error) => server.log.error({ err: error }, 'CF custom-hostname retention sweep failed'));
+await runCfRetentionSweep();
+const cfRetentionTimer = setInterval(() => void runCfRetentionSweep(), 24 * 60 * 60 * 1000);
+cfRetentionTimer.unref();
+
+// F: publish the routing table once at boot (a fresh `masterEpoch` always
+// needs an initial push so every node learns it) and on the same 5-minute
+// resync cadence the plan calls for.
+hostTablePublisher.markDirty();
+const hostTableResyncTimer = setInterval(() => hostTablePublisher.markDirty(), 5 * 60 * 1000);
+hostTableResyncTimer.unref();
+
 async function shutdown(signal: string): Promise<void> {
 	server.log.info({ signal }, 'apps master shutdown');
 	clearInterval(usageTimer);
 	clearInterval(reaperTimer);
+	clearInterval(cfRetentionTimer);
+	clearInterval(hostTableResyncTimer);
 	await server.close();
 	await client.close();
 }

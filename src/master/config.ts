@@ -24,6 +24,31 @@ const MasterConfigSchema = z.object({
 	// route, installs/uninstalls/reconfigures are untouched when this is off.
 	APP_CLUSTER_MCP_UPGRADE_V3: z.enum(['on', 'off']).default('on'),
 	MCP_RELEASE_AUTHORITY_JWKS_JSON: z.string().default('{"keys":[]}'),
+	// Public-hostnames feature (plan 260924-2220). All default to inert so a
+	// fleet that has not rolled the edge behaves byte-identically:
+	//   - NO_DEFAULT_HOST off  => v3 creates still allocate the legacy label.
+	//   - EMIT_APP_PUBLIC_URL off (default) => the container never sees the
+	//     renamed PRIVOS_APP_PUBLIC_URL key at all — byte-identical to today.
+	//     Control nodes (master) and gen nodes (agent) deploy separately and
+	//     non-atomically, so a rolled-ahead master must not emit a key an
+	//     older agent's PlatformEnvNameSchema enum does not yet accept — that
+	//     would 400 every v3 deploy/reconfigure/upgrade for the whole rollout
+	//     window. The operator flips this on in phase 7, after every agent has
+	//     rolled.
+	//   - LEGACY_PUBLIC_URL_ALIAS on (default) => while EMIT_APP_PUBLIC_URL is
+	//     also on, runtimes receive BOTH keys with the same value during the
+	//     rename transition; off => only the renamed key.
+	// Net emission matrix: default (emit off) => {PRIVOS_PUBLIC_URL} only;
+	// emit-on + alias-on => {both}; emit-on + alias-off => {PRIVOS_APP_PUBLIC_URL} only.
+	MCP_V3_NO_DEFAULT_HOST: z.enum(['on', 'off']).default('off'),
+	MCP_EMIT_APP_PUBLIC_URL: z.enum(['on', 'off']).default('off'),
+	MCP_LEGACY_PUBLIC_URL_ALIAS: z.enum(['on', 'off']).default('on'),
+	// Days a WS_SUSPENDED host keeps its Cloudflare custom hostname before the
+	// daily release job deletes it (resume recreates it). DEV E2E sets 0.
+	APP_HOST_SUSPEND_CF_RETENTION_DAYS: z.coerce.number().int().nonnegative().default(30),
+	// Token scoped to custom-hostname operations on the privos.link SaaS zone.
+	// Separate from CF_APPS_API_TOKEN (wildcard/CNAME DNS) by least privilege.
+	CF_APPS_SAAS_API_TOKEN: z.string().optional(),
 }).superRefine((config, ctx) => {
 	let key: Buffer | null = null;
 	try {

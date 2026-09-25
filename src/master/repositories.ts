@@ -13,6 +13,10 @@ import type {
 	McpProtocolV3ArtifactUse,
 	RuntimeResourceInventory,
 } from './types.js';
+import type { HostLabelRecord } from './label-namespace.js';
+import type { AppHostRecord } from './app-host-registry.js';
+import type { MasterMetaRecord } from './host-table-publisher.js';
+import { seedHostLabels } from '../migrations/seed-host-labels.js';
 
 export class MasterRepositories {
 	readonly workspaces: Collection<MasterWorkspace>;
@@ -27,6 +31,12 @@ export class MasterRepositories {
 	readonly clusterCleanupResults: Collection<ClusterCleanupResultRecord>;
 	readonly mcpProtocolV3ArtifactUses: Collection<McpProtocolV3ArtifactUse>;
 	readonly clusterSigningIdentities: Collection<ClusterSigningIdentityRecord>;
+	/** The D10 single label namespace — legacy labels, TENANT and VANITY all share it. */
+	readonly hostLabels: Collection<HostLabelRecord>;
+	/** D-requirement registry: one row per public hostname, pre-registration included. */
+	readonly appHosts: Collection<AppHostRecord>;
+	/** Singleton master-scoped counters (routing-table revision, ...). */
+	readonly masterMeta: Collection<MasterMetaRecord>;
 
 	constructor(readonly db: Db) {
 		this.workspaces = db.collection('apps_master_workspaces');
@@ -41,6 +51,9 @@ export class MasterRepositories {
 		this.clusterCleanupResults = db.collection('apps_master_cleanup_results');
 		this.mcpProtocolV3ArtifactUses = db.collection('apps_master_mcp_protocol_v3_artifact_uses');
 		this.clusterSigningIdentities = db.collection('apps_master_cluster_signing_identities');
+		this.hostLabels = db.collection('host_labels');
+		this.appHosts = db.collection('app_hosts');
+		this.masterMeta = db.collection('apps_master_meta');
 	}
 
 	async ensureIndexes(): Promise<void> {
@@ -49,7 +62,15 @@ export class MasterRepositories {
 			this.nodes.createIndex({ nodeId: 1 }, { unique: true }),
 			this.apps.createIndex({ appId: 1 }, { unique: true }),
 			this.apps.createIndex({ workspaceId: 1, listingId: 1 }),
-			this.apps.createIndex({ subdomain: 1 }, { unique: true }),
+			// PARTIAL: a v3 app with MCP_V3_NO_DEFAULT_HOST on has no `subdomain` at
+			// all, and a plain-unique index treats every missing field as the same
+			// `null` key — refusing the SECOND host-less app in a workspace. Kept in
+			// sync with the migration below, which repoints this same index name on
+			// an existing deployment (createIndex here is a no-op once it matches).
+			this.apps.createIndex(
+				{ subdomain: 1 },
+				{ unique: true, partialFilterExpression: { subdomain: { $type: 'string' } } },
+			),
 			// Reaper sweep: find QUARANTINED apps whose grace window has elapsed.
 			this.apps.createIndex({ state: 1, quarantinedAt: 1 }),
 			this.apps.createIndex(
@@ -125,6 +146,15 @@ export class MasterRepositories {
 			),
 			this.clusterSigningIdentities.createIndex({ clusterId: 1 }, { unique: true }),
 			this.clusterSigningIdentities.createIndex({ kid: 1 }, { unique: true }),
+			this.hostLabels.createIndex({ workspaceId: 1, listingId: 1 }),
+			this.hostLabels.createIndex({ state: 1 }),
+			this.appHosts.createIndex({ workspaceId: 1, appId: 1 }),
+			this.appHosts.createIndex({ appId: 1, generationId: 1 }),
+			this.appHosts.createIndex({ state: 1 }),
+			this.appHosts.createIndex(
+				{ cfHostnameId: 1 },
+				{ unique: true, partialFilterExpression: { cfHostnameId: { $type: 'string' } } },
+			),
 		]);
 	}
 }
@@ -135,7 +165,15 @@ export async function connectMasterRepositories(
 ): Promise<{ client: MongoClient; repositories: MasterRepositories }> {
 	const client = new MongoClient(url);
 	await client.connect();
-	const repositories = new MasterRepositories(client.db(dbName));
+	const db = client.db(dbName);
+	// MUST run before `ensureIndexes`: it repoints `apps.subdomain_1` from a
+	// plain-unique to a partial-unique index, and `ensureIndexes` recreating the
+	// OLD shape first would just have this migration redo the same work a
+	// moment later — harmless, but the ordering is the contract the phase-3
+	// spec calls for, so it is kept explicit rather than relying on idempotency
+	// to paper over a reordering.
+	await seedHostLabels(db);
+	const repositories = new MasterRepositories(db);
 	await repositories.ensureIndexes();
 	return { client, repositories };
 }

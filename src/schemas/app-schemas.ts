@@ -19,8 +19,16 @@ export const VolumeSchema = z.object({
 /** Operator-declarable environment name. Upper snake, never the PRIVOS_ namespace. */
 export const EnvNameSchema = z.string().regex(/^[A-Z][A-Z0-9_]{0,63}$/);
 
-/** The exact platform-injected names. Anything else is a spoofing attempt. */
-export const PLATFORM_ENV_NAMES = ['PRIVOS_PUBLIC_URL', 'PRIVOS_ACCESS_MODE'] as const;
+/**
+ * The exact platform-injected names. Anything else is a spoofing attempt.
+ *
+ * `PRIVOS_APP_PUBLIC_URL` is the D18 rename target (the app's own origin);
+ * `PRIVOS_PUBLIC_URL` is kept for the transition — the master still injects
+ * it, with the same value, whenever `MCP_LEGACY_PUBLIC_URL_ALIAS` is on
+ * (default) — dropped only once no live app reads the old key (phase 1
+ * check 5).
+ */
+export const PLATFORM_ENV_NAMES = ['PRIVOS_APP_PUBLIC_URL', 'PRIVOS_PUBLIC_URL', 'PRIVOS_ACCESS_MODE'] as const;
 export const PlatformEnvNameSchema = z.enum(PLATFORM_ENV_NAMES);
 
 export { RESERVED_AGENT_BOT_ENV_NAMES, isAllowedReservedEnvName } from './reserved-env.js';
