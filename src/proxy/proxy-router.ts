@@ -13,6 +13,11 @@
  *   - exactly ONE subdomain label (`a.b.example.com` rejected) — matches the free
  *     Cloudflare Universal SSL depth (one level); deeper needs ACM (out of scope).
  *
+ * A THIRD guard lives one layer down: the injected `findByHost` (production:
+ * `docker-state.findByHost`) excludes schema-3 (v3) containers outright — v3
+ * public hosts are routed exclusively by the new ingress/runtime listeners
+ * (`src/proxy/{ingress,runtime}-listener.ts`), never by this loopback fallback.
+ *
  * Resolutions are cached with a short TTL; `refreshRoutes()` invalidates the cache
  * after any deploy/remove/redeploy so a new host routes within one lifecycle cycle.
  */

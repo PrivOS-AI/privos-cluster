@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { spawnSync } from 'node:child_process';
 
-import { isLocalRuntimeEnabled } from './config.js';
+import { isLocalRuntimeEnabled, isIngressListenerEnabled, isRuntimeListenerEnabled } from './config.js';
 
 // Config validates process.env at import time and process.exit(1)s on failure.
 // Load it in a child process with controlled env and assert the exit code.
@@ -107,4 +107,31 @@ test('isLocalRuntimeEnabled: on forces it even outside tunnel mode', () => {
 test('isLocalRuntimeEnabled: unset follows tunnel mode', () => {
 	assert.equal(isLocalRuntimeEnabled({ PRIVOS_HUB_URL: 'https://hub.example.com', PRIVOS_TUNNEL_ENABLED: undefined, CLUSTER_LOCAL_RUNTIME: undefined }), true);
 	assert.equal(isLocalRuntimeEnabled({ PRIVOS_HUB_URL: undefined, PRIVOS_TUNNEL_ENABLED: undefined, CLUSTER_LOCAL_RUNTIME: undefined }), false);
+});
+
+test('a node with no PROXY_ROLE starts neither new listener (byte-identical default)', () => {
+	assert.equal(loadConfigWith({}, ['PROXY_ROLE']), 0);
+	assert.equal(isIngressListenerEnabled({ PROXY_ROLE: undefined }), false);
+	assert.equal(isRuntimeListenerEnabled({ PROXY_ROLE: undefined }), false);
+});
+
+test('isIngressListenerEnabled / isRuntimeListenerEnabled follow PROXY_ROLE', () => {
+	assert.equal(isIngressListenerEnabled({ PROXY_ROLE: 'INGRESS' }), true);
+	assert.equal(isIngressListenerEnabled({ PROXY_ROLE: 'RUNTIME' }), false);
+	assert.equal(isIngressListenerEnabled({ PROXY_ROLE: 'BOTH' }), true);
+	assert.equal(isRuntimeListenerEnabled({ PROXY_ROLE: 'RUNTIME' }), true);
+	assert.equal(isRuntimeListenerEnabled({ PROXY_ROLE: 'INGRESS' }), false);
+	assert.equal(isRuntimeListenerEnabled({ PROXY_ROLE: 'BOTH' }), true);
+});
+
+test('PROXY_ROLE=RUNTIME|BOTH requires a WireGuard MESH_BIND_IP', () => {
+	assert.equal(loadConfigWith({ PROXY_ROLE: 'RUNTIME' }, ['MESH_BIND_IP']), 1);
+	assert.equal(loadConfigWith({ PROXY_ROLE: 'RUNTIME', MESH_BIND_IP: '192.168.1.5' }), 1, 'not a mesh address');
+	assert.equal(loadConfigWith({ PROXY_ROLE: 'RUNTIME', MESH_BIND_IP: '10.88.0.11' }), 0);
+	assert.equal(loadConfigWith({ PROXY_ROLE: 'BOTH', MESH_BIND_IP: '10.88.0.11', FLEET_NODE_ID: 'app-eu-01' }), 0);
+});
+
+test('PROXY_ROLE=INGRESS|BOTH requires FLEET_NODE_ID', () => {
+	assert.equal(loadConfigWith({ PROXY_ROLE: 'INGRESS' }, ['FLEET_NODE_ID']), 1);
+	assert.equal(loadConfigWith({ PROXY_ROLE: 'INGRESS', FLEET_NODE_ID: 'app-eu-01' }), 0);
 });

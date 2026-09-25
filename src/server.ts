@@ -14,10 +14,12 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import websocket from '@fastify/websocket';
 import cors from '@fastify/cors';
 
-import { config, isLocalRuntimeEnabled, isTunnelMode } from './config.js';
+import { config, isLocalRuntimeEnabled, isTunnelMode, isIngressListenerEnabled, isRuntimeListenerEnabled } from './config.js';
 import { networkManager } from './docker/index.js';
 import { startHealthMonitor, stopHealthMonitor } from './services/health-monitor.js';
 import { startReverseProxy, stopReverseProxy } from './proxy/reverse-proxy-server.js';
+import { startIngressListener, stopIngressListener } from './proxy/ingress-listener.js';
+import { startRuntimeListener, stopRuntimeListener } from './proxy/runtime-listener.js';
 import authPlugin from './plugins/auth.js';
 import capabilitiesHandler from './handlers/capabilities.js';
 import appsHandler from './handlers/apps.js';
@@ -179,6 +181,17 @@ async function main(): Promise<void> {
 			await startReverseProxy();
 			fastify.log.info({ proxyPort: config.PROXY_PORT }, 'native reverse proxy started');
 		}
+
+		// Two NEW, separate listeners gated by node role (PROXY_ROLE) — a node
+		// with no role starts neither, leaving the block above byte-identical.
+		if (isIngressListenerEnabled(config)) {
+			await startIngressListener();
+			fastify.log.info({ port: config.APPS_INGRESS_PORT }, 'ingress proxy listener started');
+		}
+		if (isRuntimeListenerEnabled(config)) {
+			await startRuntimeListener();
+			fastify.log.info({ port: config.RUNTIME_PROXY_PORT, host: config.MESH_BIND_IP }, 'runtime proxy listener started');
+		}
 	} catch (err) {
 		logFatal(err, 'failed to start');
 		process.exit(1);
@@ -199,6 +212,8 @@ async function shutdown(signal: string): Promise<void> {
 		tunnelClient?.stop();
 		await mcpBrokerManager.closeAll();
 		await stopReverseProxy();
+		await stopIngressListener();
+		await stopRuntimeListener();
 		await fastify?.close();
 		fastify?.log.info('shutdown complete');
 		process.exit(0);

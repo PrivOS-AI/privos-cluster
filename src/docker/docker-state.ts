@@ -60,13 +60,37 @@ export async function getById(
 	return found[0] ?? null;
 }
 
+/**
+ * A schema-3 (v3) container must never be served by the legacy loopback
+ * listener's `splitHost`/`findByHost` fallback — v3 public hosts are routed
+ * exclusively through the new ingress/runtime listeners (`src/proxy/{ingress,
+ * runtime}-listener.ts`), so an old v3 label can never come back to life here.
+ */
+export function isEligibleForLegacyHostFallback(c: Container): boolean {
+	return c.mcpV3 !== true;
+}
+
 /** Per-host uniqueness (subdomain + domain) purely from labels. */
 export async function findByHost(subdomain: string, domain: string | null): Promise<Container | null> {
 	const filters: Record<string, string[]> = { label: [MANAGED_LABEL, `privos.subdomain=${subdomain}`] };
 	if (domain) filters.label.push(`privos.domain=${domain}`);
 	const found = await inspectManaged(filters);
 	// When domain is null, exclude containers that DO carry a domain.
-	return found.find((c) => (c.domain ?? null) === (domain ?? null)) ?? null;
+	return found.find((c) => (c.domain ?? null) === (domain ?? null) && isEligibleForLegacyHostFallback(c)) ?? null;
+}
+
+/**
+ * Runtime-listener host resolution: host → appId (from the fleet host table)
+ * → container, resolved by labels alone (never by the table's `containerId`
+ * string), scoped to schema-3 so a stale table entry can never point at a
+ * plain/v2 container of the same appId/workspace.
+ */
+export async function findByAppId(appId: string, workspaceId: string): Promise<Container | null> {
+	const filters: Record<string, string[]> = {
+		label: [MANAGED_LABEL, `privos.app-id=${appId}`, `privos.workspace=${workspaceId}`, 'privos.mcp.schema=3'],
+	};
+	const found = await inspectManaged(filters);
+	return found[0] ?? null;
 }
 
 /** Sum of allocated resources across managed containers (budget check). */

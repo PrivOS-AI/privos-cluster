@@ -79,6 +79,23 @@ const ConfigSchema = z.object({
 
 	// CORS — comma-separated origins, or "*" for any. Empty disables CORS entirely.
 	CORS_ORIGIN: z.string().default('http://localhost:5173'),
+
+	// Agent proxy role — two NEW, separate listeners on top of the legacy
+	// loopback one above (PROXY_PORT/REVERSE_PROXY_MODE), gated by node role.
+	// Unset (the default) starts NEITHER: a node with no role is byte-identical
+	// to today. INGRESS/BOTH nodes serve cloudflared; RUNTIME/BOTH nodes serve
+	// the mesh. See `src/proxy/{ingress-listener.ts,runtime-listener.ts}`.
+	PROXY_ROLE: z.enum(['INGRESS', 'RUNTIME', 'BOTH']).optional(),
+	// Loopback port for the ingress listener; only cloudflared's local connector dials it.
+	APPS_INGRESS_PORT: z.coerce.number().int().positive().default(8181),
+	// Mesh-facing port for the runtime listener.
+	RUNTIME_PROXY_PORT: z.coerce.number().int().positive().default(8282),
+	// This node's own WireGuard mesh IP — the runtime listener binds it, and the
+	// ingress listener uses it to prefer a local runtime replica.
+	MESH_BIND_IP: z.string().optional(),
+	// Ed25519 signing key used by the ingress listener to sign every forwarded
+	// request; auto-generated on first boot if the file does not exist yet.
+	PROXY_INGRESS_SIGNING_KEY_PATH: z.string().startsWith('/').default('/var/lib/privos/ingress-signing-key.json'),
 }).superRefine((cfg, ctx) => {
 	// Outside fleet mode, boot requires EITHER a JWT_SECRET (fleet/master HTTP
 	// deployment path, unchanged) OR a PRIVOS_HUB_URL (tunnel mode). A tunnel
@@ -136,6 +153,25 @@ const ConfigSchema = z.object({
 			});
 		}
 	}
+
+	// RUNTIME/BOTH binds the runtime listener on the node's OWN mesh IP — there is
+	// no safe default for another node's address, so it must be configured.
+	if ((cfg.PROXY_ROLE === 'RUNTIME' || cfg.PROXY_ROLE === 'BOTH') && !/^10\.88\.\d{1,3}\.\d{1,3}$/.test(cfg.MESH_BIND_IP ?? '')) {
+		ctx.addIssue({
+			code: z.ZodIssueCode.custom,
+			path: ['MESH_BIND_IP'],
+			message: 'PROXY_ROLE=RUNTIME|BOTH requires MESH_BIND_IP to be a WireGuard 10.88.0.0/16 address',
+		});
+	}
+
+	// INGRESS/BOTH reports its identity at /_privos/ingress-id for per-connector probes.
+	if ((cfg.PROXY_ROLE === 'INGRESS' || cfg.PROXY_ROLE === 'BOTH') && !cfg.FLEET_NODE_ID) {
+		ctx.addIssue({
+			code: z.ZodIssueCode.custom,
+			path: ['FLEET_NODE_ID'],
+			message: 'PROXY_ROLE=INGRESS|BOTH requires FLEET_NODE_ID (reported at /_privos/ingress-id)',
+		});
+	}
 });
 
 export type Config = z.infer<typeof ConfigSchema>;
@@ -164,6 +200,16 @@ export function isLocalRuntimeEnabled(
 	if (cfg.CLUSTER_LOCAL_RUNTIME === 'off') return false;
 	if (cfg.CLUSTER_LOCAL_RUNTIME === 'on') return true;
 	return isTunnelMode(cfg);
+}
+
+/** True when this node's role starts the new loopback ingress listener (`PROXY_ROLE=INGRESS|BOTH`). */
+export function isIngressListenerEnabled(cfg: Pick<Config, 'PROXY_ROLE'>): boolean {
+	return cfg.PROXY_ROLE === 'INGRESS' || cfg.PROXY_ROLE === 'BOTH';
+}
+
+/** True when this node's role starts the new mesh-facing runtime listener (`PROXY_ROLE=RUNTIME|BOTH`). */
+export function isRuntimeListenerEnabled(cfg: Pick<Config, 'PROXY_ROLE'>): boolean {
+	return cfg.PROXY_ROLE === 'RUNTIME' || cfg.PROXY_ROLE === 'BOTH';
 }
 
 /**
