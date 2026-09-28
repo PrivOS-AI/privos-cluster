@@ -47,6 +47,11 @@ function fixture() {
 			if (update.$set) Object.assign(row, update.$set);
 			return { matchedCount: 1 };
 		},
+		deleteMany: async (filter: Record<string, unknown>) => {
+			const doomed = hostRows.filter((row) => matchesRow(row as unknown as Record<string, unknown>, filter));
+			for (const row of doomed) hostRows.splice(hostRows.indexOf(row), 1);
+			return { deletedCount: doomed.length };
+		},
 		updateMany: async (filter: Record<string, unknown>, update: { $set?: Partial<AppHostRecord>; $unset?: Record<string, unknown> }) => {
 			const matched = hostRows.filter((row) => matchesRow(row as unknown as Record<string, unknown>, filter));
 			for (const row of matched) {
@@ -164,7 +169,7 @@ test('setDesiredHosts refuses more than one primary', async () => {
 	);
 });
 
-test('setDesiredHosts writes new rows, updates existing ones, and moves anything no longer desired to DELETING', async () => {
+test('setDesiredHosts writes new rows, updates existing ones, and retires anything no longer desired', async () => {
 	const state = fixture();
 	const { registry, hostRows } = state;
 	await registry.setDesiredHosts({
@@ -172,9 +177,11 @@ test('setDesiredHosts writes new rows, updates existing ones, and moves anything
 		hosts: [
 			{ hostname: 'a.privos.link', kind: 'VANITY', primary: true, state: 'ACTIVE' },
 			{ hostname: 'b.privos.link', kind: 'VANITY', primary: false, state: 'ACTIVE' },
+			{ hostname: 'shop.customer.com', kind: 'CUSTOM', primary: false, state: 'ACTIVE' },
 		],
 	});
-	assert.equal(hostRows.length, 2);
+	assert.equal(hostRows.length, 3);
+	hostRows.find((row) => row._id === 'shop.customer.com')!.cfHostnameId = 'cf-id-1';
 	assert.equal(state.publisherDirtyCalls, 1);
 	assert.equal(state.cfNotifyCalls, 1);
 
@@ -183,9 +190,25 @@ test('setDesiredHosts writes new rows, updates existing ones, and moves anything
 		hosts: [{ hostname: 'a.privos.link', kind: 'VANITY', primary: true, state: 'SUSPENDED' }],
 	});
 	const a = hostRows.find((row) => row._id === 'a.privos.link')!;
-	const b = hostRows.find((row) => row._id === 'b.privos.link')!;
 	assert.equal(a.state, 'SUSPENDED');
-	assert.equal(b.state, 'DELETING', 'dropped from the desired set → DELETING, never silently deleted');
+	// No CF hostname → nothing left to tear down, so the row goes at once (nothing
+	// else ever finalizes it). A CF-backed row waits in DELETING for the CF worker.
+	assert.equal(hostRows.some((row) => row._id === 'b.privos.link'), false);
+	assert.equal(hostRows.find((row) => row._id === 'shop.customer.com')!.state, 'DELETING');
+});
+
+test('a hostname removed and then added again is re-created, even over a leftover DELETING row', async () => {
+	const { registry, hostRows } = fixture();
+	const host = { hostname: 'shop--acme.privos.link', kind: 'TENANT' as const, primary: false, state: 'ACTIVE' as const };
+	await registry.setDesiredHosts({ workspaceId: 'ws-1', appId: 'app-1', listingId: 'listing-1', hosts: [host] });
+	await registry.setDesiredHosts({ workspaceId: 'ws-1', appId: 'app-1', listingId: 'listing-1', hosts: [] });
+	assert.equal(hostRows.length, 0);
+	// A row left DELETING without a CF hostname by an older master build.
+	hostRows.push({ ...host, _id: host.hostname, workspaceId: 'ws-1', appId: 'app-1', listingId: 'listing-1', state: 'DELETING', createdAt: new Date(), updatedAt: new Date() } as any);
+	await registry.reserve({ workspaceId: 'ws-1', appId: 'app-1', listingId: 'listing-1', hostname: host.hostname, kind: 'TENANT' });
+	await registry.setDesiredHosts({ workspaceId: 'ws-1', appId: 'app-1', listingId: 'listing-1', hosts: [host] });
+	assert.equal(hostRows.length, 1);
+	assert.equal(hostRows[0]!.state, 'PENDING');
 });
 
 test('setDesiredHosts refuses a hostname another app already holds, tagging the conflicting hostname', async () => {
@@ -222,7 +245,7 @@ test('removeAllAppHosts scoped to a generationId keeps a reinstall\'s new hosts'
 	assert.equal(removedGen1, 0);
 	const removedGen2 = await registry.removeAllAppHosts('app-1', 'gen-2');
 	assert.equal(removedGen2, 2);
-	assert.ok(hostRows.every((row) => row.state === 'DELETING'));
+	assert.equal(hostRows.length, 0, 'label-only hosts have nothing left to tear down');
 });
 
 test('setWorkspaceHostsSuspended flips ACTIVE hosts to WS_SUSPENDED (keeping the label/CF hostname) and resume clears it', async () => {

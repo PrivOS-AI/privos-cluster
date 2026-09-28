@@ -156,6 +156,12 @@ export class AppHostRegistry {
 			throw Object.assign(new Error('multiple_primary_hosts'), { code: 'MULTIPLE_PRIMARY_HOSTS', statusCode: 400 });
 		}
 		const rows = await this.deps.locks.run(input.workspaceId, async () => {
+			// A DELETING row with no CF hostname is dead (nothing left to tear down);
+			// clear this app's so a hostname removed and then added again inserts
+			// cleanly instead of colliding with its own leftover.
+			await this.deps.repositories.appHosts.deleteMany({
+				workspaceId: input.workspaceId, appId: input.appId, state: 'DELETING', cfHostnameId: { $exists: false },
+			});
 			const current = await this.deps.repositories.appHosts.find({
 				workspaceId: input.workspaceId,
 				appId: input.appId,
@@ -186,10 +192,15 @@ export class AppHostRegistry {
 						await this.deps.namespace.hold(label, { workspaceId: input.workspaceId, listingId: input.listingId });
 					} catch (error) {
 						if ((error as { code?: string }).code !== 'LABEL_ALREADY_CLAIMED') throw error;
-						throw Object.assign(
-							new Error(`host_conflict: ${host.hostname}`),
-							{ code: 'HOST_CONFLICT', statusCode: 409, hostname: host.hostname },
-						);
+						// Same self-heal as `reserve`: a label this workspace already holds
+						// (a host it removed and now adds back — labels are never freed) is
+						// not a conflict. Only a foreign owner is.
+						if (!(await this.deps.namespace.isAvailableFor(label, input.workspaceId))) {
+							throw Object.assign(
+								new Error(`host_conflict: ${host.hostname}`),
+								{ code: 'HOST_CONFLICT', statusCode: 409, hostname: host.hostname },
+							);
+						}
 					}
 				}
 				const row: AppHostRecord = {
@@ -217,12 +228,9 @@ export class AppHostRegistry {
 				}
 				written.push(row);
 			}
-			// Anything currently on the app but no longer in the desired set moves
-			// to DELETING; its CF hostname (if any) is torn down by the async worker.
+			// Anything currently on the app but no longer in the desired set is retired.
 			const removed = current.filter((row) => !desired.has(row._id));
-			for (const row of removed) {
-				await this.deps.repositories.appHosts.updateOne({ _id: row._id }, { $set: { state: 'DELETING', updatedAt: now } });
-			}
+			if (removed.length > 0) await this.retire({ _id: { $in: removed.map((row) => row._id) } }, now);
 			return [...written, ...removed.map((row) => ({ ...row, state: 'DELETING' as const, updatedAt: now }))];
 		});
 		this.deps.publisher?.markDirty();
@@ -254,16 +262,28 @@ export class AppHostRegistry {
 	 */
 	async removeAllAppHosts(appId: string, generationId?: string): Promise<number> {
 		const filter = generationId ? { appId, generationId } : { appId };
-		const now = new Date();
-		const result = await this.deps.repositories.appHosts.updateMany(
-			{ ...filter, state: { $ne: 'DELETING' } },
-			{ $set: { state: 'DELETING', updatedAt: now } },
-		);
-		if (result.modifiedCount > 0) {
+		const retired = await this.retire(filter, new Date());
+		if (retired > 0) {
 			this.deps.publisher?.markDirty();
 			this.deps.cfWorker?.notify();
 		}
-		return result.modifiedCount;
+		return retired;
+	}
+
+	/**
+	 * Takes rows out of service. Only a CUSTOM host carries a Cloudflare custom
+	 * hostname; the CF worker deletes such a row once the CF call succeeds, so it
+	 * goes to DELETING. Every other row has nothing left to tear down and is
+	 * deleted outright — nothing else ever finalizes a DELETING row without a CF
+	 * hostname. The label stays held either way (tombstones are forever).
+	 */
+	private async retire(filter: Record<string, unknown>, now: Date): Promise<number> {
+		const deleted = await this.deps.repositories.appHosts.deleteMany({ ...filter, cfHostnameId: { $exists: false } });
+		const marked = await this.deps.repositories.appHosts.updateMany(
+			{ ...filter, state: { $ne: 'DELETING' } },
+			{ $set: { state: 'DELETING', updatedAt: now } },
+		);
+		return deleted.deletedCount + marked.modifiedCount;
 	}
 
 	/**
