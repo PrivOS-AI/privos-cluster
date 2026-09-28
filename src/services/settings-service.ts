@@ -68,6 +68,14 @@ export function getMaxCpus(): number | null {
 	return config.CLUSTER_MAX_CPUS ?? null;
 }
 
+export function getBudgetRule(): { cpuReserved: number; cpuOvercommit: number; memoryFraction: number } {
+	return {
+		cpuReserved: config.CLUSTER_CPU_RESERVED,
+		cpuOvercommit: config.CLUSTER_CPU_OVERCOMMIT,
+		memoryFraction: config.CLUSTER_MEMORY_FRACTION,
+	};
+}
+
 export function getImageRegistryAllowlist(): string[] {
 	return config.IMAGE_REGISTRY_ALLOWLIST
 		.split(',')

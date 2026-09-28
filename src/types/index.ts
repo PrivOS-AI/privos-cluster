@@ -92,6 +92,14 @@ export interface ClusterResources {
 		memoryMb: number;
 		cpus: number;
 	};
+	/** The allocation budget `available` is measured against, and where it came
+	 * from: `configured` (CLUSTER_MAX_*) or `rule` (derived from the host). */
+	budget: {
+		memoryMb: number;
+		cpus: number;
+		memorySource: 'configured' | 'rule';
+		cpuSource: 'configured' | 'rule';
+	};
 }
 
 export interface DeployRequest {

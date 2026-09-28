@@ -17,8 +17,17 @@ const ConfigSchema = z.object({
 		.transform((v) => v === 'true' || v === '1'),
 	APP_NETWORK_NAME: z.string().optional(),
 	IMAGE_REGISTRY_ALLOWLIST: z.string().default(''),
+	// Allocation budget for app containers. An explicit CLUSTER_MAX_* is the
+	// final budget. Unset, the budget follows the app-node rule:
+	// CPU = (host cores - CLUSTER_CPU_RESERVED) x CLUSTER_CPU_OVERCOMMIT, because a
+	// container's --cpus is a ceiling on a shared core, not a dedicated core;
+	// RAM = host RAM x CLUSTER_MEMORY_FRACTION at 1:1, because exceeding memory
+	// limits OOM-kills containers.
 	CLUSTER_MAX_MEMORY_MB: z.coerce.number().int().positive().optional(),
 	CLUSTER_MAX_CPUS: z.coerce.number().positive().optional(),
+	CLUSTER_CPU_RESERVED: z.coerce.number().min(0).default(2),
+	CLUSTER_CPU_OVERCOMMIT: z.coerce.number().positive().default(4),
+	CLUSTER_MEMORY_FRACTION: z.coerce.number().gt(0).max(1).default(0.7),
 	CLUSTER_OPERATOR_ROUTES: z.enum(['on', 'off']).default('off'),
 
 	JWT_SECRET: z.string().min(16, 'JWT_SECRET must be at least 16 chars').optional(),
