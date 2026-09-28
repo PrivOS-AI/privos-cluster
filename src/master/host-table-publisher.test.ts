@@ -232,3 +232,26 @@ test('an INGRESS node without a registered ingress signing key contributes no ve
 	const ingressCall = calls.find((call) => call.path.includes('/ingress'))!;
 	assert.deepEqual(ingressCall.body.signingKeys, []);
 });
+
+test('the runtime table carries exactly the full hostnames the ingress rules route to each app', async () => {
+	const { publisher, nodes, apps, hosts, calls } = fixture();
+	nodes.push(node({ nodeId: 'app-eu-01', role: 'BOTH', meshIp: '10.88.0.21' }));
+	apps.push(
+		app({ appId: 'app-1', replicas: [{ replicaId: 'r-1', nodeId: 'app-eu-01', containerId: 'c-1', state: 'running' }] }),
+		app({ appId: 'app-2', subdomain: 'legacy-abc', replicas: [{ replicaId: 'r-2', nodeId: 'app-eu-01', containerId: 'c-2', state: 'running' }] }),
+	);
+	hosts.push({
+		_id: 'shop--acme.apps.example.com', workspaceId: 'ws-1', appId: 'app-1', listingId: 'listing-1',
+		kind: 'TENANT', primary: false, state: 'ACTIVE', createdAt: new Date(), updatedAt: new Date(),
+	});
+	await publisher.publishOnce();
+	const runtime = calls.find((call) => call.path.includes('/runtime'))!.body.apps;
+	const rules = calls.find((call) => call.path.includes('/ingress'))!.body.rules;
+	// The runtime listener matches the forwarded Host, so a bare label or a missing
+	// registry host here means the ingress forwards and the runtime answers 404.
+	assert.deepEqual(runtime.find((e: { appId: string }) => e.appId === 'app-1').hosts, ['shop--acme.apps.example.com']);
+	assert.deepEqual(runtime.find((e: { appId: string }) => e.appId === 'app-2').hosts, ['legacy-abc.apps.example.com']);
+	for (const rule of rules) {
+		assert.ok(runtime.find((e: { appId: string }) => e.appId === rule.appId).hosts.includes(rule.host), `runtime table misses ${rule.host}`);
+	}
+});

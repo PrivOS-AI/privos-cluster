@@ -233,7 +233,7 @@ export class HostTablePublisher {
 	/** Runtime tables first, then ingress: an ingress node must never learn a route before the runtime node behind it has the container to serve it. */
 	private async pushSnapshot(snapshot: HostTableSnapshot, revision: number): Promise<void> {
 		const runtimeResults = await Promise.allSettled(
-			snapshot.runtimeNodes.map((node) => this.pushRuntimeTable(node, snapshot.apps, revision)),
+			snapshot.runtimeNodes.map((node) => this.pushRuntimeTable(node, snapshot.apps, snapshot.rules, revision)),
 		);
 		const ingressResults = await Promise.allSettled(
 			snapshot.ingressNodes.map((node) => this.pushIngressTable(node, snapshot.rules, snapshot.signingKeys, revision)),
@@ -244,7 +244,13 @@ export class HostTablePublisher {
 		}
 	}
 
-	private async pushRuntimeTable(node: MasterNode, apps: MasterApp[], revision: number): Promise<void> {
+	private async pushRuntimeTable(node: MasterNode, apps: MasterApp[], rules: IngressRule[], revision: number): Promise<void> {
+		// The runtime listener looks up the forwarded Host (a full hostname), so an
+		// app's runtime hosts are exactly the hosts the ingress rules route to it —
+		// registry hosts, or the legacy `<label>.<baseDomain>` fallback. Deriving
+		// both tables from the same rules keeps them from ever disagreeing.
+		const hostsByApp = new Map<string, string[]>();
+		for (const rule of rules) hostsByApp.set(rule.appId, [...(hostsByApp.get(rule.appId) ?? []), rule.host]);
 		const entries: RuntimeTableEntry[] = [];
 		for (const app of apps) {
 			for (const replica of app.replicas) {
@@ -253,7 +259,7 @@ export class HostTablePublisher {
 					appId: app.appId,
 					workspaceId: app.workspaceId,
 					containerId: replica.containerId,
-					hosts: app.subdomain ? [app.subdomain] : [],
+					hosts: hostsByApp.get(app.appId) ?? [],
 				});
 			}
 		}
