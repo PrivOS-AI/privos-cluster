@@ -731,7 +731,14 @@ export class DeploymentService {
 				kind: 'mcp-v3',
 				mcpRuntimeInstallationId: runtimeInstallationId,
 			});
-			if (!app) throw Object.assign(new Error('MCP v3 app not found'), { statusCode: 404 });
+			// The row is written at PROVISIONING before any replica exists, and a
+			// later install only ever replaces a REMOVED tombstone, so no row means
+			// this cluster never ran the generation (or already removed it). The
+			// distinct code lets the Hub count that as proven absence, unlike a
+			// missing inventory under a row that does exist.
+			if (!app) {
+				throw Object.assign(new Error('MCP v3 app not found'), { statusCode: 404, code: 'runtime_not_registered' });
+			}
 			const inventoryId = app.runtimeResourceInventoryId
 				?? `inventory-${sha256Base64Url([
 					workspaceId,

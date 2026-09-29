@@ -362,7 +362,9 @@ test('recovering the inventory of a generation stranded mid-install finalizes it
 	// An unknown generation stays a 404, never an invented inventory.
 	await assert.rejects(
 		state.service.recoverMcpV3InventoryAttestation('workspace-1', 'runtime-unknown'),
-		(error: unknown) => (error as { statusCode?: number }).statusCode === 404,
+		(error: unknown) =>
+			(error as { statusCode?: number }).statusCode === 404 &&
+			(error as { code?: string }).code === 'runtime_not_registered',
 	);
 });
 

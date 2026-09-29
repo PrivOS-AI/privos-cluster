@@ -664,8 +664,10 @@ export function hubFacingRoutes(deps: {
 					runtimeInstallationId,
 				);
 			} catch (error) {
-				const statusCode = (error as { statusCode?: number }).statusCode;
-				if (statusCode === 404) return reply.code(404).send({ error: 'not_found' });
+				const { statusCode, code } = error as { statusCode?: number; code?: string };
+				if (statusCode === 404) {
+					return reply.code(404).send({ error: 'not_found', ...(code === 'runtime_not_registered' ? { code } : {}) });
+				}
 				return reply.code(409).send({
 					error: 'runtime_inventory_recovery_failed',
 					code: clusterMcpSafeReason(error, 'runtime_inventory_recovery_failed'),
