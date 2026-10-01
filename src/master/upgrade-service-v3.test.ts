@@ -169,6 +169,7 @@ test('a verified upgrade swaps every replica through the existing redeploy primi
 	assert.equal(result.swapStrategy, 'STOP_THEN_CREATE');
 	assert.equal(result.app.manifestDigest, `sha256:${'f'.repeat(64)}`);
 	assert.equal(result.app.imageDigest, `sha256:${'f'.repeat(64)}`);
+	assert.equal(result.app.image, `registry.example/app@sha256:${'f'.repeat(64)}`);
 	assert.equal(result.app.mcpPreviousManifestDigest, `sha256:${'e'.repeat(64)}`);
 	assert.equal(result.app.mcpPreviousImageDigest, `sha256:${'e'.repeat(64)}`);
 	assert.equal(result.app.mcpAppliedRevision, 1);

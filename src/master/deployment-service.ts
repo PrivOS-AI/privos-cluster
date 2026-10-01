@@ -994,7 +994,10 @@ export class DeploymentService {
 				workspaceId,
 				listingId: app.listingId,
 				versionDigest: app.versionDigest,
-				image: app.image,
+				// The repository, not `app.image`: a row upgraded before the upgrade
+				// started re-pinning `image` still carries the PREVIOUS digest's pin,
+				// and the agent refuses a pin that disagrees with `digest`.
+				image: imageRepositoryOf(app.image),
 				digest: app.imageDigest,
 				tag: 'latest',
 				port: app.port,
@@ -1303,6 +1306,9 @@ export class DeploymentService {
 					{
 						$set: {
 							manifestDigest: command.targetManifestDigest,
+							// Keep `image` pinned to the digest now running, like every other
+							// writer; leaving the old pin made each later reconfigure fail.
+							image: `${appImageRepository}@${command.targetImageDigest}`,
 							imageDigest: command.targetImageDigest,
 							mcpPreviousManifestDigest: command.previousManifestDigest,
 							mcpPreviousImageDigest: command.previousImageDigest,

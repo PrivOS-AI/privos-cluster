@@ -418,3 +418,12 @@ test('replaying the applied epoch with the identical resources is idempotent', a
 	assert.equal(state.agentCalls.length, 1, 'an idempotent repeat must not touch a replica again');
 	assert.equal(state.lifecycleEvents.length, 1, 'an idempotent repeat must not double-emit RESIZED');
 });
+
+test('a row upgraded while its image still pinned the previous digest reconfigures against the running digest', async () => {
+	const state = fixture(runningApp({ imageDigest: `sha256:${'f'.repeat(64)}` }));
+	await state.service.reconfigureMcpV3('workspace-1', command());
+
+	const [call] = state.agentCalls;
+	assert.equal(call!.body.image, 'registry.example/app');
+	assert.equal(call!.body.digest, `sha256:${'f'.repeat(64)}`);
+});
