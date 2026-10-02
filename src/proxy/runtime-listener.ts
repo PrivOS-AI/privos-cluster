@@ -32,7 +32,7 @@ import { request } from 'undici';
 import pino from 'pino';
 import { config } from '../config.js';
 import { canonicalizePath, matchLongestPrefix, type PathRoute } from './canonical-path.js';
-import { verifyRequest, type SignedRequestFields } from './forward-signature.js';
+import { EDGE_SIGNATURE_HEADERS, verifyRequest, type SignedRequestFields } from './forward-signature.js';
 import type { ReplayCache } from './replay-cache.js';
 import { createReplayCache } from './replay-cache.js';
 import { stripPrivosLinkCookieDomains } from './cookie-domain-strip.js';
@@ -159,14 +159,14 @@ async function resolveTarget(deps: RuntimeListenerDeps, host: string, pathname: 
 	return { target: { url: `http://${ip}:${container.port}`, containerId: container.id } };
 }
 
-/** Fresh forwarded-header set — NEVER copies an incoming X-Forwarded- or X-Privos- header. */
+/** Fresh forwarded-header set — NEVER copies an incoming X-Forwarded- or edge signature header. */
 function buildForwardedHeaders(req: http.IncomingMessage, clientIp: string, host: string, hopByHop: Set<string> = HOP_BY_HOP): Record<string, string> {
 	const out: Record<string, string> = {};
 	for (const [key, value] of Object.entries(req.headers)) {
 		if (value === undefined) continue;
 		const lower = key.toLowerCase();
 		if (hopByHop.has(lower)) continue;
-		if (lower.startsWith('x-forwarded-') || lower.startsWith('x-privos-')) continue;
+		if (lower.startsWith('x-forwarded-') || EDGE_SIGNATURE_HEADERS.has(lower)) continue;
 		out[key] = Array.isArray(value) ? value.join(', ') : value;
 	}
 	out['host'] = host; // the container gets the original public Host, not the mesh IP:port it's dialed on

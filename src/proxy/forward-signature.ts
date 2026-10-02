@@ -15,6 +15,22 @@ import crypto, { type KeyObject, type JsonWebKey } from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
+/**
+ * The headers the ingress listener sets to carry the forward signature. They are
+ * the only `x-privos-*` headers the edge owns: a client copy is dropped at ingress
+ * and the runtime listener drops them before the container. Every other
+ * `x-privos-*` header is application data (e.g. the Hub's
+ * `X-PrivOS-Bot-Api-Secret-Token` on bot webhooks) and must pass through.
+ */
+export const EDGE_SIGNATURE_HEADERS: ReadonlySet<string> = new Set([
+	'x-privos-target-node',
+	'x-privos-nonce',
+	'x-privos-ts',
+	'x-privos-kid',
+	'x-privos-client-ip',
+	'x-privos-sig',
+]);
+
 export interface SignedRequestFields {
 	/** The runtime node's mesh IP this request is signed for — see the phase-note
 	 * in `ingress-listener.ts` on why this is a mesh IP rather than a fleet node id. */

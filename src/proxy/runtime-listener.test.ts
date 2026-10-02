@@ -184,7 +184,7 @@ test('a client-sent X-Forwarded-For/X-Privos-* header is never trusted — only 
 	const identity = makeIdentity();
 	const upstream = http.createServer((req, res) => {
 		res.writeHead(200);
-		res.end(`fwd-for=${req.headers['x-forwarded-for']}`);
+		res.end(`fwd-for=${req.headers['x-forwarded-for']} app=${req.headers['x-privos-bot-api-secret-token']} sig=${req.headers['x-privos-sig']}`);
 	});
 	const uport = await listen(upstream);
 	const deps = baseDeps(identity, { findContainerByAppId: async () => fakeContainer({ port: uport }), getContainerIp: async () => '127.0.0.1' });
@@ -193,9 +193,14 @@ test('a client-sent X-Forwarded-For/X-Privos-* header is never trusted — only 
 
 	const res = await requestWithHost(port, '/ui', {
 		'x-forwarded-for': 'spoofed-attacker-ip',
+		'x-privos-bot-api-secret-token': 'hub-webhook-secret',
 		...signedHeaders(identity, { clientIp: '203.0.113.9' }),
 	});
-	assert.equal(await res.text(), 'fwd-for=203.0.113.9', 'the spoofed client header is dropped; only the signed clientIp is forwarded');
+	assert.equal(
+		await res.text(),
+		'fwd-for=203.0.113.9 app=hub-webhook-secret sig=undefined',
+		'the spoofed client header and the edge signature are dropped; application x-privos-* headers pass through',
+	);
 
 	server.close();
 	upstream.close();

@@ -3,8 +3,8 @@
  * connector for the `privos-apps` tunnel ever dials `127.0.0.1:APPS_INGRESS_PORT`
  * — Cloudflare itself terminates TLS and injects `CF-Connecting-IP`, which is
  * the ONLY source this listener trusts for the client's real IP. Any
- * client-sent `X-Forwarded-*`/`X-Privos-*` header is dropped before the
- * request is re-signed and forwarded to a runtime node over the mesh.
+ * client-sent `X-Forwarded-*` or edge signature header (`EDGE_SIGNATURE_HEADERS`)
+ * is dropped before the request is re-signed and forwarded to a runtime node over the mesh.
  *
  * Exact-host lookup only — an unknown host is a 404, NEVER a `splitHost`
  * fallback (that fallback exists solely for the legacy loopback listener's
@@ -21,7 +21,7 @@ import net from 'node:net';
 import { request } from 'undici';
 import pino from 'pino';
 import { config } from '../config.js';
-import { generateNonce, signRequest, type SignedRequestFields, type SigningIdentity, loadOrCreateSigningIdentity } from './forward-signature.js';
+import { EDGE_SIGNATURE_HEADERS, generateNonce, signRequest, type SignedRequestFields, type SigningIdentity, loadOrCreateSigningIdentity } from './forward-signature.js';
 import { findIngressRuleByHost, ingressTableAgeMs, type IngressRule } from './host-table.js';
 
 const logger = pino({ level: config.LOG_LEVEL }).child({ component: 'ingress-listener' });
@@ -86,7 +86,7 @@ function stripClientHeaders(req: http.IncomingMessage, hopByHop: Set<string> = H
 		if (value === undefined) continue;
 		const lower = key.toLowerCase();
 		if (hopByHop.has(lower) || lower === 'host') continue; // host is set explicitly below
-		if (lower.startsWith('x-forwarded-') || lower.startsWith('x-privos-')) continue; // client-sent — never trusted
+		if (lower.startsWith('x-forwarded-') || EDGE_SIGNATURE_HEADERS.has(lower)) continue; // client-sent — never trusted
 		out[key] = Array.isArray(value) ? value.join(', ') : value;
 	}
 	return out;

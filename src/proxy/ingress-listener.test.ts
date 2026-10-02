@@ -115,6 +115,7 @@ test('forwards to the runtime node with the original Host, a fresh signature, an
 			hasSig: Boolean(req.headers['x-privos-sig']),
 			targetNode: req.headers['x-privos-target-node'],
 			clientIp: req.headers['x-privos-client-ip'],
+			appSecret: req.headers['x-privos-bot-api-secret-token'],
 		}));
 	});
 	const rport = await listen(runtime);
@@ -123,13 +124,14 @@ test('forwards to the runtime node with the original Host, a fresh signature, an
 	const server = createIngressListener(baseDeps({ findRuleByHost: () => rule, runtimeProxyPort: rport, selfMeshIp: undefined }));
 	const port = await listen(server);
 
-	const res = await requestWithHost(port, '/ui', { host: 'shop--acme.privos.link', 'cf-connecting-ip': '203.0.113.7', 'x-forwarded-for': 'spoofed' });
+	const res = await requestWithHost(port, '/ui', { host: 'shop--acme.privos.link', 'cf-connecting-ip': '203.0.113.7', 'x-forwarded-for': 'spoofed', 'x-privos-client-ip': 'spoofed', 'x-privos-bot-api-secret-token': 'hub-webhook-secret' });
 	assert.equal(res.status, 200);
-	const body = (await res.json()) as { host: string; hasSig: boolean; targetNode: string; clientIp: string };
+	const body = (await res.json()) as { host: string; hasSig: boolean; targetNode: string; clientIp: string; appSecret: string };
 	assert.equal(body.host, 'shop--acme.privos.link');
 	assert.equal(body.hasSig, true);
 	assert.equal(body.targetNode, '127.0.0.1');
 	assert.equal(body.clientIp, '203.0.113.7');
+	assert.equal(body.appSecret, 'hub-webhook-secret', 'application x-privos-* headers (Hub bot webhook secret) pass through');
 
 	server.close();
 	runtime.close();
