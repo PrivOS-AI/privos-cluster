@@ -41,6 +41,7 @@ type World = {
 	nodeAvailable: boolean;
 	ingressFails: boolean;
 	appUpdates: Array<{ $set?: Record<string, unknown>; $unset?: Record<string, unknown> }>;
+	lifecycleEvents?: Array<Record<string, any>>;
 	operations: Map<string, any>;
 	checkpoints: Map<string, any>;
 	cleanupResults: Map<string, any>;
@@ -84,8 +85,14 @@ function buildService(world: World) {
 			},
 		},
 		apps: {
+			findOne: async () => ({ appId: 'cluster-app-1', resources: { memoryMb: 512, cpus: 0.5 } }),
 			updateOne: async (_filter: unknown, update: any) => {
 				world.appUpdates.push(update);
+			},
+		},
+		lifecycleEvents: {
+			insertOne: async (record: Record<string, any>) => {
+				world.lifecycleEvents?.push(record);
 			},
 		},
 		nodes: {
@@ -163,6 +170,32 @@ test('removes every declared resource and only then signs a completed acknowledg
 	assert.equal(world.appUpdates[0].$set?.state, 'REVOKING');
 	assert.equal(world.appUpdates.at(-1)?.$set?.state, 'REMOVED');
 	assert.ok(world.checkpoints.size >= 5);
+});
+
+test('a COMPLETED uninstall closes the app billable interval with an UNINSTALLED event', async () => {
+	const world = freshWorld({ lifecycleEvents: [] });
+	const result = await buildService(world).uninstall({ workspaceId: 'workspace-1', command, commandHash: 'D'.repeat(43) });
+	assert.equal(result.state, 'COMPLETED');
+	assert.equal(world.lifecycleEvents!.length, 1);
+	const [closing] = world.lifecycleEvents!;
+	assert.equal(closing.type, 'UNINSTALLED');
+	assert.equal(closing.appId, 'cluster-app-1');
+	assert.equal(closing.workspaceId, 'workspace-1');
+	assert.deepEqual(closing.resources, { memoryMb: 512, cpus: 0.5 });
+	assert.equal(closing.at, world.appUpdates.at(-1)?.$set?.updatedAt);
+});
+
+test('an uninstall that leaves residue keeps the billable interval open', async () => {
+	const world = freshWorld({
+		lifecycleEvents: [],
+		nodeOutcomes: {
+			remove: [],
+			absence: [{ kind: 'VOLUME', resourceId: 'volume:data', status: 'FAILED', reasonCode: 'volume_still_present' }],
+		},
+	});
+	const result = await buildService(world).uninstall({ workspaceId: 'workspace-1', command, commandHash: 'D'.repeat(43) });
+	assert.equal(result.state, 'CLEANUP_REQUIRED');
+	assert.deepEqual(world.lifecycleEvents, []);
 });
 
 test('E: a COMPLETED uninstall runs its own removeAllAppHosts teardown step, scoped to this generation', async () => {

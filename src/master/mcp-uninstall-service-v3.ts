@@ -190,10 +190,24 @@ export class McpUninstallServiceV3 {
 			},
 		);
 		if (complete) {
+			const app = await this.deps.repositories.apps.findOne({ appId: command.clusterAppId, workspaceId: command.workspaceId });
+			const removedAt = new Date();
 			await this.deps.repositories.apps.updateOne(
 				{ appId: command.clusterAppId, workspaceId: command.workspaceId },
-				{ $set: { state: 'REMOVED', updatedAt: new Date() }, $unset: { mcpActiveDeploymentKey: '' } },
+				{ $set: { state: 'REMOVED', updatedAt: removedAt }, $unset: { mcpActiveDeploymentKey: '' } },
 			);
+			// Closes the app's billable interval, exactly as a raw-app removal does;
+			// without it the usage rollup keeps metering the removed app.
+			if (app) {
+				await this.deps.repositories.lifecycleEvents.insertOne({
+					eventId: crypto.randomUUID(),
+					workspaceId: command.workspaceId,
+					appId: command.clusterAppId,
+					type: 'UNINSTALLED',
+					resources: app.resources,
+					at: removedAt,
+				});
+			}
 			// E: its own uninstall step, run for whatever this generation's
 			// inventory actually contains — scoped to `generationId` so a
 			// reinstall of the same `appId` under a NEW generation keeps that

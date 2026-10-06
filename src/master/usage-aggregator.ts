@@ -120,6 +120,16 @@ export function aggregateWorkspaceDay(
 		else appLevelEventsByApp.set(event.appId, [event]);
 	}
 
+	// A REMOVED document is the removal record of last resort: the protocol-v3
+	// uninstall marked documents REMOVED without a closing event, so an app
+	// removed that way still has an open interval in its event log. Its
+	// `updatedAt` is the removal time (nothing writes a REMOVED document again
+	// until a revive replaces it with a non-REMOVED one).
+	// ponytail: a later write to a REMOVED document would push this out; add a
+	// dedicated removedAt field if one ever appears.
+	const removedAtByApp = new Map<string, number>();
+	for (const doc of apps) if (doc.state === 'REMOVED') removedAtByApp.set(doc.appId, doc.updatedAt.getTime());
+
 	for (const [appId, appEvents] of appLevelEventsByApp) {
 		const sorted = [...appEvents].sort((a, b) => a.at.getTime() - b.at.getTime());
 		const closedSegments: Array<OpenInterval & { end: number }> = [];
@@ -143,7 +153,10 @@ export function aggregateWorkspaceDay(
 				open = null;
 			}
 		}
-		if (open) closedSegments.push({ ...open, end: accountingEnd });
+		if (open) {
+			const removedAt = removedAtByApp.get(appId);
+			closedSegments.push({ ...open, end: removedAt === undefined ? accountingEnd : Math.min(accountingEnd, Math.max(open.since, removedAt)) });
+		}
 
 		let installedMs = 0;
 		let maxMemoryMb = 0;
@@ -187,7 +200,7 @@ export function aggregateWorkspaceDay(
 		const removalTimes = events
 			.filter((event) => event.appId === app.appId && event.type === 'REMOVED' && event.at.getTime() > app.createdAt.getTime())
 			.map((event) => event.at.getTime());
-		const removedAt = removalTimes.length ? Math.min(...removalTimes) : undefined;
+		const removedAt = removalTimes.length ? Math.min(...removalTimes) : removedAtByApp.get(app.appId);
 		const storageStart = Math.max(start.getTime(), app.createdAt.getTime());
 		const storageEnd = Math.min(accountingEnd, removedAt ?? accountingEnd);
 		if (storageEnd <= storageStart) continue;
