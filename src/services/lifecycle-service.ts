@@ -1,8 +1,8 @@
 import crypto from 'crypto';
 import pino from 'pino';
 import { config } from '../config.js';
-import { containerManager, networkManager } from '../docker/index.js';
-import { imageRepositoryOf } from '../docker/image-reference.js';
+import { containerManager, imageManager, networkManager } from '../docker/index.js';
+import { imageRepositoryOf, resolveImmutableImageReference } from '../docker/image-reference.js';
 import * as dockerState from '../docker/docker-state.js';
 import { getHealth } from './health-monitor.js';
 import { checkResourceRequest } from './resource-check.js';
@@ -24,7 +24,7 @@ import type {
 	RedeployRequest,
 } from '../types/index.js';
 import type { JsonWebKey } from 'node:crypto';
-import { canonicalJson } from '../security/artifacts.js';
+import { canonicalJson, sha256 } from '../security/artifacts.js';
 import { assertRawRedeployAllowedForLabels } from './redeploy-secret-guard.js';
 
 const logger = pino({ level: config.LOG_LEVEL }).child({ component: 'lifecycle' });
@@ -843,6 +843,55 @@ export async function createAndStartRedeployedContainer(params: {
     }
 }
 
+/**
+ * An install made while the app was stateless has no data volume, and a
+ * redeploy only carries the old container's mounts — so the version that first
+ * declares `volumes` would run on a read-only root with nowhere to write. The
+ * upgrade that introduces the volume creates it (same name as an install would
+ * have) and mounts it. The declaration is read from the target image's manifest
+ * label and trusted only when it digests to the signed target manifest.
+ */
+export async function mountsForMcpV3Upgrade(input: {
+    mounts: Array<{ dockerVolumeName: string; mountPath: string }>;
+    image: { name: string; tag?: string; digest?: string };
+    manifestDigest: string;
+    workspaceId?: string;
+    containerId: string;
+    multiReplica: boolean;
+}): Promise<Array<{ dockerVolumeName: string; mountPath: string }>> {
+    if (input.mounts.length > 0) return input.mounts;
+    let raw: string | undefined;
+    try {
+        const reference = resolveImmutableImageReference(input.image.name, input.image.tag, input.image.digest);
+        raw = (await imageManager.inspect(reference))?.labels['io.privos.mcp.manifest'];
+    } catch {
+        // The image was just pulled by the same reference; an unreadable one
+        // keeps the long-standing behaviour (no new volume) rather than failing.
+        return input.mounts;
+    }
+    if (!raw) return input.mounts;
+    let manifest: { stateless?: unknown; volumes?: Array<{ name?: unknown; mountPath?: unknown; sizeMb?: unknown }> };
+    try {
+        manifest = JSON.parse(raw);
+    } catch {
+        return input.mounts;
+    }
+    const volume = manifest.stateless === false && Array.isArray(manifest.volumes) ? manifest.volumes[0] : undefined;
+    if (!volume || volume.name !== 'data' || typeof volume.mountPath !== 'string') return input.mounts;
+    if (sha256(canonicalJson(manifest)) !== input.manifestDigest) throw new Error('mcp_v3_upgrade_manifest_digest_mismatch');
+    // Two replicas would each get their own volume and split the app's state.
+    if (input.multiReplica) throw new Error('mcp_v3_upgrade_volume_requires_single_replica');
+    const dockerVolumeName = input.workspaceId
+        ? `privos-ws-${input.workspaceId}-app-${input.containerId}-data`
+        : `mcp-vol-${input.containerId.slice(0, 12)}-data`;
+    await containerManager.ensureVolume(dockerVolumeName, typeof volume.sizeMb === 'number' ? volume.sizeMb : undefined, {
+        'privos.workspace': input.workspaceId ?? '',
+        'privos.app-id': input.containerId,
+    });
+    logger.info({ containerId: input.containerId, dockerVolumeName, mountPath: volume.mountPath }, 'upgrade adds the data volume the new version declares');
+    return [{ dockerVolumeName, mountPath: volume.mountPath }];
+}
+
 export async function redeployContainer(
     containerId: string,
     req: RedeployRequest,
@@ -932,6 +981,19 @@ export async function redeployContainer(
         await containerManager.pullImage(c.image, c.tag, mcpV3PreviousBinding.imageDigest);
     }
 
+    // Resolved before the old container is touched, so a refusal here is
+    // non-destructive. A revert below keeps the old `mounts`.
+    const swapMounts = mcpV3Binding
+        ? await mountsForMcpV3Upgrade({
+            mounts,
+            image: { name: newImage, tag: newTag, digest: newDigest },
+            manifestDigest: mcpV3Binding.manifestDigest,
+            workspaceId: c.workspaceId ?? undefined,
+            containerId,
+            multiReplica: req.mcpV3MultiReplica === true,
+        })
+        : mounts;
+
     // Stop + remove the OLD Docker container FIRST, and only clear its broker
     // binding once that has actually succeeded. Doing it in the other order
     // (as an earlier version of this function did) leaves a window where a
@@ -971,7 +1033,7 @@ export async function redeployContainer(
             port: c.port,
             resources: newResources,
             envVars: swapEnvVars,
-            mounts,
+            mounts: swapMounts,
             subdomain: newSubdomain,
             baseDomain,
             createdAt: c.createdAt,

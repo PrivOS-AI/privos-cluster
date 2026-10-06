@@ -270,6 +270,7 @@ export const RedeployRequestSchema = z.object({
     runtimeResourceInventoryHash: z.string().regex(/^[A-Za-z0-9_-]{43}$/).optional(),
     platformEnvVars: z.record(PlatformEnvNameSchema, z.string().max(4096)).optional(),
     secretEnvKeys: z.array(EnvNameSchema).max(32).optional(),
+    mcpV3MultiReplica: z.literal(true).optional(),
 }).strict().superRefine((value, ctx) => {
     const requiresDigest = config.FLEET_MODE || value.image?.split('/').includes('marketplace');
     if ((requiresDigest || value.mcpV3Binding) && !value.digest) {

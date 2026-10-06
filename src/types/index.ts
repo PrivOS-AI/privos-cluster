@@ -196,6 +196,8 @@ export interface RedeployRequest {
 	envVars?: Record<string, string>;
 	platformEnvVars?: Record<string, string>;
 	secretEnvKeys?: string[];
+	/** Sent (only) when the v3 app runs more than one replica; such an upgrade may not add a data volume. */
+	mcpV3MultiReplica?: boolean;
 }
 
 export interface ContainerStatus {

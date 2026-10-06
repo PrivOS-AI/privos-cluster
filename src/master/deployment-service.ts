@@ -1246,6 +1246,9 @@ export class DeploymentService {
 					deploymentGrantHash,
 					resourceManifestHash: command.resourceManifestHash,
 				},
+				// Omitted for a single replica, so an agent that predates the field
+				// still accepts every upgrade the fleet actually sends today.
+				...(app.replicas.length > 1 ? { mcpV3MultiReplica: true } : {}),
 			});
 
 			// HA runs one replica at a time so the ingress always has a healthy
