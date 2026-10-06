@@ -498,7 +498,8 @@ export class ContainerManager {
         try {
             await this.docker.createVolume({
                 Name: name,
-                Labels: { 'mcp-app': 'true', ...labels },
+                // The declared size is the volume's soft quota (storage-quota-monitor).
+                Labels: { 'mcp-app': 'true', ...labels, ...(_sizeMb ? { 'privos.size-mb': String(_sizeMb) } : {}) },
             });
         } catch (err: any) {
             if (err.statusCode === 409) return; // already exists — idempotent
@@ -538,6 +539,21 @@ export class ContainerManager {
             filters: { label: ['mcp-app=true'] },
         });
         return result.Volumes ?? [];
+    }
+
+    /** Size and labels of every app volume in one Docker pass; `type=volume` keeps it to seconds. */
+    async appVolumeUsage(): Promise<Array<{ name: string; bytes: number; labels: Record<string, string> }>> {
+        // dockerode's df() drops its options, so ask the API directly; a full df also
+        // sizes every image and build-cache layer and takes minutes on an app node.
+        const usage: any = await new Promise((resolve, reject) => {
+            this.docker.modem.dial(
+                { path: '/system/df?', method: 'GET', options: { type: 'volume' }, statusCodes: { 200: true, 500: 'server error' } },
+                (err: unknown, data: unknown) => (err ? reject(err) : resolve(data)),
+            );
+        });
+        return (usage.Volumes ?? [])
+            .filter((volume: any) => volume.Labels?.['mcp-app'] === 'true')
+            .map((volume: any) => ({ name: volume.Name, bytes: Math.max(0, Number(volume.UsageData?.Size ?? 0)), labels: volume.Labels ?? {} }));
     }
 
     async getVolumeSizeBytes(name: string): Promise<number> {

@@ -17,6 +17,7 @@ import cors from '@fastify/cors';
 import { config, isLocalRuntimeEnabled, isTunnelMode, isIngressListenerEnabled, isRuntimeListenerEnabled } from './config.js';
 import { networkManager } from './docker/index.js';
 import { startHealthMonitor, stopHealthMonitor } from './services/health-monitor.js';
+import { startStorageQuotaMonitor, stopStorageQuotaMonitor } from './services/storage-quota-monitor.js';
 import { startReverseProxy, stopReverseProxy } from './proxy/reverse-proxy-server.js';
 import { startIngressListener, stopIngressListener } from './proxy/ingress-listener.js';
 import { startRuntimeListener, stopRuntimeListener } from './proxy/runtime-listener.js';
@@ -150,6 +151,7 @@ async function main(): Promise<void> {
 
 		// Start background services
 		startHealthMonitor();
+		startStorageQuotaMonitor();
 		// Reclaim subnets of workspace app networks whose last container is
 		// gone (uninstalled/purged workspaces). Docker's default address pools
 		// hold ~31 bridge subnets per node; without this sweep the node
@@ -208,6 +210,7 @@ async function shutdown(signal: string): Promise<void> {
 	fastify?.log.info({ signal }, 'shutdown initiated');
 	try {
 		if (networkSweepTimer) clearInterval(networkSweepTimer);
+		stopStorageQuotaMonitor();
 		stopHealthMonitor();
 		tunnelClient?.stop();
 		await mcpBrokerManager.closeAll();
