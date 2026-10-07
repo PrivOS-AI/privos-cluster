@@ -227,3 +227,40 @@ test('legacy fallback ignores a stale REMOVED from before a tombstone revive (re
 	assert.equal(row.installedDayFraction, 1);
 	assert.ok(row.storageGbDay > 0);
 });
+
+test('an app document removed without a closing event stops billing at its removal time', () => {
+	// A protocol-v3 uninstall marks the document REMOVED; an install that was
+	// removed that way before the closing event existed has only INSTALLED.
+	const removed = app({ state: 'REMOVED', createdAt: day, updatedAt: atHour(6) });
+	const events = [appEvent('INSTALLED', day, { replicaCount: 1 })];
+	const removalDay = aggregateWorkspaceDay('ws-1', day, events, [removed]);
+	assert.equal(removalDay.perApp.find((entry) => entry.appId === 'app-1')!.installedDayFraction, 6 / 24);
+	const nextDay = new Date(day.getTime() + 24 * 3_600_000);
+	const later = aggregateWorkspaceDay('ws-1', nextDay, events, [removed]);
+	assert.equal(later.perApp.find((entry) => entry.appId === 'app-1'), undefined);
+});
+
+test('a live app document with an open interval keeps billing', () => {
+	const usage = aggregateWorkspaceDay('ws-1', day, [appEvent('INSTALLED', day, { replicaCount: 1 })], [app()]);
+	assert.equal(usage.perApp.find((entry) => entry.appId === 'app-1')!.installedDayFraction, 1);
+});
+
+test('a revived app document is not cut off by an earlier removal', () => {
+	const events = [
+		appEvent('INSTALLED', atHour(-48), { replicaCount: 1 }),
+		appEvent('UNINSTALLED', atHour(-24)),
+		appEvent('INSTALLED', atHour(-1), { replicaCount: 1 }),
+	];
+	const usage = aggregateWorkspaceDay('ws-1', day, events, [app({ state: 'RUNNING', createdAt: atHour(-1), updatedAt: atHour(-1) })]);
+	assert.equal(usage.perApp.find((entry) => entry.appId === 'app-1')!.installedDayFraction, 1);
+});
+
+test('a legacy removed app with no REMOVED event stops billing at its removal time', () => {
+	const removed = app({ state: 'REMOVED', createdAt: day, updatedAt: atHour(6) });
+	const usage = aggregateWorkspaceDay('ws-1', day, [event('replica-1', 'STARTED', day)], [removed]);
+	assert.equal(usage.perApp.find((entry) => entry.appId === 'app-1')!.installedDayFraction, 6 / 24);
+	const nextDay = new Date(day.getTime() + 24 * 3_600_000);
+	const later = aggregateWorkspaceDay('ws-1', nextDay, [event('replica-1', 'STARTED', day)], [removed]);
+	// The replica telemetry row may remain (no STOPPED event); billing reads the fraction.
+	assert.equal(later.perApp.find((entry) => entry.appId === 'app-1')?.installedDayFraction ?? 0, 0);
+});
