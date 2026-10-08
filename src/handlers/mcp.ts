@@ -355,6 +355,14 @@ const declaredContainerId = (resource: z.infer<typeof RuntimeResourceDescriptorV
 	resource.attributes.containerId ?? (resource.kind === 'CONTAINER' ? resource.resourceId : undefined);
 
 /**
+ * Same gap for VOLUME: the inventory declares the Docker volume name as the
+ * resourceId with empty attributes, so a hash-pinned generation can never gain
+ * `attributes.volumeName` and its uninstall would stay CLEANUP_REQUIRED forever.
+ */
+const declaredVolumeName = (resource: z.infer<typeof RuntimeResourceDescriptorV3Schema>): string | undefined =>
+	resource.attributes.volumeName ?? (resource.kind === 'VOLUME' ? resource.resourceId : undefined);
+
+/**
  * Reason codes travel to the Hub inside a signed cleanup acknowledgement whose
  * schema accepts `^[A-Z][A-Z0-9_]{1,95}$`. A code that cannot be signed strands
  * the whole uninstall, so anything from outside — a Docker error `code`, say —
@@ -394,7 +402,7 @@ async function removeRuntimeResource(
 			return { ...identity, status: 'REMOVED', reasonCode: null };
 		}
 		if (resource.kind === 'VOLUME') {
-			const volumeName = resource.attributes.volumeName;
+			const volumeName = declaredVolumeName(resource);
 			if (!volumeName) return { ...identity, status: 'UNKNOWN', reasonCode: 'VOLUME_NAME_MISSING' };
 			// The declared name is caller-supplied: a volume that is not labelled for
 			// this workspace is invisible to it (ABSENT), exactly as getById treats a
@@ -445,7 +453,7 @@ async function observeRuntimeResource(
 			return { ...identity, status: container ? 'FAILED' : 'ABSENT', reasonCode: container ? 'CONTAINER_STILL_PRESENT' : null };
 		}
 		if (resource.kind === 'VOLUME') {
-			const volumeName = resource.attributes.volumeName;
+			const volumeName = declaredVolumeName(resource);
 			if (!volumeName) return { ...identity, status: 'UNKNOWN', reasonCode: 'VOLUME_NAME_MISSING' };
 			const volumes = await containerManager.listVolumes();
 			const present = volumes.some((volume: { Name?: string }) => volume?.Name === volumeName);
