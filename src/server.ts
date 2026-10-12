@@ -35,7 +35,7 @@ import mcpHandler from './handlers/mcp.js';
 import hostTableHandler from './handlers/host-table.js';
 import localRuntimeHandler from './handlers/local-runtime.js';
 import { areOperatorRoutesEnabled } from './services/settings-service.js';
-import { mcpBrokerManager, rebindMcpBrokers } from './services/mcp-broker.js';
+import { mcpBrokerManager, rebindMcpBrokers, sweepOrphanBrokerState } from './services/mcp-broker.js';
 import { startTunnelClient, type TunnelClient } from './tunnel/tunnel-client.js';
 
 /**
@@ -145,6 +145,14 @@ async function main(): Promise<void> {
 
 		fastify = await buildFastifyServer();
 		fastify.log.info(brokerRebind, 'MCP identity brokers rebound');
+		if (config.FLEET_MODE) {
+			try {
+				const orphans = await sweepOrphanBrokerState();
+				if (orphans.length) fastify.log.info({ orphans }, 'orphan MCP broker state files removed');
+			} catch (err) {
+				fastify.log.warn(err, 'orphan MCP broker state sweep failed');
+			}
+		}
 		if (!config.FLEET_MODE) {
 			fastify.log.info({ network: config.DOCKER_NETWORK }, 'docker network ready');
 		}
