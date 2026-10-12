@@ -70,6 +70,8 @@ test('v3 upgrade response omits publicUrl for a host-less app (D9)', async (t) =
 	const json = response.json();
 	assert.equal('publicUrl' in json, false, 'no primary host → the key must be OMITTED entirely');
 	assert.ok(!JSON.stringify(json).includes('undefined'));
+	// The agents reported nothing (older agent): the key is omitted, never sent as null.
+	assert.equal('securityProfile' in json, false);
 });
 
 test('subdomain-check reports a HELD label the caller\'s own workspace holds as available', async (t) => {
