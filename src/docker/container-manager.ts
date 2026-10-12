@@ -4,7 +4,9 @@ import Docker from 'dockerode';
 
 import { resolveImmutableImageReference } from './image-reference.js';
 import { config } from '../config.js';
-import type { ContainerResources, McpRuntimeBinding, McpRuntimeBindingV3 } from '../types/index.js';
+import type { ContainerResources, McpRuntimeBinding, McpRuntimeBindingV3, RuntimeSecurityProfile } from '../types/index.js';
+import { RUNTIME_SECURITY_PROFILES } from '../types/index.js';
+import browserSandboxSeccomp from './seccomp/browser-sandbox.json' with { type: 'json' };
 import { getAppNetworkName } from '../services/settings-service.js';
 import { buildMcpRuntimeResourceLabelsV3 } from '../security/mcp-resource-labels-v3.js';
 
@@ -33,6 +35,37 @@ export interface CreateContainerConfig {
     mcpBinding?: McpRuntimeBinding;
 	mcpV3Binding?: McpRuntimeBindingV3;
     brokerMount?: { source: string; target: string };
+    /**
+     * Required so every create path states the profile explicitly. null keeps
+     * the default hardened HostConfig (PidsLimit 100, default seccomp).
+     */
+    securityProfile: RuntimeSecurityProfile | null;
+}
+
+/**
+ * Per-profile HostConfig overrides.
+ *
+ * browser-sandbox: lets Chromium create its own user/pid/net namespaces.
+ * The seccomp JSON (src/docker/seccomp/browser-sandbox.json, see the README
+ * beside it) is passed inline, so no file is needed on the node. The pid limit
+ * covers an idle stack plus the per-session peak of a browser (about 160) for
+ * the agreed session cap, with headroom.
+ */
+const PROFILE_PID_LIMIT: Record<RuntimeSecurityProfile, number> = { 'browser-sandbox': 1024 };
+const PROFILE_SECCOMP: Record<RuntimeSecurityProfile, string> = {
+	'browser-sandbox': JSON.stringify(browserSandboxSeccomp),
+};
+
+/** Throws on a profile name this agent does not know, instead of silently dropping the hardening change. */
+function profileHostConfig(profile: RuntimeSecurityProfile | null): { SecurityOpt: string[]; PidsLimit: number } {
+	if (profile === null) return { SecurityOpt: ['no-new-privileges:true'], PidsLimit: 100 };
+	if (!(RUNTIME_SECURITY_PROFILES as readonly string[]).includes(profile)) {
+		throw new Error(`unknown_security_profile:${String(profile)}`);
+	}
+	return {
+		SecurityOpt: ['no-new-privileges:true', `seccomp=${PROFILE_SECCOMP[profile]}`],
+		PidsLimit: PROFILE_PID_LIMIT[profile],
+	};
 }
 
 // Default health policy encoded into labels so the (in-memory) health monitor can
@@ -88,6 +121,7 @@ export function buildContainerLabels(cfg: {
     createdAt?: number;
 	mcpBinding?: McpRuntimeBinding;
 	mcpV3Binding?: McpRuntimeBindingV3;
+	securityProfile?: RuntimeSecurityProfile | null;
 }): Record<string, string> {
 	if (cfg.mcpBinding && cfg.mcpV3Binding) throw new Error('mcp_protocol_binding_conflict');
 	const userEnv = cfg.envVars ?? {};
@@ -130,6 +164,8 @@ export function buildContainerLabels(cfg: {
         'privos.health.max-fails': String(HEALTH_DEFAULTS.maxFails),
         'privos.health.restart': String(HEALTH_DEFAULTS.restart),
     };
+	// Written only when set, so containers without a profile keep today's exact label set.
+	if (cfg.securityProfile) labels['privos.securityProfile'] = cfg.securityProfile;
 	if (cfg.mcpBinding) {
 		Object.assign(labels, {
 			'privos.mcp.schema': '2',
@@ -225,6 +261,7 @@ export class ContainerManager {
         env.push(`PORT=${cfg.port}`);
 
         const portKey = `${cfg.port}/tcp`;
+        const profile = profileHostConfig(cfg.securityProfile);
 
         const container = await this.docker.createContainer({
             Image: resolveImmutableImageReference(cfg.image, cfg.tag, cfg.digest),
@@ -250,13 +287,14 @@ export class ContainerManager {
                 createdAt: cfg.createdAt,
 				mcpBinding: cfg.mcpBinding,
 				mcpV3Binding: cfg.mcpV3Binding,
+				securityProfile: cfg.securityProfile,
             }),
             HostConfig: {
                 NetworkMode: getAppNetworkName(cfg.workspaceId),
                 ReadonlyRootfs: true,
                 Tmpfs: { '/tmp': `size=${cfg.resources.tmpSizeMb}m,mode=1777` },
                 CapDrop: ['ALL'],
-                SecurityOpt: ['no-new-privileges:true'],
+                SecurityOpt: profile.SecurityOpt,
                 Memory: cfg.resources.memoryMb * 1024 * 1024,
                 MemorySwap: cfg.resources.memoryMb * 1024 * 1024, // disable swap
                 NanoCpus: Math.round(cfg.resources.cpus * 1e9),
@@ -265,7 +303,7 @@ export class ContainerManager {
                 // its own size package. CpuShares (1024 = one full share) makes an XL
                 // package get proportionally more of a contended host than an S package.
                 CpuShares: Math.round(1024 * cfg.resources.cpus),
-                PidsLimit: 100,
+                PidsLimit: profile.PidsLimit,
                 RestartPolicy: { Name: 'no' }, // health monitor handles restarts
 				Mounts: [
 					...(cfg.mounts?.map((m) => ({

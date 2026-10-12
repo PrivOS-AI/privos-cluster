@@ -11,6 +11,8 @@ import {
 	McpDeployRequestSchema,
 	McpDeployRequestV3Schema,
 	McpReconfigureRequestV3Schema,
+	SECURITY_PROFILE_NOT_ALLOWED,
+	isSecurityProfileRefused,
 } from '../schemas/app-schemas.js';
 import { canonicalJson, sha256, sha256Base64Url } from '../security/artifacts.js';
 import { deployManagedApp, reconfigureManagedAppV3 } from '../services/lifecycle-service.js';
@@ -122,6 +124,9 @@ const mcpHandler: FastifyPluginAsync = async (fastify) => {
 		if (!parsed.success) {
 			return reply.code(400).send({ error: 'validation_error', details: parsed.error.issues });
 		}
+		if (isSecurityProfileRefused(parsed.data.securityProfile)) {
+			return reply.code(400).send({ error: SECURITY_PROFILE_NOT_ALLOWED });
+		}
 		const binding = parsed.data.mcpV3Binding;
 		if (
 			binding.clusterId !== config.FLEET_CLUSTER_ID ||
@@ -213,6 +218,9 @@ const mcpHandler: FastifyPluginAsync = async (fastify) => {
 		const parsed = McpReconfigureRequestV3Schema.safeParse(req.body);
 		if (!containerId || !parsed.success) {
 			return reply.code(400).send({ error: 'validation_error', details: parsed.success ? undefined : parsed.error.issues });
+		}
+		if (isSecurityProfileRefused(parsed.data.securityProfile)) {
+			return reply.code(400).send({ error: SECURITY_PROFILE_NOT_ALLOWED });
 		}
 		const binding = parsed.data.mcpV3Binding;
 		if (

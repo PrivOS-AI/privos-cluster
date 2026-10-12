@@ -334,7 +334,7 @@ test('a successful v3 upgrade verifies the label, delegates the swap, and return
 			publicUrlFor: (subdomain: string) => `https://${subdomain}.apps.example.com`,
 			upgradeMcpV3: async () => {
 				callOrder.push('upgradeMcpV3');
-				return { app: upgradedApp, swapStrategy: 'STOP_THEN_CREATE' };
+				return { app: upgradedApp, swapStrategy: 'STOP_THEN_CREATE', securityProfile: 'browser-sandbox' };
 			},
 		} as any,
 		lifecycle: {} as any,
@@ -392,6 +392,8 @@ test('a successful v3 upgrade verifies the label, delegates the swap, and return
 	assert.equal(json.state, 'UPGRADED');
 	assert.equal(json.clusterAppId, 'cluster-app-1');
 	assert.equal(json.publicUrl, 'https://library-app.apps.example.com');
+	// The profile the agents report running is passed through to the Hub.
+	assert.equal(json.securityProfile, 'browser-sandbox');
 	assert.deepEqual(callOrder, ['consumeUpgradeCommandV3', 'imageInspect', 'upgradeMcpV3', 'signUpgradeAcknowledgement']);
 });
 

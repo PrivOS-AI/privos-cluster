@@ -99,6 +99,7 @@ function fixture(app: MasterApp = runningApp(), extra: {
 	otherApps?: MasterApp[];
 	quota?: { assertResizeAllowed?: (...args: any[]) => Promise<void> };
 	failContainerIds?: string[];
+	deps?: Partial<ConstructorParameters<typeof DeploymentService>[0]>;
 } = {}) {
 	const apps = [structuredClone(app)];
 	const otherApps = (extra.otherApps ?? []).map((candidate) => structuredClone(candidate));
@@ -147,6 +148,7 @@ function fixture(app: MasterApp = runningApp(), extra: {
 		locks: { run: async (_ws: string, work: () => Promise<unknown>) => work() } as any,
 		baseDomain: 'apps.example.com',
 		cipher: new KeyCipher(CIPHER_KEY),
+		...extra.deps,
 	});
 	return { apps, agentCalls, lifecycleEvents, service };
 }
@@ -426,4 +428,54 @@ test('a row upgraded while its image still pinned the previous digest reconfigur
 	const [call] = state.agentCalls;
 	assert.equal(call!.body.image, 'registry.example/app');
 	assert.equal(call!.body.digest, `sha256:${'f'.repeat(64)}`);
+});
+
+const SANDBOX_ALLOWLIST = new Map([['listing-1', 'browser-sandbox' as const]]);
+
+test('security profile: emit off never puts the key in a reconfigure body, even for an allowlisted listing', async () => {
+	const state = fixture(runningApp(), { deps: { securityProfileAllowlist: SANDBOX_ALLOWLIST } });
+	await state.service.reconfigureMcpV3('workspace-1', command());
+	assert.equal('securityProfile' in state.agentCalls[0]!.body, false);
+});
+
+test('security profile: emit on sends the allowlisted profile on reconfigure and its rollback', async () => {
+	const state = fixture(runningApp({
+		replicas: [
+			{ replicaId: 'replica-1', nodeId: 'node-1', containerId: 'container-1', state: 'running' },
+			{ replicaId: 'replica-2', nodeId: 'node-1', containerId: 'container-2', state: 'running' },
+		],
+	}), {
+		failContainerIds: ['container-2'],
+		deps: { securityProfileAllowlist: SANDBOX_ALLOWLIST, emitSecurityProfile: true },
+	});
+	await assert.rejects(state.service.reconfigureMcpV3('workspace-1', command({
+		resources: { memoryMb: 512, cpus: 0.5, tmpSizeMb: 64 },
+	} as any)));
+	// forward on replica 1, forward on replica 2 (fails), rollback of replica 1: all carry the profile.
+	assert.ok(state.agentCalls.length >= 2);
+	for (const call of state.agentCalls) assert.equal(call.body.securityProfile, 'browser-sandbox');
+});
+
+test('security profile: emit on with no allowlist entry sends an explicit null that removes a stale profile', async () => {
+	const state = fixture(runningApp(), { deps: { emitSecurityProfile: true } });
+	await state.service.reconfigureMcpV3('workspace-1', command());
+	assert.equal(state.agentCalls[0]!.body.securityProfile, null);
+	assert.equal('securityProfile' in state.agentCalls[0]!.body, true);
+});
+
+test('security profile: removing the allowlist entry changes the next reconfigure from the profile to null', async () => {
+	const withEntry = fixture(runningApp(), { deps: { securityProfileAllowlist: SANDBOX_ALLOWLIST, emitSecurityProfile: true } });
+	await withEntry.service.reconfigureMcpV3('workspace-1', command());
+	assert.equal(withEntry.agentCalls[0]!.body.securityProfile, 'browser-sandbox');
+	const withoutEntry = fixture(runningApp(), { deps: { securityProfileAllowlist: new Map(), emitSecurityProfile: true } });
+	await withoutEntry.service.reconfigureMcpV3('workspace-1', command());
+	assert.equal(withoutEntry.agentCalls[0]!.body.securityProfile, null);
+});
+
+test('security profile: the hub-chosen mcpAppId has no effect on the profile', async () => {
+	const state = fixture(runningApp(), {
+		deps: { securityProfileAllowlist: new Map([['mcp-app-1', 'browser-sandbox' as const]]), emitSecurityProfile: true },
+	});
+	await state.service.reconfigureMcpV3('workspace-1', command());
+	assert.equal(state.agentCalls[0]!.body.securityProfile, null);
 });

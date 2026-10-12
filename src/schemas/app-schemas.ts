@@ -2,6 +2,21 @@ import { z } from 'zod';
 import type { JsonWebKey } from 'node:crypto';
 import { config } from '../config.js';
 import { SubdomainLabelSchema } from './settings-schemas.js';
+import { RUNTIME_SECURITY_PROFILES } from '../types/index.js';
+
+/** Closed enum: an unknown profile name is refused rather than ignored. */
+export const SecurityProfileSchema = z.enum(RUNTIME_SECURITY_PROFILES).nullable().optional();
+
+/**
+ * A runtime security profile may only be requested by the fleet master. In
+ * non-fleet (paired/CE) mode the agent also accepts Hub-issued tokens, so a
+ * non-null profile there would let a Hub choose its own seccomp profile.
+ * Null or absent stays accepted. Routes answer 400 with this code.
+ */
+export const SECURITY_PROFILE_NOT_ALLOWED = 'security_profile_not_allowed';
+export function isSecurityProfileRefused(profile: unknown): boolean {
+	return profile !== undefined && profile !== null && !config.FLEET_MODE;
+}
 
 export const ResourcesSchema = z.object({
     // Max 4096 so an XL managed-runtime size (4096MB/4cpu) deploys and reconfigures.
@@ -168,6 +183,7 @@ export const McpRuntimeProvisioningBindingV3Schema = z.object({
 
 export const McpDeployRequestV3Schema = DeployRequestObject.extend({
 	mcpV3Binding: McpRuntimeProvisioningBindingV3Schema,
+	securityProfile: SecurityProfileSchema,
 }).strict().superRefine((value, ctx) => {
 	validateDeployRequest(value, ctx);
 	if (!value.appId) {
@@ -229,6 +245,7 @@ export const McpRuntimeReconfigureBindingV3Schema = McpRuntimeProvisioningBindin
 
 export const McpReconfigureRequestV3Schema = DeployRequestObject.extend({
 	mcpV3Binding: McpRuntimeReconfigureBindingV3Schema,
+	securityProfile: SecurityProfileSchema,
 	configEpoch: z.number().int().positive(),
 	runtimeResourceInventoryHash: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
 }).strict().superRefine((value, ctx) => {
@@ -271,6 +288,7 @@ export const RedeployRequestSchema = z.object({
     platformEnvVars: z.record(PlatformEnvNameSchema, z.string().max(4096)).optional(),
     secretEnvKeys: z.array(EnvNameSchema).max(32).optional(),
     mcpV3MultiReplica: z.literal(true).optional(),
+    securityProfile: SecurityProfileSchema,
 }).strict().superRefine((value, ctx) => {
     const requiresDigest = config.FLEET_MODE || value.image?.split('/').includes('marketplace');
     if ((requiresDigest || value.mcpV3Binding) && !value.digest) {

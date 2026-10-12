@@ -22,6 +22,7 @@ import type {
 	DeployRequest,
 	McpRuntimeBindingV3,
 	RedeployRequest,
+	RuntimeSecurityProfile,
 } from '../types/index.js';
 import type { JsonWebKey } from 'node:crypto';
 import { canonicalJson, sha256 } from '../security/artifacts.js';
@@ -235,6 +236,18 @@ async function assertResourceBudget(
 // deployManagedApp
 // ---------------------------------------------------------------------------
 
+/**
+ * Profile for a container about to be (re)created. A request value applies,
+ * an explicit null removes it, and an absent key keeps what the running
+ * container already has (a master that does not emit the field changes nothing).
+ */
+function resolveRequestedSecurityProfile(
+	requested: RuntimeSecurityProfile | null | undefined,
+	current: RuntimeSecurityProfile | null | undefined,
+): RuntimeSecurityProfile | null {
+	return requested === undefined ? (current ?? null) : requested;
+}
+
 export async function deployManagedApp(req: DeployRequest): Promise<Container> {
     await networkManager.ensureNetwork(req.workspaceId);
 
@@ -375,6 +388,8 @@ export async function deployManagedApp(req: DeployRequest): Promise<Container> {
 			mcpBinding: req.mcpBinding,
 			mcpV3Binding: req.mcpV3Binding,
 			brokerMount,
+			// Install: no running container to inherit from, so absent means none.
+			securityProfile: req.securityProfile ?? null,
         });
         dockerContainerId = created.containerId;
 		if (req.mcpBinding) {
@@ -541,6 +556,7 @@ export async function reconfigureManagedAppV3(
 		baseDomain,
 		mcpV3Binding: binding,
 		brokerMount,
+		securityProfile: resolveRequestedSecurityProfile(req.securityProfile, existing.securityProfile),
 	});
 	// Re-establish the finalized broker binding: the socket was torn down with
 	// the old container, and dispatch stays refused until the inventory hash the
@@ -757,6 +773,7 @@ export async function createAndStartRedeployedContainer(params: {
     subdomain: string | null;
     baseDomain: string | null;
     createdAt: number;
+    securityProfile: RuntimeSecurityProfile | null;
     mcp?: McpV3SwapContext;
 }): Promise<Container> {
     const brokerMount = params.mcp ? await mcpBrokerManager.prepare(params.mcp.binding.replicaId) : undefined;
@@ -783,6 +800,7 @@ export async function createAndStartRedeployedContainer(params: {
             createdAt: params.createdAt,
             mcpV3Binding: params.mcp?.binding,
             brokerMount,
+            securityProfile: params.securityProfile,
         });
         if (params.mcp) {
             // Re-establish the finalized broker binding: the socket was torn down
@@ -1018,6 +1036,7 @@ export async function redeployContainer(
     // uses the FULL environment the master sent alongside the signed command —
     // see RedeployRequest's comment on why that is required.
     const swapEnvVars = mcpV3Binding ? (req.envVars ?? {}) : c.envVars;
+    const newSecurityProfile = resolveRequestedSecurityProfile(req.securityProfile, c.securityProfile);
 
     try {
         const updated = await createAndStartRedeployedContainer({
@@ -1037,6 +1056,7 @@ export async function redeployContainer(
             subdomain: newSubdomain,
             baseDomain,
             createdAt: c.createdAt,
+            securityProfile: newSecurityProfile,
             mcp: mcpContext,
         });
         logger.info({ containerId, newDockerContainerId: updated.dockerContainerId }, 'redeploy complete');
@@ -1072,6 +1092,8 @@ export async function redeployContainer(
                 subdomain: newSubdomain,
                 baseDomain,
                 createdAt: c.createdAt,
+                // The revert restores the container as it was, profile included.
+                securityProfile: c.securityProfile ?? null,
                 mcp: { ...mcpContext, binding: mcpV3PreviousBinding },
             });
             logger.warn({ containerId }, 'redeploy failed — previous image restored, upgrade rolled back');
@@ -1175,6 +1197,7 @@ export async function rollingRedeployContainer(
             subdomain: newSubdomain,
             baseDomain,
             createdAt: old.createdAt,
+            securityProfile: resolveRequestedSecurityProfile(req.securityProfile, old.securityProfile),
         });
         newDockerContainerId = created.containerId;
 

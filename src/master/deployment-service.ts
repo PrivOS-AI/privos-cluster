@@ -4,7 +4,8 @@ import type { JsonWebKey } from 'node:crypto';
 import { z } from 'zod';
 import type { MasterRepositories } from './repositories.js';
 import type { AvailabilityTier, AppReplica, MasterApp, MasterNode, RuntimeResourceInventory } from './types.js';
-import type { ContainerResources } from '../types/index.js';
+import { RUNTIME_SECURITY_PROFILES } from '../types/index.js';
+import type { ContainerResources, RuntimeSecurityProfile } from '../types/index.js';
 import { AgentClient } from './agent-client.js';
 import { IngressRouteProgrammer } from './ingress-route-programmer.js';
 import { QuotaService } from './quota-service.js';
@@ -28,6 +29,26 @@ import {
 	normalizeRuntimeResourcesV3,
 } from './runtime-resource-inventory.js';
 import type { AppHostRegistry } from './app-host-registry.js';
+
+/**
+ * Profile the agents report their containers actually run (the `securityProfile`
+ * field of each agent response, read from the container label). Returns
+ * undefined when any response lacks the field (older agent, or no fresh agent
+ * call), so the Hub response omits the key rather than claiming "none"; null when
+ * all agree on none or the replicas disagree (logged); the name when all agree.
+ */
+export function consolidateReportedSecurityProfile(
+	bodies: unknown[],
+	expectedCount: number,
+): RuntimeSecurityProfile | null | undefined {
+	if (bodies.length === 0 || bodies.length !== expectedCount) return undefined;
+	const values = bodies.map((body) => (body as { securityProfile?: unknown } | null | undefined)?.securityProfile);
+	if (values.some((value) => value === undefined)) return undefined;
+	const normalized = values.map((value) => (typeof value === 'string' && RUNTIME_SECURITY_PROFILES.includes(value as RuntimeSecurityProfile) ? (value as RuntimeSecurityProfile) : null));
+	if (normalized.every((value) => value === normalized[0])) return normalized[0];
+	console.warn(JSON.stringify({ level: 40, msg: 'replicas report different runtime security profiles', profiles: normalized }));
+	return null;
+}
 
 const DeploySchema = z.object({
 	appId: z.string().min(1).max(128).optional(),
@@ -93,12 +114,36 @@ export class DeploymentService {
 		 * alongside PRIVOS_APP_PUBLIC_URL (D18) with the same value. Irrelevant
 		 * (PRIVOS_PUBLIC_URL is emitted regardless) while `emitAppPublicUrl` is off. */
 		legacyPublicUrlAlias?: boolean;
+		/** MCP_V3_SECURITY_PROFILE_ALLOWLIST, already parsed: attested listingId ->
+		 * runtime security profile. Absent/empty means no app gets a profile. */
+		securityProfileAllowlist?: ReadonlyMap<string, RuntimeSecurityProfile>;
+		/** MCP_V3_EMIT_SECURITY_PROFILE === 'on' (default false): send the
+		 * `securityProfile` key to the agent at all. Off keeps every agent body
+		 * free of the key, so an agent that predates the field (strict schemas)
+		 * keeps accepting the request. Agents roll first, then this flips on. */
+		emitSecurityProfile?: boolean;
 		/** D-requirement host registry. Optional so every existing/unwired
 		 * caller (tests, a fleet that has not deployed phase 3's registry) is
 		 * unaffected — its absence just means the env builder falls back to
 		 * `app.subdomain`, exactly as it always has. */
 		appHosts?: AppHostRegistry;
 	}) {}
+
+	/**
+	 * The one place a runtime security profile is decided. Keyed only on the
+	 * stored, portal-attested listingId; nothing the Hub sends (manifest name,
+	 * mcpAppId, descriptor fields) takes part. Derived on every call, never
+	 * persisted, so the allowlist is always the current truth.
+	 */
+	resolveSecurityProfile(listingId: string): RuntimeSecurityProfile | null {
+		return this.deps.securityProfileAllowlist?.get(listingId) ?? null;
+	}
+
+	/** Body fragment for every agent request that can create a container: the key is absent
+	 * while the emit flag is off, otherwise a profile name or an explicit null (which removes it). */
+	private securityProfileBody(listingId: string): { securityProfile?: RuntimeSecurityProfile | null } {
+		return this.deps.emitSecurityProfile === true ? { securityProfile: this.resolveSecurityProfile(listingId) } : {};
+	}
 
 	async deploy(workspaceId: string, raw: unknown): Promise<MasterApp> {
 		const input = DeploySchema.parse(raw);
@@ -210,7 +255,7 @@ export class DeploymentService {
 		grant: McpDeploymentGrantPayloadV3,
 		deploymentGrantHash: string,
 		hubIdentity: { kid: string; publicJwk: JsonWebKey },
-	): Promise<{ app: MasterApp; inventory: RuntimeResourceInventory & { runtimeResourceInventoryHash: string } }> {
+	): Promise<{ app: MasterApp; inventory: RuntimeResourceInventory & { runtimeResourceInventoryHash: string }; securityProfile?: RuntimeSecurityProfile | null }> {
 		const input = DeploySchema.parse({
 			appId: grant.deployment.clusterAppId,
 			listingId: grant.deployment.listingId,
@@ -463,6 +508,7 @@ export class DeploymentService {
 			this.assertMcpV3InventoryAffinity(inventory, grant);
 
 			const plans = app.mcpProvisioningReplicas ?? [];
+			const agentResponses: unknown[] = [];
 			const nodes = await this.deps.repositories.nodes.find({
 				nodeId: { $in: plans.map((plan) => plan.nodeId) },
 			}).toArray();
@@ -487,6 +533,7 @@ export class DeploymentService {
 							domain: this.deps.baseDomain,
 							platformEnvVars: await this.platformEnvVarsV3(app),
 							secretEnvKeys: app.secretEnvKeys ?? [],
+							...this.securityProfileBody(app.listingId),
 							mcpV3Binding: {
 								protocolVersion: 3,
 								clusterId: grant.clusterId,
@@ -512,6 +559,7 @@ export class DeploymentService {
 						},
 					);
 					if (response.status >= 300) throw new Error(`agent MCP v3 deploy failed: ${JSON.stringify(response.body)}`);
+					agentResponses.push(response.body);
 					replica = this.parseMcpV3ReplicaResponse(response.body, plan, node, {
 						clusterAppId: grant.deployment.clusterAppId,
 						workspaceId,
@@ -636,7 +684,11 @@ export class DeploymentService {
 				app.runtimeResourceInventoryId !== inventoryId ||
 				app.runtimeResourceInventoryHash !== readyInventory.runtimeResourceInventoryHash
 			) throw new Error('mcp_v3_quarantine_persistence_failed');
-			return { app, inventory: readyInventory };
+			return {
+				app,
+				inventory: readyInventory,
+				securityProfile: consolidateReportedSecurityProfile(agentResponses, plans.length),
+			};
 		});
 	}
 
@@ -722,7 +774,7 @@ export class DeploymentService {
 	async recoverMcpV3InventoryAttestation(
 		workspaceId: string,
 		runtimeInstallationId: string,
-	): Promise<{ app: MasterApp; inventory: RuntimeResourceInventory & { runtimeResourceInventoryHash: string } }> {
+	): Promise<{ app: MasterApp; inventory: RuntimeResourceInventory & { runtimeResourceInventoryHash: string }; securityProfile?: RuntimeSecurityProfile | null }> {
 		return this.deps.locks.run(workspaceId, async () => {
 			// No state filter: a generation the cluster already tore down (REMOVED)
 			// must still replay its attestation so the Hub-side saga can converge.
@@ -892,7 +944,7 @@ export class DeploymentService {
 	async reconfigureMcpV3(
 		workspaceId: string,
 		command: ClusterReconfigureCommandPayloadV3,
-	): Promise<{ app: MasterApp; appliedKeys: string[] }> {
+	): Promise<{ app: MasterApp; appliedKeys: string[]; securityProfile?: RuntimeSecurityProfile | null }> {
 		return this.deps.locks.run(workspaceId, async () => {
 			const app = await this.deps.repositories.apps.findOne({
 				workspaceId,
@@ -1012,6 +1064,7 @@ export class DeploymentService {
 				domain: this.deps.baseDomain,
 				configEpoch: command.configEpoch,
 				runtimeResourceInventoryHash: command.runtimeResourceInventoryHash,
+				...this.securityProfileBody(app.listingId),
 				mcpV3Binding: {
 					protocolVersion: 3 as const,
 					clusterId: command.clusterId,
@@ -1035,6 +1088,7 @@ export class DeploymentService {
 
 			const previousResources = app.resources;
 			const resizedReplicas: AppReplica[] = [];
+			const agentResponses: unknown[] = [];
 			for (const replica of app.replicas) {
 				const node = nodes.find((candidate) => candidate.nodeId === replica.nodeId)!;
 				const response = await this.deps.agentClient.request(
@@ -1074,6 +1128,7 @@ export class DeploymentService {
 					}
 					throw new Error(`agent MCP v3 reconfigure failed: ${JSON.stringify(response.body)}`);
 				}
+				agentResponses.push(response.body);
 				if (requestedResources) resizedReplicas.push(replica);
 			}
 
@@ -1109,7 +1164,11 @@ export class DeploymentService {
 					at: appliedAt,
 				});
 			}
-			return { app: reconfigured, appliedKeys: Object.keys(command.envVars).sort() };
+			return {
+				app: reconfigured,
+				appliedKeys: Object.keys(command.envVars).sort(),
+				securityProfile: consolidateReportedSecurityProfile(agentResponses, app.replicas.length),
+			};
 		});
 	}
 
@@ -1130,7 +1189,7 @@ export class DeploymentService {
 	async upgradeMcpV3(
 		workspaceId: string,
 		command: ClusterUpgradeCommandPayloadV3,
-	): Promise<{ app: MasterApp; swapStrategy: 'ROLLING' | 'STOP_THEN_CREATE' }> {
+	): Promise<{ app: MasterApp; swapStrategy: 'ROLLING' | 'STOP_THEN_CREATE'; securityProfile?: RuntimeSecurityProfile | null }> {
 		return this.deps.locks.run(workspaceId, async () => {
 			const app = await this.deps.repositories.apps.findOne({
 				workspaceId,
@@ -1223,6 +1282,7 @@ export class DeploymentService {
 				platformEnvVars,
 				secretEnvKeys,
 				runtimeResourceInventoryHash: command.runtimeResourceInventoryHash,
+				...this.securityProfileBody(app.listingId),
 				mcpV3Binding: {
 					protocolVersion: 3 as const,
 					clusterId: command.clusterId,
@@ -1261,6 +1321,7 @@ export class DeploymentService {
 			// go through the identical revert path, never a separate unprotected
 			// throw after the loop.
 			const succeeded: Array<{ replica: AppReplica; node: MasterNode; swapStrategy: 'ROLLING' | 'STOP_THEN_CREATE' }> = [];
+			const forwardResponses: unknown[] = [];
 			let failedReplicaRecovered: boolean | undefined;
 			let persistenceFailed = false;
 			try {
@@ -1283,6 +1344,7 @@ export class DeploymentService {
 						throw new Error('agent_mcp_v3_upgrade_response_invalid');
 					}
 					succeeded.push({ replica, node, swapStrategy: body.swapStrategy });
+					forwardResponses.push(response.body);
 				}
 
 				const [swapStrategy, ...rest] = succeeded.map((entry) => entry.swapStrategy);
@@ -1338,7 +1400,11 @@ export class DeploymentService {
 					persistenceFailed = true;
 					throw new Error('mcp_v3_upgrade_persistence_conflict');
 				}
-				return { app: upgraded, swapStrategy };
+				return {
+					app: upgraded,
+					swapStrategy,
+					securityProfile: consolidateReportedSecurityProfile(forwardResponses, app.replicas.length),
+				};
 			} catch (error) {
 				// Revert every replica that already swapped forward, through the
 				// IDENTICAL redeploy primitive, targeting the named previous digest.

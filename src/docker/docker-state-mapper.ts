@@ -7,7 +7,8 @@
  */
 import type Docker from 'dockerode';
 import { HEALTH_DEFAULTS } from './container-manager.js';
-import type { Container, ContainerResources, ContainerState, ContainerVolume, HealthCheck, HealthPolicy } from '../types/index.js';
+import { RUNTIME_SECURITY_PROFILES } from '../types/index.js';
+import type { Container, ContainerResources, ContainerState, ContainerVolume, HealthCheck, HealthPolicy, RuntimeSecurityProfile } from '../types/index.js';
 
 export const DEFAULT_RESOURCES: ContainerResources = { memoryMb: 256, cpus: 0.5, tmpSizeMb: 64 };
 export const DEFAULT_HEALTH: HealthCheck = { status: 'unknown', failCount: 0, restartCount: 0, lastCheck: null };
@@ -33,6 +34,10 @@ export function mapState(status: string | undefined): ContainerState {
 function labelOrNull(labels: Record<string, string>, key: string): string | null {
 	const v = labels[key];
 	return v && v.length > 0 ? v : null;
+}
+
+function parseSecurityProfile(raw: string | undefined): RuntimeSecurityProfile | null {
+	return (RUNTIME_SECURITY_PROFILES as readonly string[]).includes(raw ?? '') ? (raw as RuntimeSecurityProfile) : null;
 }
 
 function parseResources(raw: string | undefined): ContainerResources {
@@ -186,6 +191,7 @@ function buildContainer(facts: DockerFacts, health: HealthCheck, oomKilledAt: nu
 		port,
 		hostPort: facts.hostPort,
 		resources: parseResources(labels['privos.resources']),
+		securityProfile: parseSecurityProfile(labels['privos.securityProfile']),
 		envVars: parseEnv(labels['privos.env']),
 		healthCheck: health,
 		createdAt: Number.isFinite(createdAtLabel) && createdAtLabel > 0 ? createdAtLabel : (facts.createdFallbackMs || Date.now()),
