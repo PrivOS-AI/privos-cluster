@@ -1,9 +1,12 @@
 import fs from 'node:fs/promises';
+import type { FileHandle } from 'node:fs/promises';
+import { constants as fsConstants } from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import type { JsonWebKey } from 'node:crypto';
 
+import { writeFileAtomic } from '../atomic-write.js';
 import { config } from '../config.js';
 import { containerManager } from '../docker/index.js';
 import { canonicalJson, jwkThumbprint } from '../security/artifacts.js';
@@ -72,11 +75,31 @@ export class McpBrokerManager {
 		private readonly root: string,
 		private readonly identity: NodeIdentity,
 		private readonly inspectContainer: (id: string) => Promise<any>,
+		/**
+		 * Durable home of the finalized v3 bindings. `root` lives on tmpfs and is wiped by a
+		 * host reboot; this directory survives it. Unset keeps the socket directory as the
+		 * only home (local runtime, tests).
+		 */
+		private readonly stateRoot?: string,
 	) {}
 
-	private directory(replicaId: string): string {
+	private assertReplicaId(replicaId: string): void {
 		if (!/^[0-9a-f-]{36}$/i.test(replicaId)) throw new Error('replica_id_invalid');
+	}
+
+	private directory(replicaId: string): string {
+		this.assertReplicaId(replicaId);
 		return path.join(this.root, replicaId);
+	}
+
+	/** Store file for a replica, or undefined when no store is configured. Validated before any fs call. */
+	private storeFile(replicaId: string): string | undefined {
+		if (!this.stateRoot) return undefined;
+		this.assertReplicaId(replicaId);
+		const resolvedRoot = path.resolve(this.stateRoot);
+		const file = path.resolve(resolvedRoot, `${replicaId}.json`);
+		if (path.dirname(file) !== resolvedRoot) throw new Error('replica_id_invalid');
+		return file;
 	}
 
 	async prepare(replicaId: string): Promise<{ source: string; target: string }> {
@@ -143,23 +166,79 @@ export class McpBrokerManager {
 			version: 1,
 		};
 		delete (record as Partial<McpReplicaBindingV3>).dockerContainerId;
-		const filePath = path.join(this.directory(binding.replicaId), 'binding-v3.json');
-		try {
-			const existing = JSON.parse(await fs.readFile(filePath, 'utf8')) as unknown;
-			if (canonicalJson(existing) !== canonicalJson(record)) {
-				throw new Error('persisted_mcp_v3_broker_binding_conflict');
+		const serialized = `${canonicalJson(record)}\n`;
+		// The store is written first so a durable copy exists before the legacy copy
+		// (kept for one release so an agent rollback still finds the binding in /run).
+		const store = this.storeFile(binding.replicaId);
+		if (store) await fs.mkdir(path.dirname(store), { recursive: true, mode: 0o700 });
+		// After a host boot the tmpfs replica folder does not exist yet; the legacy write needs it.
+		await this.prepare(binding.replicaId);
+		const targets = [store, path.join(this.directory(binding.replicaId), 'binding-v3.json')];
+		for (const filePath of targets) {
+			if (!filePath) continue;
+			try {
+				const existing = JSON.parse(await fs.readFile(filePath, 'utf8')) as unknown;
+				if (canonicalJson(existing) !== canonicalJson(record)) {
+					throw new Error('persisted_mcp_v3_broker_binding_conflict');
+				}
+				continue;
+			} catch (error: unknown) {
+				if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
 			}
-			return;
+			await writeFileAtomic(filePath, serialized);
+		}
+	}
+
+	/**
+	 * Read the persisted binding: store first, then the legacy socket-folder copy. Only
+	 * the legacy copy is attacker-reachable (the app container mounts that folder), so it
+	 * must be a regular file owned by the agent and not accessible to group/other.
+	 * A raw ENOENT is returned when neither exists: provisioning registration relies on it.
+	 */
+	private async readPersistedV3(
+		replicaId: string,
+	): Promise<{ persisted: Partial<PersistedMcpReplicaBindingV3>; raw: string; fromLegacy: boolean }> {
+		try {
+			return await this.readPersistedV3Unmarked(replicaId);
+		} catch (error: unknown) {
+			if ((error as NodeJS.ErrnoException).code === 'ENOENT') (error as { bindingMissing?: boolean }).bindingMissing = true;
+			throw error;
+		}
+	}
+
+	private async readPersistedV3Unmarked(
+		replicaId: string,
+	): Promise<{ persisted: Partial<PersistedMcpReplicaBindingV3>; raw: string; fromLegacy: boolean }> {
+		const legacyPath = path.join(this.directory(replicaId), 'binding-v3.json');
+		const store = this.storeFile(replicaId);
+		if (!store) {
+			const raw = await fs.readFile(legacyPath, 'utf8');
+			return { persisted: JSON.parse(raw), raw, fromLegacy: false };
+		}
+		try {
+			const raw = await fs.readFile(store, 'utf8');
+			return { persisted: JSON.parse(raw), raw, fromLegacy: false };
 		} catch (error: unknown) {
 			if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
 		}
-		const temporaryPath = `${filePath}.next-${process.pid}-${crypto.randomUUID()}`;
-		await fs.writeFile(temporaryPath, `${canonicalJson(record)}\n`, { flag: 'wx', mode: 0o600 });
+		let handle: FileHandle;
 		try {
-			await fs.rename(temporaryPath, filePath);
-		} catch (error) {
-			await fs.rm(temporaryPath, { force: true });
+			// O_NOFOLLOW refuses a symlink planted in the replica folder.
+			handle = await fs.open(legacyPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+		} catch (error: unknown) {
+			if ((error as NodeJS.ErrnoException).code === 'ELOOP') throw new Error('persisted_mcp_v3_broker_binding_unsafe');
 			throw error;
+		}
+		try {
+			const stat = await handle.stat();
+			const uid = process.getuid?.();
+			if (!stat.isFile() || (uid !== undefined && stat.uid !== uid) || (stat.mode & 0o077) !== 0) {
+				throw new Error('persisted_mcp_v3_broker_binding_unsafe');
+			}
+			const raw = await handle.readFile('utf8');
+			return { persisted: JSON.parse(raw), raw, fromLegacy: true };
+		} finally {
+			await handle.close();
 		}
 	}
 
@@ -169,9 +248,7 @@ export class McpBrokerManager {
 	): Promise<void> {
 		const replicaId = labels['privos.mcp.replica'];
 		if (!replicaId) throw new Error('persisted_mcp_v3_broker_binding_invalid');
-		const persisted = JSON.parse(
-			await fs.readFile(path.join(this.directory(replicaId), 'binding-v3.json'), 'utf8'),
-		) as Partial<PersistedMcpReplicaBindingV3>;
+		const { persisted, raw, fromLegacy } = await this.readPersistedV3(replicaId);
 		const expectedPersistedAffinity: Partial<PersistedMcpReplicaBindingV3> = {
 			version: 1,
 			protocolVersion: 3,
@@ -207,6 +284,12 @@ export class McpBrokerManager {
 		} catch {
 			throw new Error('persisted_mcp_v3_broker_binding_invalid');
 		}
+		// Migrate a validated legacy binding into the store; the legacy copy stays.
+		const store = this.storeFile(replicaId);
+		if (fromLegacy && store) {
+			await fs.mkdir(path.dirname(store), { recursive: true, mode: 0o700 });
+			await writeFileAtomic(store, raw);
+		}
 		await this.register({
 			...(expectedPersistedAffinity as Omit<McpReplicaBindingV3, 'dockerContainerId' | 'hubPublicJwk' | 'runtimeResourceInventoryHash'>),
 			dockerContainerId,
@@ -222,7 +305,9 @@ export class McpBrokerManager {
 		try {
 			await this.restoreFinalizedV3(labels, binding.dockerContainerId);
 		} catch (error: unknown) {
-			if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+			// Only "no binding in the store and none in the legacy folder" means provisioning;
+			// an ENOENT from any later step (writing, socket setup) is a real failure.
+			if (!(error as { bindingMissing?: boolean }).bindingMissing) throw error;
 			await this.registerProvisioningV3(binding);
 		}
 	}
@@ -370,6 +455,31 @@ export class McpBrokerManager {
 	async cleanup(replicaId: string): Promise<void> {
 		await this.close(replicaId);
 		await fs.rm(this.directory(replicaId), { recursive: true, force: true });
+		const store = this.storeFile(replicaId);
+		if (store) await fs.rm(store, { force: true });
+	}
+
+	/**
+	 * Remove store files (and interrupted-write leftovers) whose replica has no container.
+	 * Returns the removed file names. Entries that are not store files are left alone.
+	 */
+	async sweepOrphanStore(knownReplicaIds: ReadonlySet<string>): Promise<string[]> {
+		if (!this.stateRoot) return [];
+		let entries: string[];
+		try {
+			entries = await fs.readdir(this.stateRoot);
+		} catch (error: unknown) {
+			if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+			throw error;
+		}
+		const removed: string[] = [];
+		for (const entry of entries) {
+			const match = /^([0-9a-f-]{36})\.json(\.next-.+)?$/i.exec(entry);
+			if (!match || (!match[2] && knownReplicaIds.has(match[1]!))) continue;
+			await fs.rm(path.join(this.stateRoot, entry), { force: true });
+			removed.push(entry);
+		}
+		return removed;
 	}
 
 	/** True while a broker socket for this replica is still live and bindable. */
@@ -391,7 +501,19 @@ export const mcpBrokerManager = new McpBrokerManager(
 	config.MCP_BROKER_ROOT,
 	nodeIdentity,
 	(id) => containerManager.inspectContainer(id),
+	// Only a fleet node reboots with tenants on it; local runtimes keep the socket folder as the only home.
+	config.FLEET_MODE ? config.MCP_BROKER_STATE_ROOT : undefined,
 );
+
+/** Drops store files whose replica has no managed container (any state). Run once at start-up, before listening. */
+export async function sweepOrphanBrokerState(): Promise<string[]> {
+	const known = new Set<string>();
+	for (const listed of await containerManager.listMcpContainers()) {
+		const replicaId = listed.Labels?.['privos.mcp.replica'];
+		if (replicaId) known.add(replicaId);
+	}
+	return mcpBrokerManager.sweepOrphanStore(known);
+}
 
 export async function rebindMcpBrokers(): Promise<{ rebound: number; failed: number }> {
 	let rebound = 0;

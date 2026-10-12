@@ -2,7 +2,10 @@
  * Privos Cluster — Fastify entry point.
  * Stateless Docker agent: bootstraps Docker + background services and
  * registers HTTP/WebSocket routes. No local database — Docker (container
- * labels, images) is the only source of truth.
+ * labels, images) is the source of truth, with one deliberate exception: in fleet
+ * mode a small desired-state file (docker/desired-state.ts) records which managed
+ * containers should be running, because Docker cannot tell after a host reboot
+ * which stopped containers were stopped on purpose.
  *
  * Two deployment shapes share this one process:
  *  - HTTP/fleet path: opens a TCP listener (`fastify.listen`), same as always.
@@ -15,7 +18,9 @@ import websocket from '@fastify/websocket';
 import cors from '@fastify/cors';
 
 import { config, isLocalRuntimeEnabled, isTunnelMode, isIngressListenerEnabled, isRuntimeListenerEnabled } from './config.js';
-import { networkManager } from './docker/index.js';
+import { containerManager, networkManager } from './docker/index.js';
+import { desiredState } from './docker/desired-state.js';
+import { afterRecovery, readHostBootId, recoverDesiredState } from './docker/desired-state-recovery.js';
 import { startHealthMonitor, stopHealthMonitor } from './services/health-monitor.js';
 import { startStorageQuotaMonitor, stopStorageQuotaMonitor } from './services/storage-quota-monitor.js';
 import { startReverseProxy, stopReverseProxy } from './proxy/reverse-proxy-server.js';
@@ -35,7 +40,7 @@ import mcpHandler from './handlers/mcp.js';
 import hostTableHandler from './handlers/host-table.js';
 import localRuntimeHandler from './handlers/local-runtime.js';
 import { areOperatorRoutesEnabled } from './services/settings-service.js';
-import { mcpBrokerManager, rebindMcpBrokers } from './services/mcp-broker.js';
+import { mcpBrokerManager, rebindMcpBrokers, sweepOrphanBrokerState } from './services/mcp-broker.js';
 import { startTunnelClient, type TunnelClient } from './tunnel/tunnel-client.js';
 
 /**
@@ -139,12 +144,21 @@ async function main(): Promise<void> {
 		//    (containers, labels, images) is the only source of truth; there is
 		//    no local database to initialize or reconcile. This runs regardless
 		//    of transport (HTTP listener or tunnel) — the cluster still manages
-		//    Docker either way.
+		//    Docker either way. (Fleet nodes also keep the desired-state file
+		//    described in the header.)
 		await networkManager.ensureNetwork();
 		const brokerRebind = await rebindMcpBrokers();
 
 		fastify = await buildFastifyServer();
 		fastify.log.info(brokerRebind, 'MCP identity brokers rebound');
+		if (config.FLEET_MODE) {
+			try {
+				const orphans = await sweepOrphanBrokerState();
+				if (orphans.length) fastify.log.info({ orphans }, 'orphan MCP broker state files removed');
+			} catch (err) {
+				fastify.log.warn(err, 'orphan MCP broker state sweep failed');
+			}
+		}
 		if (!config.FLEET_MODE) {
 			fastify.log.info({ network: config.DOCKER_NETWORK }, 'docker network ready');
 		}
@@ -152,19 +166,6 @@ async function main(): Promise<void> {
 		// Start background services
 		startHealthMonitor();
 		startStorageQuotaMonitor();
-		// Reclaim subnets of workspace app networks whose last container is
-		// gone (uninstalled/purged workspaces). Docker's default address pools
-		// hold ~31 bridge subnets per node; without this sweep the node
-		// eventually cannot create any network and every install fails. The
-		// 1h minimum age keeps the sweep clear of deploys in flight.
-		if (config.FLEET_MODE) {
-			const sweep = async (): Promise<void> => {
-				const removed = await networkManager.sweepUnusedWorkspaceNetworks(60 * 60 * 1000);
-				if (removed.length) fastify?.log.info({ removed }, 'unused workspace app networks removed');
-			};
-			networkSweepTimer = setInterval(() => void sweep().catch((err) => fastify?.log.warn(err, 'network sweep failed')), 60 * 60 * 1000);
-			void sweep().catch((err) => fastify?.log.warn(err, 'network sweep failed'));
-		}
 
 		// Listen (HTTP/fleet path) or dial the Hub (tunnel path) — never both.
 		if (isTunnelMode(config)) {
@@ -173,6 +174,48 @@ async function main(): Promise<void> {
 		} else {
 			await fastify.listen({ port: config.PORT, host: config.HOST });
 			fastify.log.info({ port: config.PORT, host: config.HOST }, 'privos-cluster ready');
+		}
+
+		// After a host boot, start the managed containers that were running before it.
+		// Runs after listen so the agent is reachable meanwhile; it has its own
+		// try/catch, so a failure here can never take the agent down.
+		let recoveryDone: Promise<unknown> = Promise.resolve();
+		if (config.FLEET_MODE) {
+			const log = fastify.log;
+			recoveryDone = (async () => {
+				try {
+					await recoverDesiredState({
+						store: desiredState,
+						readBootId: readHostBootId,
+						listManaged: () => containerManager.listContainers({ label: ['privos.managed=true'] }, true),
+						inspect: (id) => containerManager.inspectContainer(id),
+						start: (id) => containerManager.startContainerWithoutRecord(id),
+						stop: (id) => containerManager.stopContainerWithoutRecord(id),
+						repairNetwork: (id, name, workspaceId, endpointId) =>
+							networkManager.repairContainerNetwork(id, name, workspaceId, endpointId),
+						isBound: (replicaId) => mcpBrokerManager.isBound(replicaId),
+						log,
+					});
+				} catch (err) {
+					log.error(err, 'desired-state recovery crashed');
+				}
+			})();
+		}
+
+		// Reclaim subnets of workspace app networks whose last container is
+		// gone (uninstalled/purged workspaces). Docker's default address pools
+		// hold ~31 bridge subnets per node; without this sweep the node
+		// eventually cannot create any network and every install fails. The
+		// 1h minimum age keeps the sweep clear of deploys in flight.
+		if (config.FLEET_MODE) {
+			// A network must not be judged "unused" while recovery is still
+			// starting the stopped containers that need it.
+			const sweep = afterRecovery(recoveryDone, async (): Promise<void> => {
+				const removed = await networkManager.sweepUnusedWorkspaceNetworks(60 * 60 * 1000);
+				if (removed.length) fastify?.log.info({ removed }, 'unused workspace app networks removed');
+			});
+			networkSweepTimer = setInterval(() => void sweep().catch((err) => fastify?.log.warn(err, 'network sweep failed')), 60 * 60 * 1000);
+			void sweep().catch((err) => fastify?.log.warn(err, 'network sweep failed'));
 		}
 
 		// Native reverse proxy (only in `native` mode). cloudflared terminates

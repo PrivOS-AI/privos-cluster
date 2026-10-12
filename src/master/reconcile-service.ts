@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import type { MasterRepositories } from './repositories.js';
 import type { AgentClient } from './agent-client.js';
-import type { MasterApp } from './types.js';
+import type { MasterApp, MasterNode } from './types.js';
 import type { Container } from '../types/index.js';
 
 export class ReconcileService {
@@ -31,7 +31,7 @@ export class ReconcileService {
 					if (response.status >= 300) throw new Error(`agent returned ${response.status}`);
 					for (const container of response.body as Container[]) {
 						discovered += 1;
-						repaired += await this.reconcileContainer(workspace.workspaceId, node.nodeId, container);
+						repaired += await this.reconcileContainer(workspace.workspaceId, node, container);
 					}
 				} catch {
 					failed += 1;
@@ -43,16 +43,23 @@ export class ReconcileService {
 
 	private async reconcileContainer(
 		workspaceId: string,
-		nodeId: string,
+		node: MasterNode,
 		container: Container,
 	): Promise<number> {
+		const nodeId = node.nodeId;
 		const appId = container.appId ?? container.id;
 		const app = await this.deps.repositories.apps.findOne({ appId, workspaceId });
 		// A QUARANTINED app is intentionally stopped, pending reap after the grace
 		// window — its stopped container is NOT drift. Never touch it here (in
 		// particular, never overwrite QUARANTINED with the container's state, which
 		// would hide it from the reaper and strand the workload forever).
-		if (app?.state === 'QUARANTINED') return 0;
+		if (app?.state === 'QUARANTINED') {
+			// The one thing worth repairing: a container the agent reports running. The
+			// quarantine stop is fire-and-forget, so it is lost when the node or its
+			// agent was down, and a host reboot can bring the workload back. Stop it again.
+			if (container.state === 'running') await this.stopQuarantined(workspaceId, node, container.id, appId);
+			return 0;
+		}
 		// V3 recovery must resume from its persisted generation plan and exact
 		// inventory. Generic discovery must never invent a replica or mark it RUNNING.
 		if (container.mcpV3 || app?.kind === 'mcp-v3') {
@@ -127,6 +134,16 @@ export class ReconcileService {
 		);
 		await this.seedLifecycle(workspaceId, appId, nodeId, container);
 		return 1;
+	}
+
+	private async stopQuarantined(workspaceId: string, node: MasterNode, containerId: string, appId: string): Promise<void> {
+		try {
+			const response = await this.deps.agentClient.request(node, workspaceId, 'POST', `/api/v1/apps/${containerId}/stop`);
+			if (response.status >= 300) throw new Error(`agent returned ${response.status}`);
+			console.warn(JSON.stringify({ level: 40, msg: 'stopped a running container of a quarantined app', workspaceId, appId, nodeId: node.nodeId, containerId }));
+		} catch (err) {
+			console.warn(JSON.stringify({ level: 40, msg: 'could not stop a running container of a quarantined app', workspaceId, appId, nodeId: node.nodeId, containerId, error: err instanceof Error ? err.message : String(err) }));
+		}
 	}
 
 	private async seedLifecycle(

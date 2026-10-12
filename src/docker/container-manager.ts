@@ -4,6 +4,7 @@ import Docker from 'dockerode';
 
 import { resolveImmutableImageReference } from './image-reference.js';
 import { config } from '../config.js';
+import { desiredState } from './desired-state.js';
 import type { ContainerResources, McpRuntimeBinding, McpRuntimeBindingV3, RuntimeSecurityProfile } from '../types/index.js';
 import { RUNTIME_SECURITY_PROFILES } from '../types/index.js';
 import browserSandboxSeccomp from './seccomp/browser-sandbox.json' with { type: 'json' };
@@ -325,6 +326,7 @@ export class ContainerManager {
         });
 
         const info = await container.inspect();
+        await desiredState.mark(info.Id, 'running');
         return { containerId: info.Id, containerName, hostPort: 0 };
     }
 
@@ -354,16 +356,30 @@ export class ContainerManager {
     }
 
     async startContainer(containerId: string): Promise<void> {
+        await this.startContainerWithoutRecord(containerId);
+        await desiredState.mark(containerId, 'running');
+    }
+
+    /** Docker start only. Boot recovery uses it so it cannot overwrite a `stopped` record written meanwhile. */
+    async startContainerWithoutRecord(containerId: string): Promise<void> {
         const container = this.docker.getContainer(containerId);
         try {
             await container.start();
         } catch (err: any) {
-            if (err.statusCode === 304) return; // already running
-            throw new Error(`Failed to start container ${containerId}: ${err.message}`);
+            if (err.statusCode !== 304) throw new Error(`Failed to start container ${containerId}: ${err.message}`);
+            // 304: already running
         }
     }
 
     async stopContainer(containerId: string, timeout = 10): Promise<void> {
+        // Recorded before Docker is asked: if the agent dies between the two, a reboot
+        // must not bring back a container someone just stopped on purpose.
+        await desiredState.mark(containerId, 'stopped');
+        await this.stopContainerWithoutRecord(containerId, timeout);
+    }
+
+    /** Docker stop only (boot recovery re-stops a container the operator stopped while it was starting). */
+    async stopContainerWithoutRecord(containerId: string, timeout = 10): Promise<void> {
         const container = this.docker.getContainer(containerId);
         try {
             await container.stop({ t: timeout });
@@ -384,9 +400,10 @@ export class ContainerManager {
         try {
             await container.remove({ force });
         } catch (err: any) {
-            if (err.statusCode === 404) return; // already gone
-            throw new Error(`Failed to remove container ${containerId}: ${err.message}`);
+            if (err.statusCode !== 404) throw new Error(`Failed to remove container ${containerId}: ${err.message}`);
+            // 404: already gone
         }
+        await desiredState.remove(containerId);
     }
 
     async getContainerStats(containerId: string): Promise<{

@@ -13,6 +13,7 @@ import {
     resolveDomain,
 	getAppNetworkName,
 } from './settings-service.js';
+import { desiredState } from '../docker/desired-state.js';
 import { mcpBrokerManager } from './mcp-broker.js';
 import { refreshRoutes } from '../proxy/proxy-router.js';
 import type {
@@ -633,6 +634,8 @@ export async function restartContainer(containerId: string, workspaceId?: string
     logger.info({ containerId, dockerContainerId: c.dockerContainerId }, 'restarting container');
 
     await containerManager.restartContainer(c.dockerContainerId);
+    // An operator restart also starts a stopped container; the health monitor's restart never records.
+    await desiredState.mark(c.dockerContainerId, 'running');
 
     // Port mapping may change after restart
     const internalUrl = await getInternalUrl(c.dockerContainerId, c.port);
