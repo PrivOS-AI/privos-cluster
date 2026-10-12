@@ -13,6 +13,7 @@ import { selectNodes, remainingNodeCapacity, type NodeReservation, SchedulingErr
 import { SubdomainRegistry } from './subdomain-registry.js';
 import { WorkspaceLock } from './workspace-lock.js';
 import { KeyCipher } from './key-crypto.js';
+import { isRefusedEnvName } from '../schemas/reserved-env.js';
 import type { McpDeploymentGrantPayload } from './mcp-security.js';
 import { canonicalJson, jwkThumbprint, sha256Base64Url } from '../security/artifacts.js';
 import {
@@ -63,7 +64,10 @@ const DeploySchema = z.object({
 		cpus: z.number().min(0.1).max(16),
 		tmpSizeMb: z.number().int().min(16).max(4096).default(64),
 	}),
-	envVars: z.record(z.string(), z.string()).default({}),
+	envVars: z.record(z.string(), z.string()).default({}).refine(
+		(vars) => !Object.keys(vars).some(isRefusedEnvName),
+		'PRIVOS_* environment names are reserved for the platform',
+	),
 	volumes: z.array(z.object({
 		name: z.literal('data'),
 		mountPath: z.string().startsWith('/'),

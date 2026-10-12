@@ -47,7 +47,20 @@ export const PLATFORM_ENV_NAMES = ['PRIVOS_APP_PUBLIC_URL', 'PRIVOS_PUBLIC_URL',
 export const PlatformEnvNameSchema = z.enum(PLATFORM_ENV_NAMES);
 
 export { RESERVED_AGENT_BOT_ENV_NAMES, isAllowedReservedEnvName } from './reserved-env.js';
-import { isAllowedReservedEnvName } from './reserved-env.js';
+import { isRefusedEnvName } from './reserved-env.js';
+
+/** The PRIVOS_ namespace is platform-only on every path that accepts caller-supplied envVars. */
+function refuseReservedEnvNames(envVars: Record<string, string> | undefined, ctx: z.RefinementCtx): void {
+	for (const key of Object.keys(envVars ?? {})) {
+		if (isRefusedEnvName(key)) {
+			ctx.addIssue({
+				code: z.ZodIssueCode.custom,
+				path: ['envVars', key],
+				message: 'PRIVOS_* environment names are reserved for the platform',
+			});
+		}
+	}
+}
 
 const DeployRequestObject = z.object({
     appId: z.string().optional(),
@@ -79,6 +92,7 @@ const DeployRequestObject = z.object({
 });
 
 function validateDeployRequest(value: z.infer<typeof DeployRequestObject>, ctx: z.RefinementCtx): void {
+    refuseReservedEnvNames(value.envVars, ctx);
     const requiresDigest = config.FLEET_MODE || value.image.split('/').includes('marketplace');
     if (requiresDigest && !value.digest) {
         ctx.addIssue({
@@ -141,15 +155,6 @@ export const McpRuntimeBindingSchema = z.object({
 
 export const McpDeployRequestSchema = DeployRequestObject.extend({ mcpBinding: McpRuntimeBindingSchema }).superRefine((value, ctx) => {
 		validateDeployRequest(value, ctx);
-		for (const key of Object.keys(value.envVars ?? {})) {
-			if (key.toUpperCase().startsWith('PRIVOS_') && !isAllowedReservedEnvName(key)) {
-				ctx.addIssue({
-					code: z.ZodIssueCode.custom,
-					path: ['envVars', key],
-					message: 'PRIVOS_* environment names are reserved for the platform',
-				});
-			}
-		}
 		if (value.workspaceId !== value.mcpBinding.workspaceId) {
 			ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['workspaceId'], message: 'workspace binding mismatch' });
 		}
@@ -188,15 +193,6 @@ export const McpDeployRequestV3Schema = DeployRequestObject.extend({
 	validateDeployRequest(value, ctx);
 	if (!value.appId) {
 		ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['appId'], message: 'appId is required for MCP v3' });
-	}
-	for (const key of Object.keys(value.envVars ?? {})) {
-		if (key.toUpperCase().startsWith('PRIVOS_') && !isAllowedReservedEnvName(key)) {
-			ctx.addIssue({
-				code: z.ZodIssueCode.custom,
-				path: ['envVars', key],
-				message: 'PRIVOS_* environment names are reserved for the platform',
-			});
-		}
 	}
 	if (value.workspaceId !== value.mcpV3Binding.workspaceId) {
 		ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['workspaceId'], message: 'workspace binding mismatch' });
@@ -253,15 +249,6 @@ export const McpReconfigureRequestV3Schema = DeployRequestObject.extend({
 	if (!value.appId) {
 		ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['appId'], message: 'appId is required for MCP v3' });
 	}
-	for (const key of Object.keys(value.envVars ?? {})) {
-		if (key.toUpperCase().startsWith('PRIVOS_') && !isAllowedReservedEnvName(key)) {
-			ctx.addIssue({
-				code: z.ZodIssueCode.custom,
-				path: ['envVars', key],
-				message: 'PRIVOS_* environment names are reserved for the platform',
-			});
-		}
-	}
 	if (value.workspaceId !== value.mcpV3Binding.workspaceId) {
 		ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['workspaceId'], message: 'workspace binding mismatch' });
 	}
@@ -310,15 +297,7 @@ export const RedeployRequestSchema = z.object({
     // Symmetric with McpDeployRequestV3Schema and McpReconfigureRequestV3Schema:
     // the PRIVOS_ namespace is platform-only on every path that accepts envVars,
     // not just the ones that were written with an MCP v3 binding in mind.
-    for (const key of Object.keys(value.envVars ?? {})) {
-        if (key.toUpperCase().startsWith('PRIVOS_') && !isAllowedReservedEnvName(key)) {
-            ctx.addIssue({
-                code: z.ZodIssueCode.custom,
-                path: ['envVars', key],
-                message: 'PRIVOS_* environment names are reserved for the platform',
-            });
-        }
-    }
+    refuseReservedEnvNames(value.envVars, ctx);
     if (value.mcpV3Binding) {
         if (value.digest !== value.mcpV3Binding.imageDigest) {
             ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['digest'], message: 'image digest binding mismatch' });
