@@ -140,6 +140,7 @@ test('a forward swap that fails after the broker binding is written is recovered
 		subdomain: null,
 		baseDomain: null,
 		createdAt: Date.now(),
+		securityProfile: null,
 	};
 
 	await assert.rejects(createAndStartRedeployedContainer({
@@ -250,6 +251,7 @@ test('a new image that starts, gets an IP, then exits is refused rather than sil
 		subdomain: null,
 		baseDomain: null,
 		createdAt: Date.now(),
+		securityProfile: null,
 	};
 
 	await assert.rejects(
@@ -413,4 +415,112 @@ test('redeployContainer pre-pulls the previous image before the old container is
 	assert.ok(pullTarget < pullPrevious, 'target pulled before previous');
 	assert.ok(pullPrevious < stopOld, 'previous image pulled before the old container is stopped');
 	assert.ok(pullPrevious < removeOld, 'previous image pulled before the old container is removed');
+});
+
+/**
+ * Drives the full redeployContainer path against an in-memory Docker and records the
+ * securityProfile every createAppContainer call received.
+ */
+async function swapProfiles(
+	t: import('node:test').TestContext,
+	opts: { oldProfile?: string; requested?: 'browser-sandbox' | null; failForward: boolean },
+): Promise<Array<string | null>> {
+	const health = await startHealthServer();
+	t.after(async () => {
+		await health.close();
+		await mcpBrokerManager.closeAll();
+	});
+	const replicaId = '77777777-7777-4777-8777-777777777777';
+	const containerId = '88888888-8888-4888-8888-888888888888';
+	const targetDigest = `sha256:${'3'.repeat(64)}`;
+	const previousDigest = `sha256:${'4'.repeat(64)}`;
+	const mcpLabels: Record<string, string> = {
+		'privos.mcp.schema': '3', 'privos.mcp.cluster': 'cluster-1', 'privos.mcp.node': 'node-1',
+		'privos.mcp.workspace': 'workspace-1', 'privos.mcp.deployment': 'deployment-1',
+		'privos.mcp.generation': 'generation-1', 'privos.mcp.generation-number': '1',
+		'privos.mcp.runtime-installation': 'runtime-1', 'privos.mcp.app': 'mcp-app-1',
+		'privos.mcp.replica': replicaId, 'privos.mcp.image.digest': previousDigest,
+		'privos.mcp.manifest.digest': previousDigest, 'privos.mcp.authorization-epoch': '1',
+		'privos.mcp.hub-origin': 'https://hub.example.com', 'privos.mcp.hub-kid': 'kid-1',
+		'privos.mcp.hub-jwk': JSON.stringify({ kty: 'EC', crv: 'P-256', x: 'x', y: 'y' }),
+		'privos.env.secret-keys': '[]', 'privos.port': String(health.port),
+	};
+	const oldInspect = inspectFixture('docker-old', containerId, previousDigest);
+	Object.assign(oldInspect.Config.Labels, mcpLabels);
+	if (opts.oldProfile) oldInspect.Config.Labels['privos.securityProfile'] = opts.oldProfile;
+	const registry = new Map<string, any>([['docker-old', oldInspect]]);
+	const profiles: Array<string | null> = [];
+	let created = 0;
+
+	t.mock.method(docker, 'info', async () => ({ MemTotal: 8 * 1024 * 1024 * 1024, NCPU: 4 }));
+	t.mock.method(containerManager, 'pullImage', async () => undefined);
+	t.mock.method(containerManager, 'stopContainer', async () => undefined);
+	t.mock.method(containerManager, 'removeContainer', async (id: string) => { registry.delete(id); });
+	t.mock.method(containerManager, 'createAppContainer', async (cfg: any) => {
+		created += 1;
+		profiles.push(cfg.securityProfile);
+		const id = `docker-new-${created}`;
+		const info = inspectFixture(id, containerId, cfg.digest);
+		Object.assign(info.Config.Labels, mcpLabels, { 'privos.port': String(health.port) });
+		if (cfg.securityProfile) info.Config.Labels['privos.securityProfile'] = cfg.securityProfile;
+		registry.set(id, info);
+		return { containerId: id, containerName: id, hostPort: 0 };
+	});
+	t.mock.method(containerManager, 'startContainer', async () => {
+		if (opts.failForward && created === 1) throw new Error('forward start failed');
+	});
+	t.mock.method(containerManager, 'getContainerIp', async () => '127.0.0.1');
+	// The state mapper reads labels off the list entry, so entries must carry them.
+	t.mock.method(containerManager, 'listContainers', async () => [...registry.entries()].map(([Id, info]) => ({
+		Id, Names: [`/${Id}`], Image: 'registry.example/app:latest', Labels: info.Config.Labels,
+		State: 'running', Created: Math.floor(Date.now() / 1000), Ports: [], Mounts: [],
+		NetworkSettings: { Networks: {} },
+	})));
+	t.mock.method(containerManager, 'inspectContainer', async (id: string) => {
+		const info = registry.get(id);
+		if (!info) throw new Error(`no such container: ${id}`);
+		return info;
+	});
+
+	const request = {
+		workspaceId: 'workspace-1',
+		digest: targetDigest,
+		mcpV3Binding: {
+			clusterId: 'cluster-1', nodeId: 'node-1', workspaceId: 'workspace-1',
+			deploymentId: 'deployment-1', generationId: 'generation-1', generationNumber: 1,
+			runtimeInstallationId: 'runtime-1', mcpAppId: 'mcp-app-1', replicaId, containerId,
+			imageDigest: targetDigest, manifestDigest: targetDigest,
+			approvalReceiptHash: 'b'.repeat(43), authorizationEpoch: 2, deploymentGrantHash: 'g'.repeat(43),
+			resourceManifestHash: 'r'.repeat(43),
+		} as any,
+		runtimeResourceInventoryHash: 'i'.repeat(43),
+		envVars: {},
+		secretEnvKeys: [],
+		platformEnvVars: { PRIVOS_PUBLIC_URL: 'https://library-app.apps.example.com', PRIVOS_ACCESS_MODE: 'managed-runtime' },
+		...(opts.requested !== undefined ? { securityProfile: opts.requested } : {}),
+	};
+	try {
+		await redeployContainer(containerId, request, 'workspace-1');
+	} catch (error) {
+		if (!opts.failForward) throw error;
+	}
+	return profiles;
+}
+
+test('an absent profile key keeps the running container profile across an upgrade swap', async (t) => {
+	assert.deepEqual(await swapProfiles(t, { oldProfile: 'browser-sandbox', failForward: false }), ['browser-sandbox']);
+});
+
+test('a failed upgrade swap restores the OLD container profile even when the request removes it', async (t) => {
+	const profiles = await swapProfiles(t, { oldProfile: 'browser-sandbox', requested: null, failForward: true });
+	// Forward attempt follows the request (null); the revert recreates the container as it was.
+	assert.deepEqual(profiles, [null, 'browser-sandbox']);
+});
+
+test('an explicit null removes the profile and a value adds it on a successful swap', async (t) => {
+	assert.deepEqual(await swapProfiles(t, { oldProfile: 'browser-sandbox', requested: null, failForward: false }), [null]);
+});
+
+test('a requested profile applies to a container that had none', async (t) => {
+	assert.deepEqual(await swapProfiles(t, { requested: 'browser-sandbox', failForward: false }), ['browser-sandbox']);
 });
