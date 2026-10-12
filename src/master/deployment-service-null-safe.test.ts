@@ -39,7 +39,13 @@ function matches(record: Record<string, unknown>, filter: Record<string, unknown
  * all never do. This is the exact invariant the migration in
  * `src/migrations/seed-host-labels.ts` establishes at the real Mongo layer.
  */
-function fixture(overrides: { noDefaultHost?: boolean; emitAppPublicUrl?: boolean; legacyPublicUrlAlias?: boolean } = {}) {
+function fixture(overrides: {
+	noDefaultHost?: boolean;
+	emitAppPublicUrl?: boolean;
+	legacyPublicUrlAlias?: boolean;
+	securityProfileAllowlist?: Map<string, 'browser-sandbox'>;
+	emitSecurityProfile?: boolean;
+} = {}) {
 	const apps: MasterApp[] = [];
 	const inventories: RuntimeResourceInventory[] = [];
 	const lifecycleEvents: AppLifecycleEvent[] = [];
@@ -171,6 +177,8 @@ function fixture(overrides: { noDefaultHost?: boolean; emitAppPublicUrl?: boolea
 		noDefaultHost: overrides.noDefaultHost,
 		emitAppPublicUrl: overrides.emitAppPublicUrl,
 		legacyPublicUrlAlias: overrides.legacyPublicUrlAlias,
+		securityProfileAllowlist: overrides.securityProfileAllowlist,
+		emitSecurityProfile: overrides.emitSecurityProfile,
 	});
 	return { apps, inventories, service, deployBodies, get ingressCalls() { return ingressCalls; }, get allocateCalls() { return allocateCalls; } };
 }
@@ -360,4 +368,31 @@ test('L8: reviving an appId tombstone with a foreign subdomain surfaces the clea
 			return true;
 		},
 	);
+});
+
+test('security profile: install sends the profile for an allowlisted attested listing only when emit is on', async () => {
+	const allowlist = new Map([['listing-1', 'browser-sandbox' as const]]);
+	const on = fixture({ securityProfileAllowlist: allowlist, emitSecurityProfile: true });
+	await on.service.deployMcpV3('workspace-1', grant(), 'grant-hash', { kid: 'hub-kid', publicJwk: {} as any });
+	assert.equal(on.deployBodies[0].securityProfile, 'browser-sandbox');
+
+	const off = fixture({ securityProfileAllowlist: allowlist });
+	await off.service.deployMcpV3('workspace-1', grant(), 'grant-hash', { kid: 'hub-kid', publicJwk: {} as any });
+	assert.equal('securityProfile' in off.deployBodies[0], false);
+});
+
+test('security profile: install sends an explicit null for a listing that is not allowlisted or an empty allowlist', async () => {
+	const other = fixture({ securityProfileAllowlist: new Map([['listing-99', 'browser-sandbox' as const]]), emitSecurityProfile: true });
+	await other.service.deployMcpV3('workspace-1', grant(), 'grant-hash', { kid: 'hub-kid', publicJwk: {} as any });
+	assert.equal(other.deployBodies[0].securityProfile, null);
+	const empty = fixture({ emitSecurityProfile: true });
+	await empty.service.deployMcpV3('workspace-1', grant(), 'grant-hash', { kid: 'hub-kid', publicJwk: {} as any });
+	assert.equal(empty.deployBodies[0].securityProfile, null);
+});
+
+test('security profile: a Hub-chosen mcpAppId or manifest value cannot select a profile', async () => {
+	// Only the attested listingId is looked up; the allowlist entry keyed on the Hub-controlled id is inert.
+	const state = fixture({ securityProfileAllowlist: new Map([['mcp-app-1', 'browser-sandbox' as const]]), emitSecurityProfile: true });
+	await state.service.deployMcpV3('workspace-1', grant(), 'grant-hash', { kid: 'hub-kid', publicJwk: {} as any });
+	assert.equal(state.deployBodies[0].securityProfile, null);
 });

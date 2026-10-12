@@ -97,7 +97,11 @@ function command(overrides: Partial<ClusterUpgradeCommandPayloadV3> = {}): Clust
 	};
 }
 
-function fixture(app: MasterApp = runningApp(), agentResponses?: (path: string) => { status: number; body: unknown }) {
+function fixture(
+	app: MasterApp = runningApp(),
+	agentResponses?: (path: string) => { status: number; body: unknown },
+	deps: Partial<ConstructorParameters<typeof DeploymentService>[0]> = {},
+) {
 	const apps = [structuredClone(app)];
 	const nodes: MasterNode[] = [{
 		nodeId: 'node-1', url: 'https://node-1.internal', region: 'eu', failureDomain: 'fd-1',
@@ -142,6 +146,7 @@ function fixture(app: MasterApp = runningApp(), agentResponses?: (path: string) 
 		locks: { run: async (_ws: string, work: () => Promise<unknown>) => work() } as any,
 		baseDomain: 'apps.example.com',
 		cipher: new KeyCipher(CIPHER_KEY),
+		...deps,
 	});
 	return { apps, agentCalls, service };
 }
@@ -335,4 +340,43 @@ test('the redeploy body carries the image repository, never the digest currently
 	assert.ok(!String(call!.body.image).includes('@'), 'the redeploy image must carry no digest pin');
 	// The digest still travels separately, so the agent composes repository@digest.
 	assert.equal(call!.body.digest, `sha256:${'f'.repeat(64)}`);
+});
+
+test('security profile: upgrade forward and revert bodies carry the same resolved profile; emit off omits the key', async () => {
+	const failSecond = (path: string) => path === '/api/v1/apps/container-2/redeploy'
+		? { status: 500, body: { error: 'boom' } }
+		: { status: 200, body: { swapStrategy: 'STOP_THEN_CREATE' } };
+	const ha = runningApp({
+		availabilityTier: 'ha',
+		replicas: [
+			{ replicaId: 'replica-1', nodeId: 'node-1', containerId: 'container-1', state: 'running' },
+			{ replicaId: 'replica-2', nodeId: 'node-2', containerId: 'container-2', state: 'running' },
+		],
+	});
+	const on = fixture(ha, failSecond, {
+		securityProfileAllowlist: new Map([['listing-1', 'browser-sandbox' as const]]),
+		emitSecurityProfile: true,
+	});
+	await assert.rejects(on.service.upgradeMcpV3('workspace-1', command()));
+	assert.equal(on.agentCalls.length, 3);
+	for (const call of on.agentCalls) assert.equal(call.body.securityProfile, 'browser-sandbox');
+
+	const off = fixture(ha, failSecond, { securityProfileAllowlist: new Map([['listing-1', 'browser-sandbox' as const]]) });
+	await assert.rejects(off.service.upgradeMcpV3('workspace-1', command()));
+	for (const call of off.agentCalls) assert.equal('securityProfile' in call.body, false);
+
+	const unlisted = fixture(runningApp(), undefined, { emitSecurityProfile: true });
+	await unlisted.service.upgradeMcpV3('workspace-1', command());
+	assert.equal(unlisted.agentCalls[0]!.body.securityProfile, null);
+});
+
+test('security profile: the response profile mirrors what was sent to the agent', () => {
+	const on = fixture(runningApp(), undefined, {
+		securityProfileAllowlist: new Map([['listing-1', 'browser-sandbox' as const]]),
+		emitSecurityProfile: true,
+	});
+	assert.equal(on.service.appliedSecurityProfile('listing-1'), 'browser-sandbox');
+	assert.equal(on.service.appliedSecurityProfile('listing-2'), null);
+	const off = fixture(runningApp(), undefined, { securityProfileAllowlist: new Map([['listing-1', 'browser-sandbox' as const]]) });
+	assert.equal(off.service.appliedSecurityProfile('listing-1'), null);
 });

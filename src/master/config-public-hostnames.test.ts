@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { loadMasterConfig } from './config.js';
+import { loadMasterConfig, parseSecurityProfileAllowlist } from './config.js';
 
 function environment(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
 	return {
@@ -40,4 +40,27 @@ test('CF_APPS_SAAS_API_TOKEN is optional and independent of CF_APPS_API_TOKEN', 
 	const config = loadMasterConfig(environment({ CF_APPS_SAAS_API_TOKEN: 'saas-token' }));
 	assert.equal(config.CF_APPS_SAAS_API_TOKEN, 'saas-token');
 	assert.equal(config.CF_APPS_API_TOKEN, undefined);
+});
+
+test('security profile allowlist is empty and the emit flag off by default', () => {
+	const config = loadMasterConfig(environment());
+	assert.equal(config.MCP_V3_SECURITY_PROFILE_ALLOWLIST, '');
+	assert.equal(config.MCP_V3_EMIT_SECURITY_PROFILE, 'off');
+	assert.equal(parseSecurityProfileAllowlist(config.MCP_V3_SECURITY_PROFILE_ALLOWLIST).size, 0);
+	assert.throws(() => loadMasterConfig(environment({ MCP_V3_EMIT_SECURITY_PROFILE: 'yes' })));
+});
+
+test('security profile allowlist parses profile:listingId entries', () => {
+	const config = loadMasterConfig(environment({
+		MCP_V3_SECURITY_PROFILE_ALLOWLIST: ' browser-sandbox:listing-a , browser-sandbox:listing-b ',
+	}));
+	const parsed = parseSecurityProfileAllowlist(config.MCP_V3_SECURITY_PROFILE_ALLOWLIST);
+	assert.deepEqual([...parsed], [['listing-a', 'browser-sandbox'], ['listing-b', 'browser-sandbox']]);
+});
+
+test('malformed allowlist entries and unknown profile names fail config load', () => {
+	for (const bad of ['listing-a', 'browser-sandbox:', ':listing-a', 'unconfined:listing-a', 'browser-sandbox:a,,browser-sandbox:b',
+		'browser-sandbox:a,browser-sandbox:a', 'browser-sandbox:bad id']) {
+		assert.throws(() => loadMasterConfig(environment({ MCP_V3_SECURITY_PROFILE_ALLOWLIST: bad })), Error, bad);
+	}
 });

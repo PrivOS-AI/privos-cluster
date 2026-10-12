@@ -634,6 +634,7 @@ export function hubFacingRoutes(deps: {
 				clusterAppId: app.appId,
 				runtimeInstallationId: grant.runtimeInstallationId,
 				...(installPublicUrl ? { publicUrl: installPublicUrl } : {}),
+				securityProfile: deps.deployment.appliedSecurityProfile(app.listingId),
 				runtimeInventoryAttestation: {
 					compact: attestation.compact,
 					artifactHash: attestation.artifactHash,
@@ -803,6 +804,7 @@ export function hubFacingRoutes(deps: {
 				runtimeInstallationId,
 				configEpoch: command.configEpoch,
 				...(reconfigurePublicUrl ? { publicUrl: reconfigurePublicUrl } : {}),
+				securityProfile: deps.deployment.appliedSecurityProfile(applied.app.listingId),
 				acknowledgement: {
 					compact: acknowledgement.compact,
 					artifactHash: acknowledgement.artifactHash,
@@ -1039,6 +1041,7 @@ export function hubFacingRoutes(deps: {
 				runtimeInstallationId,
 				revision: command.revision,
 				...(upgradePublicUrl ? { publicUrl: upgradePublicUrl } : {}),
+				securityProfile: deps.deployment.appliedSecurityProfile(applied.app.listingId),
 				acknowledgement: {
 					compact: acknowledgement.compact,
 					artifactHash: acknowledgement.artifactHash,

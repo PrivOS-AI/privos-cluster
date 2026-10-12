@@ -57,6 +57,7 @@ test('v3 activation returns the exact persisted runtime-active instant on every 
 		auth: { verify: async (workspaceId: string) => ({ workspaceId }) } as any,
 		deployment: {
 			publicUrlFor: (subdomain: string) => `https://${subdomain}.apps.example.com`,
+			appliedSecurityProfile: () => null,
 			activateMcpV3: async () => {
 				activationCalls += 1;
 				return {
@@ -332,6 +333,7 @@ test('a successful v3 upgrade verifies the label, delegates the swap, and return
 		auth: { verify: async (workspaceId: string) => ({ workspaceId }) } as any,
 		deployment: {
 			publicUrlFor: (subdomain: string) => `https://${subdomain}.apps.example.com`,
+			appliedSecurityProfile: () => null,
 			upgradeMcpV3: async () => {
 				callOrder.push('upgradeMcpV3');
 				return { app: upgradedApp, swapStrategy: 'STOP_THEN_CREATE' };
@@ -676,6 +678,7 @@ test('the inspect reference drops the running digest pin, so an upgrade can name
 		auth: { verify: async (workspaceId: string) => ({ workspaceId }) } as any,
 		deployment: {
 			publicUrlFor: (s: string) => `https://${s}.apps.example.com`,
+			appliedSecurityProfile: () => null,
 			upgradeMcpV3: async () => ({
 				app: { appId: 'cluster-app-1', subdomain: 'library-app', manifestDigest: targetDigest, imageDigest: targetDigest, updatedAt: new Date() },
 				swapStrategy: 'STOP_THEN_CREATE',

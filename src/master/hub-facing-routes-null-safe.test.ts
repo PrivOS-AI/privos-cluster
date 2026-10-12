@@ -34,6 +34,7 @@ test('v3 upgrade response omits publicUrl for a host-less app (D9)', async (t) =
 		auth: { verify: async (workspaceId: string) => ({ workspaceId }) } as any,
 		deployment: {
 			publicUrlFor,
+			appliedSecurityProfile: () => null,
 			upgradeMcpV3: async () => ({
 				// No `subdomain` at all — the MCP_V3_NO_DEFAULT_HOST case.
 				app: { appId: 'cluster-app-1', subdomain: undefined, manifestDigest: targetDigest, imageDigest: targetDigest, updatedAt: new Date() },
@@ -70,6 +71,8 @@ test('v3 upgrade response omits publicUrl for a host-less app (D9)', async (t) =
 	const json = response.json();
 	assert.equal('publicUrl' in json, false, 'no primary host → the key must be OMITTED entirely');
 	assert.ok(!JSON.stringify(json).includes('undefined'));
+	// Additive field: the applied runtime profile is always reported, null when none.
+	assert.equal(json.securityProfile, null);
 });
 
 test('subdomain-check reports a HELD label the caller\'s own workspace holds as available', async (t) => {

@@ -1,6 +1,6 @@
 import Fastify from 'fastify';
 import type { JsonWebKey } from 'node:crypto';
-import type { MasterConfig } from './config.js';
+import { parseSecurityProfileAllowlist, type MasterConfig } from './config.js';
 import type { MasterRepositories } from './repositories.js';
 import { KeyCipher } from './key-crypto.js';
 import { WorkspaceAuth } from './workspace-auth.js';
@@ -133,6 +133,8 @@ export function buildMasterServer(config: MasterConfig, repositories: MasterRepo
 		noDefaultHost: config.MCP_V3_NO_DEFAULT_HOST === 'on',
 		emitAppPublicUrl: config.MCP_EMIT_APP_PUBLIC_URL === 'on',
 		legacyPublicUrlAlias: config.MCP_LEGACY_PUBLIC_URL_ALIAS === 'on',
+		securityProfileAllowlist: parseSecurityProfileAllowlist(config.MCP_V3_SECURITY_PROFILE_ALLOWLIST),
+		emitSecurityProfile: config.MCP_V3_EMIT_SECURITY_PROFILE === 'on',
 		appHosts,
 	});
 	const mcpSecurity = config.APP_CLUSTER_MCP_INSTALL_V2 === 'on' || config.APP_CLUSTER_MCP_INSTALL_V3 === 'on'

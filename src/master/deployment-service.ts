@@ -4,7 +4,7 @@ import type { JsonWebKey } from 'node:crypto';
 import { z } from 'zod';
 import type { MasterRepositories } from './repositories.js';
 import type { AvailabilityTier, AppReplica, MasterApp, MasterNode, RuntimeResourceInventory } from './types.js';
-import type { ContainerResources } from '../types/index.js';
+import type { ContainerResources, RuntimeSecurityProfile } from '../types/index.js';
 import { AgentClient } from './agent-client.js';
 import { IngressRouteProgrammer } from './ingress-route-programmer.js';
 import { QuotaService } from './quota-service.js';
@@ -93,12 +93,41 @@ export class DeploymentService {
 		 * alongside PRIVOS_APP_PUBLIC_URL (D18) with the same value. Irrelevant
 		 * (PRIVOS_PUBLIC_URL is emitted regardless) while `emitAppPublicUrl` is off. */
 		legacyPublicUrlAlias?: boolean;
+		/** MCP_V3_SECURITY_PROFILE_ALLOWLIST, already parsed: attested listingId ->
+		 * runtime security profile. Absent/empty means no app gets a profile. */
+		securityProfileAllowlist?: ReadonlyMap<string, RuntimeSecurityProfile>;
+		/** MCP_V3_EMIT_SECURITY_PROFILE === 'on' (default false): send the
+		 * `securityProfile` key to the agent at all. Off keeps every agent body
+		 * free of the key, so an agent that predates the field (strict schemas)
+		 * keeps accepting the request. Agents roll first, then this flips on. */
+		emitSecurityProfile?: boolean;
 		/** D-requirement host registry. Optional so every existing/unwired
 		 * caller (tests, a fleet that has not deployed phase 3's registry) is
 		 * unaffected — its absence just means the env builder falls back to
 		 * `app.subdomain`, exactly as it always has. */
 		appHosts?: AppHostRegistry;
 	}) {}
+
+	/**
+	 * The one place a runtime security profile is decided. Keyed only on the
+	 * stored, portal-attested listingId; nothing the Hub sends (manifest name,
+	 * mcpAppId, descriptor fields) takes part. Derived on every call, never
+	 * persisted, so the allowlist is always the current truth.
+	 */
+	resolveSecurityProfile(listingId: string): RuntimeSecurityProfile | null {
+		return this.deps.securityProfileAllowlist?.get(listingId) ?? null;
+	}
+
+	/** Body fragment for every agent request that can create a container: the key is absent
+	 * while the emit flag is off, otherwise a profile name or an explicit null (which removes it). */
+	private securityProfileBody(listingId: string): { securityProfile?: RuntimeSecurityProfile | null } {
+		return this.deps.emitSecurityProfile === true ? { securityProfile: this.resolveSecurityProfile(listingId) } : {};
+	}
+
+	/** What the agent was told to apply, for the Hub-facing responses (null when none or not emitted). */
+	appliedSecurityProfile(listingId: string): RuntimeSecurityProfile | null {
+		return this.deps.emitSecurityProfile === true ? this.resolveSecurityProfile(listingId) : null;
+	}
 
 	async deploy(workspaceId: string, raw: unknown): Promise<MasterApp> {
 		const input = DeploySchema.parse(raw);
@@ -487,6 +516,7 @@ export class DeploymentService {
 							domain: this.deps.baseDomain,
 							platformEnvVars: await this.platformEnvVarsV3(app),
 							secretEnvKeys: app.secretEnvKeys ?? [],
+							...this.securityProfileBody(app.listingId),
 							mcpV3Binding: {
 								protocolVersion: 3,
 								clusterId: grant.clusterId,
@@ -1012,6 +1042,7 @@ export class DeploymentService {
 				domain: this.deps.baseDomain,
 				configEpoch: command.configEpoch,
 				runtimeResourceInventoryHash: command.runtimeResourceInventoryHash,
+				...this.securityProfileBody(app.listingId),
 				mcpV3Binding: {
 					protocolVersion: 3 as const,
 					clusterId: command.clusterId,
@@ -1223,6 +1254,7 @@ export class DeploymentService {
 				platformEnvVars,
 				secretEnvKeys,
 				runtimeResourceInventoryHash: command.runtimeResourceInventoryHash,
+				...this.securityProfileBody(app.listingId),
 				mcpV3Binding: {
 					protocolVersion: 3 as const,
 					clusterId: command.clusterId,

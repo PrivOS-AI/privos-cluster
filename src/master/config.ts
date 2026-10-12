@@ -1,4 +1,32 @@
 import { z } from 'zod';
+import { RUNTIME_SECURITY_PROFILES, type RuntimeSecurityProfile } from '../types/index.js';
+
+/**
+ * Parse `<profile>:<listingId>[,<profile>:<listingId>...]` into listingId -> profile.
+ * Empty or missing means no listing gets a profile. A malformed entry, an unknown
+ * profile name or a listing mapped to two profiles throws: a typo must never
+ * silently widen or drop a grant.
+ */
+export function parseSecurityProfileAllowlist(raw: string | undefined): Map<string, RuntimeSecurityProfile> {
+	const result = new Map<string, RuntimeSecurityProfile>();
+	if (!raw?.trim()) return result;
+	for (const entry of raw.split(',')) {
+		const text = entry.trim();
+		const separator = text.indexOf(':');
+		const profile = text.slice(0, separator);
+		const listingId = text.slice(separator + 1).trim();
+		if (separator < 1 || !listingId || !/^[A-Za-z0-9_.-]{1,128}$/.test(listingId)) {
+			throw new Error(`malformed security profile allowlist entry: ${JSON.stringify(text)}`);
+		}
+		if (!(RUNTIME_SECURITY_PROFILES as readonly string[]).includes(profile)) {
+			throw new Error(`unknown security profile in allowlist: ${JSON.stringify(profile)}`);
+		}
+		if (result.has(listingId)) throw new Error(`listing ${listingId} appears twice in the security profile allowlist`);
+		result.set(listingId, profile as RuntimeSecurityProfile);
+	}
+	return result;
+}
+
 const MasterConfigSchema = z.object({
 	MASTER_PORT: z.coerce.number().int().positive().default(4200),
 	MASTER_HOST: z.string().default('127.0.0.1'),
@@ -43,6 +71,14 @@ const MasterConfigSchema = z.object({
 	MCP_V3_NO_DEFAULT_HOST: z.enum(['on', 'off']).default('off'),
 	MCP_EMIT_APP_PUBLIC_URL: z.enum(['on', 'off']).default('off'),
 	MCP_LEGACY_PUBLIC_URL_ALIAS: z.enum(['on', 'off']).default('on'),
+	// Runtime security profiles (e.g. browser-sandbox). The allowlist maps an
+	// attested listingId to a profile; empty/missing grants nothing. Malformed
+	// entries or unknown profile names fail config load. EMIT follows the
+	// EMIT_APP_PUBLIC_URL skew pattern: off (default) never sends the
+	// `securityProfile` key, so an agent that predates it keeps working; flip on
+	// only after every agent has rolled.
+	MCP_V3_SECURITY_PROFILE_ALLOWLIST: z.string().default(''),
+	MCP_V3_EMIT_SECURITY_PROFILE: z.enum(['on', 'off']).default('off'),
 	// Days a WS_SUSPENDED host keeps its Cloudflare custom hostname before the
 	// daily release job deletes it (resume recreates it). DEV E2E sets 0.
 	APP_HOST_SUSPEND_CF_RETENTION_DAYS: z.coerce.number().int().nonnegative().default(30),
@@ -50,6 +86,15 @@ const MasterConfigSchema = z.object({
 	// Separate from CF_APPS_API_TOKEN (wildcard/CNAME DNS) by least privilege.
 	CF_APPS_SAAS_API_TOKEN: z.string().optional(),
 }).superRefine((config, ctx) => {
+	try {
+		parseSecurityProfileAllowlist(config.MCP_V3_SECURITY_PROFILE_ALLOWLIST);
+	} catch (error) {
+		ctx.addIssue({
+			code: z.ZodIssueCode.custom,
+			path: ['MCP_V3_SECURITY_PROFILE_ALLOWLIST'],
+			message: error instanceof Error ? error.message : 'invalid allowlist',
+		});
+	}
 	let key: Buffer | null = null;
 	try {
 		key = Buffer.from(config.APP_MASTER_KEY_ENCRYPTION_KEY_B64, 'base64');
