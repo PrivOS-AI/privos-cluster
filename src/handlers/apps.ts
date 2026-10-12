@@ -26,6 +26,8 @@ import {
     ContainerIdParamSchema,
     DeployRequestSchema,
     RedeployRequestSchema,
+    SECURITY_PROFILE_NOT_ALLOWED,
+    isSecurityProfileRefused,
     DispatchBodySchema,
 	McpDispatchBodySchema,
 	McpDispatchBodyV3Schema,
@@ -336,6 +338,9 @@ const appsHandler: FastifyPluginAsync = async (fastify) => {
             const body = RedeployRequestSchema.safeParse(req.body);
             if (!body.success) {
                 return reply.code(400).send({ error: 'validation_error', details: body.error.issues });
+            }
+            if (isSecurityProfileRefused(body.data.securityProfile)) {
+                return reply.code(400).send({ error: SECURITY_PROFILE_NOT_ALLOWED });
             }
             const workspaceId = authorizedWorkspaceId(req);
             if (!workspaceMatches(body.data.workspaceId, workspaceId)) {

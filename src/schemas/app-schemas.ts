@@ -7,6 +7,17 @@ import { RUNTIME_SECURITY_PROFILES } from '../types/index.js';
 /** Closed enum: an unknown profile name is refused rather than ignored. */
 export const SecurityProfileSchema = z.enum(RUNTIME_SECURITY_PROFILES).nullable().optional();
 
+/**
+ * A runtime security profile may only be requested by the fleet master. In
+ * non-fleet (paired/CE) mode the agent also accepts Hub-issued tokens, so a
+ * non-null profile there would let a Hub choose its own seccomp profile.
+ * Null or absent stays accepted. Routes answer 400 with this code.
+ */
+export const SECURITY_PROFILE_NOT_ALLOWED = 'security_profile_not_allowed';
+export function isSecurityProfileRefused(profile: unknown): boolean {
+	return profile !== undefined && profile !== null && !config.FLEET_MODE;
+}
+
 export const ResourcesSchema = z.object({
     // Max 4096 so an XL managed-runtime size (4096MB/4cpu) deploys and reconfigures.
     memoryMb: z.number().int().min(64).max(4096).default(256),
