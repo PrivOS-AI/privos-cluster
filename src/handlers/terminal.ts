@@ -10,6 +10,7 @@ import fp from 'fastify-plugin';
 import { verifyToken } from '../auth/jwt.js';
 import * as dockerState from '../docker/docker-state.js';
 import { containerManager } from '../docker/index.js';
+import { config } from '../config.js';
 
 const terminalHandler: FastifyPluginAsync = async (fastify) => {
     fastify.get(
@@ -18,6 +19,13 @@ const terminalHandler: FastifyPluginAsync = async (fastify) => {
         async (socket, req) => {
             const { containerId } = req.params as { containerId: string };
             const token = (req.query as Record<string, string>).token;
+
+            // Hub tokens carry no workspace, so on a shared fleet node the terminal
+            // could not be confined to one tenant's containers: refuse outright.
+            if (config.FLEET_MODE) {
+                socket.close(4403, 'forbidden');
+                return;
+            }
 
             // 1. Verify JWT — must be issued by privos-chat
             try {

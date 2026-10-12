@@ -147,6 +147,14 @@ const ConfigSchema = z.object({
 		});
 	}
 
+	if (cfg.FLEET_MODE && cfg.CORS_ORIGIN.trim() === '*') {
+		ctx.addIssue({
+			code: z.ZodIssueCode.custom,
+			path: ['CORS_ORIGIN'],
+			message: 'FLEET_MODE=true refuses CORS_ORIGIN=*; list the allowed origins explicitly',
+		});
+	}
+
 	if (cfg.FLEET_MODE && !cfg.IMAGE_REGISTRY_ALLOWLIST.split(',').some((host) => host.trim())) {
 		ctx.addIssue({
 			code: z.ZodIssueCode.custom,

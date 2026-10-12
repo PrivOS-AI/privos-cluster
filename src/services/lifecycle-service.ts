@@ -209,10 +209,11 @@ async function assertHostAvailable(
 async function assertResourceBudget(
     resources: ContainerResources,
     ignoreContainerId?: string,
+    workspaceId?: string,
 ): Promise<void> {
     let req = resources;
     if (ignoreContainerId) {
-        const existing = await dockerState.getById(ignoreContainerId);
+        const existing = await dockerState.getById(ignoreContainerId, undefined, workspaceId);
         if (existing) {
             req = {
                 memoryMb: Math.max(0, resources.memoryMb - existing.resources.memoryMb),
@@ -947,7 +948,7 @@ export async function redeployContainer(
     logger.info({ containerId, newImage, newTag, newSubdomain, baseDomain }, 'redeploying container');
 
     await assertHostAvailable(newSubdomain, baseDomain, containerId);
-    await assertResourceBudget(newResources, containerId);
+    await assertResourceBudget(newResources, containerId, workspaceId);
     assertRegistryAllowed(newImage);
 
     // Read existing volume mounts from the OLD container's own inspect before
@@ -1168,7 +1169,7 @@ export async function rollingRedeployContainer(
     );
 
     await assertHostAvailable(newSubdomain, baseDomain, containerId);
-    await assertResourceBudget(newResources, containerId);
+    await assertResourceBudget(newResources, containerId, workspaceId);
     assertRegistryAllowed(newImage);
 
     // 1. Pull new image — old container continues serving traffic

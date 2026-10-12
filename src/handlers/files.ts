@@ -5,6 +5,7 @@
  */
 import type { FastifyPluginAsync } from 'fastify';
 import fp from 'fastify-plugin';
+import path from 'node:path';
 import * as dockerState from '../docker/docker-state.js';
 import { containerManager } from '../docker/index.js';
 import {
@@ -21,12 +22,18 @@ interface FileEntry {
 }
 
 /**
- * Sanitize a path: strip ".." segments, ensure it starts with "/".
- * Returns "/app" as fallback.
+ * Resolve a caller path to an absolute POSIX path under /app, or null when it
+ * falls outside. Normalising a rooted path first collapses every ".." segment,
+ * so the prefix check below cannot be walked around.
  */
-function sanitizePath(raw: string | undefined): string {
-    const p = (raw || '/app').replace(/\.\./g, '').trim();
-    return p.startsWith('/') ? p : `/${p}`;
+export function resolveContainerPath(raw: string | undefined): string | null {
+    const p = path.posix.normalize('/' + (raw || '/app').trim());
+    return p === '/app' || p.startsWith('/app/') ? p : null;
+}
+
+/** argv for the directory listing; run without a shell so the path is never interpreted. */
+export function listDirectoryArgv(targetPath: string): string[] {
+    return ['find', targetPath, '-maxdepth', '1', '-mindepth', '1', '-exec', 'stat', '-c', '%F|%s|%Y|%n', '{}', ';'];
 }
 
 const filesHandler: FastifyPluginAsync = async (fastify) => {
@@ -43,7 +50,7 @@ const filesHandler: FastifyPluginAsync = async (fastify) => {
                 return reply.code(400).send({ error: 'validation_error', details: query.error.issues });
             }
 
-            const container = await dockerState.getById(params.data.containerId);
+            const container = await dockerState.getById(params.data.containerId, undefined, req.clusterAuth?.workspaceId);
             if (!container) {
                 return reply.code(404).send({ error: 'not found' });
             }
@@ -51,13 +58,12 @@ const filesHandler: FastifyPluginAsync = async (fastify) => {
                 return reply.code(409).send({ error: 'container not running' });
             }
 
-            const targetPath = sanitizePath(query.data.path);
+            const targetPath = resolveContainerPath(query.data.path);
+            if (!targetPath) {
+                return reply.code(400).send({ error: 'path must be inside /app' });
+            }
 
-            const output = await containerManager.execCommand(container.dockerContainerId, [
-                'sh',
-                '-c',
-                `find "${targetPath}" -maxdepth 1 -mindepth 1 -exec stat -c "%F|%s|%Y|%n" {} \\;`,
-            ]);
+            const output = await containerManager.execCommand(container.dockerContainerId, listDirectoryArgv(targetPath));
 
             const entries: FileEntry[] = [];
             const lines = output.split('\n').filter((l) => l.trim());
@@ -118,7 +124,7 @@ const filesHandler: FastifyPluginAsync = async (fastify) => {
                 return reply.code(400).send({ error: 'validation_error', details: query.error.issues });
             }
 
-            const container = await dockerState.getById(params.data.containerId);
+            const container = await dockerState.getById(params.data.containerId, undefined, req.clusterAuth?.workspaceId);
             if (!container) {
                 return reply.code(404).send({ error: 'not found' });
             }
@@ -126,7 +132,10 @@ const filesHandler: FastifyPluginAsync = async (fastify) => {
                 return reply.code(409).send({ error: 'container not running' });
             }
 
-            const safePath = sanitizePath(query.data.path);
+            const safePath = resolveContainerPath(query.data.path);
+            if (!safePath) {
+                return reply.code(400).send({ error: 'path must be inside /app' });
+            }
 
             // Check file size first — reject if >1MB
             const sizeOutput = await containerManager.execCommand(container.dockerContainerId, [

@@ -8,6 +8,7 @@
  */
 import type Docker from 'dockerode';
 import { containerManager } from './index.js';
+import { config } from '../config.js';
 import { mapListEntryToContainer, pickActivePerId } from './docker-state-mapper.js';
 import type { Container, HealthCheck } from '../types/index.js';
 
@@ -54,6 +55,9 @@ export async function getById(
 	workspaceId?: string,
 	oom?: OomProvider,
 ): Promise<Container | null> {
+	// Fleet nodes host many tenants: an unscoped lookup would cross workspaces.
+	// Non-fleet (self-hosted/BYO) containers carry no workspace claim, so they stay unscoped.
+	if (config.FLEET_MODE && !workspaceId) throw new Error('workspace scope required');
 	const labels = [MANAGED_LABEL, `privos.id=${id}`];
 	if (workspaceId) labels.push(`privos.workspace=${workspaceId}`);
 	const found = await inspectManaged({ label: labels }, health, oom);

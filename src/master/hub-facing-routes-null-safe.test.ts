@@ -116,3 +116,34 @@ test('subdomain-check reports a HELD label the caller\'s own workspace holds as 
 	});
 	assert.deepEqual(empty.json(), { available: false });
 });
+
+test('subdomain-check refuses a malformed or oversized value without consulting the namespace', async (t) => {
+	const fastify = Fastify();
+	t.after(() => fastify.close());
+	let lookups = 0;
+	await fastify.register(hubFacingRoutes({
+		auth: { verify: async (workspaceId: string) => ({ workspaceId }) } as any,
+		deployment: {} as any,
+		lifecycle: {} as any,
+		repositories: { apps: { findOne: async () => null } } as any,
+		agentClient: {} as any,
+		baseDomain: 'apps.example.com',
+		mcpV2Enabled: false,
+		mcpV3Enabled: false,
+		mcpReconfigureEnabled: false,
+		mcpUpgradeEnabled: false,
+		clusterMasterIdentity: {} as any,
+		mcpReleaseAuthorityJwks: [],
+		labelNamespace: { isAvailableFor: async () => { lookups += 1; return true; } } as any,
+	}));
+	await fastify.ready();
+	const headers = { authorization: 'Bearer test' };
+	for (const query of ['value=a&value=b', `value=${'a'.repeat(64)}`, 'value[$ne]=x']) {
+		const res = await fastify.inject({ method: 'GET', url: `/w/workspace-1/api/v1/cluster/subdomain-check?${query}`, headers });
+		assert.deepEqual(res.json(), { available: false }, query);
+	}
+	assert.equal(lookups, 0);
+	const ok = await fastify.inject({ method: 'GET', url: `/w/workspace-1/api/v1/cluster/subdomain-check?value=${'a'.repeat(63)}`, headers });
+	assert.deepEqual(ok.json(), { available: true });
+	assert.equal(lookups, 1);
+});

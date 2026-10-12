@@ -135,3 +135,20 @@ test('PROXY_ROLE=INGRESS|BOTH requires FLEET_NODE_ID', () => {
 	assert.equal(loadConfigWith({ PROXY_ROLE: 'INGRESS' }, ['FLEET_NODE_ID']), 1);
 	assert.equal(loadConfigWith({ PROXY_ROLE: 'INGRESS', FLEET_NODE_ID: 'app-eu-01' }), 0);
 });
+
+const FLEET_ENV = {
+	FLEET_MODE: 'true',
+	HOST: '10.88.0.99',
+	FLEET_NODE_ID: 'apps-test-01',
+	FLEET_NODE_KEY: 'k'.repeat(48),
+	IMAGE_REGISTRY_ALLOWLIST: '10.88.0.11:5000',
+};
+
+test('fleet mode refuses a wildcard CORS_ORIGIN and accepts an explicit list', () => {
+	assert.equal(loadConfigWith({ ...FLEET_ENV, CORS_ORIGIN: '*' }), 1);
+	assert.equal(loadConfigWith({ ...FLEET_ENV, CORS_ORIGIN: 'https://a.example, https://b.example' }), 0);
+});
+
+test('a wildcard CORS_ORIGIN still boots outside fleet mode', () => {
+	assert.equal(loadConfigWith({ CORS_ORIGIN: '*' }), 0);
+});
