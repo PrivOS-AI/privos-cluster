@@ -15,9 +15,11 @@ export interface CanonicalPath {
 
 /** Returns `null` when `rawTarget` must be rejected with 400. */
 export function canonicalizePath(rawTarget: string): CanonicalPath | null {
-	// Checked on the RAW target, before WHATWG parsing: an encoded slash/backslash
+	// Checked on the RAW path, before WHATWG parsing: an encoded slash/backslash
 	// must never be allowed to smuggle an extra path segment past the matcher below.
-	if (ENCODED_SLASH_OR_BACKSLASH.test(rawTarget)) return null;
+	// The query is not routed, so an encoded slash there (e.g. noVNC's `path=`
+	// parameter) is ordinary data and passes through untouched.
+	if (ENCODED_SLASH_OR_BACKSLASH.test(rawTarget.split(/[?#]/, 1)[0])) return null;
 
 	// Also checked on the RAW path, before WHATWG parsing: `URL` silently resolves
 	// `.`/`..` segments away (so a post-parse check on `pathname` never sees them)

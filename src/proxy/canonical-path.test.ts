@@ -14,6 +14,14 @@ test('canonicalizePath rejects encoded slash/backslash', () => {
 	assert.equal(canonicalizePath('/API%2F'), null); // case-insensitive
 });
 
+test('canonicalizePath keeps an encoded slash in the query as data', () => {
+	assert.deepEqual(canonicalizePath('/sessions/t/vnc/vnc.html?path=sessions%2Ft%2Fvnc%2Fwebsockify'), {
+		pathname: '/sessions/t/vnc/vnc.html',
+		search: '?path=sessions%2Ft%2Fvnc%2Fwebsockify',
+	});
+	assert.equal(canonicalizePath('/a%2fb?x=%2F'), null); // the path is still checked
+});
+
 test('canonicalizePath rejects dot segments and double slash', () => {
 	assert.equal(canonicalizePath('/api/../secret'), null);
 	assert.equal(canonicalizePath('/./api'), null);
