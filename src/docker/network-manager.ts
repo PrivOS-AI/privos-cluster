@@ -17,7 +17,7 @@ export function canAttachAgentToWorkspaceNetwork(networkMode: string | undefined
  * Everything else on the node — product stacks, canary composes, the shared
  * non-fleet network — is out of the garbage collector's reach by construction.
  */
-const WORKSPACE_APP_NETWORK_PATTERN = /^privos-ws-.+-apps$/;
+export const WORKSPACE_APP_NETWORK_PATTERN = /^privos-ws-.+-apps$/;
 
 export class NetworkManager {
     constructor(private docker: Docker) {}
@@ -60,6 +60,44 @@ export class NetworkManager {
     }
 
     /**
+     * Make a stopped container's workspace network usable again. If the network is gone
+     * (it was removed while the container was stopped) it is recreated, and a container
+     * whose endpoint points at an older incarnation of the network is detached and
+     * attached again — Docker refuses to start it otherwise ("network <id> not found").
+     * Returns true when anything had to be repaired.
+     */
+    async repairContainerNetwork(
+        dockerContainerId: string,
+        networkName: string,
+        workspaceId: string,
+        endpointNetworkId: string | undefined,
+    ): Promise<boolean> {
+        let repaired = false;
+        const inspectNetwork = async (): Promise<any | null> => {
+            try {
+                return await this.docker.getNetwork(networkName).inspect();
+            } catch (err: any) {
+                if (err.statusCode === 404) return null;
+                throw err;
+            }
+        };
+        let info = await inspectNetwork();
+        if (!info) {
+            await this.ensureNetwork(workspaceId);
+            info = await inspectNetwork();
+            if (!info) throw new Error(`network ${networkName} could not be recreated`);
+            repaired = true;
+        }
+        if (endpointNetworkId !== info.Id) {
+            const network = this.docker.getNetwork(networkName);
+            await network.disconnect({ Container: dockerContainerId, Force: true }).catch(() => undefined);
+            await network.connect({ Container: dockerContainerId });
+            repaired = true;
+        }
+        return repaired;
+    }
+
+    /**
      * Remove one workspace's app network when nothing runs in it anymore.
      *
      * Docker's default address pools hold ~31 bridge subnets, and every
@@ -83,6 +121,14 @@ export class NetworkManager {
             if (err.statusCode === 404) return false;
             throw err;
         }
+        // Docker lists only RUNNING containers under a network. A stopped managed
+        // container still references it through NetworkMode and needs it back at
+        // its next start (e.g. after a host reboot), so it keeps the network alive.
+        const referencing = await this.docker.listContainers({
+            all: true,
+            filters: { label: ['privos.managed=true'] },
+        });
+        if (referencing.some((container: any) => container.HostConfig?.NetworkMode === networkName)) return false;
         const attached = Object.values(info.Containers ?? {}) as Array<{ Name?: string }>;
         const nonAgent = attached.filter((container) => container.Name !== config.FLEET_AGENT_CONTAINER);
         if (nonAgent.length > 0) return false;
