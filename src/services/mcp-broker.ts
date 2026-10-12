@@ -171,6 +171,8 @@ export class McpBrokerManager {
 		// (kept for one release so an agent rollback still finds the binding in /run).
 		const store = this.storeFile(binding.replicaId);
 		if (store) await fs.mkdir(path.dirname(store), { recursive: true, mode: 0o700 });
+		// After a host boot the tmpfs replica folder does not exist yet; the legacy write needs it.
+		await this.prepare(binding.replicaId);
 		const targets = [store, path.join(this.directory(binding.replicaId), 'binding-v3.json')];
 		for (const filePath of targets) {
 			if (!filePath) continue;
@@ -194,6 +196,17 @@ export class McpBrokerManager {
 	 * A raw ENOENT is returned when neither exists: provisioning registration relies on it.
 	 */
 	private async readPersistedV3(
+		replicaId: string,
+	): Promise<{ persisted: Partial<PersistedMcpReplicaBindingV3>; raw: string; fromLegacy: boolean }> {
+		try {
+			return await this.readPersistedV3Unmarked(replicaId);
+		} catch (error: unknown) {
+			if ((error as NodeJS.ErrnoException).code === 'ENOENT') (error as { bindingMissing?: boolean }).bindingMissing = true;
+			throw error;
+		}
+	}
+
+	private async readPersistedV3Unmarked(
 		replicaId: string,
 	): Promise<{ persisted: Partial<PersistedMcpReplicaBindingV3>; raw: string; fromLegacy: boolean }> {
 		const legacyPath = path.join(this.directory(replicaId), 'binding-v3.json');
@@ -292,7 +305,9 @@ export class McpBrokerManager {
 		try {
 			await this.restoreFinalizedV3(labels, binding.dockerContainerId);
 		} catch (error: unknown) {
-			if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+			// Only "no binding in the store and none in the legacy folder" means provisioning;
+			// an ENOENT from any later step (writing, socket setup) is a real failure.
+			if (!(error as { bindingMissing?: boolean }).bindingMissing) throw error;
 			await this.registerProvisioningV3(binding);
 		}
 	}

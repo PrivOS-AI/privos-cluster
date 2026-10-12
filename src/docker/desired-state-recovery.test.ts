@@ -24,6 +24,7 @@ async function harness(
 	if (opts.recorded) await fs.writeFile(file, JSON.stringify(opts.recorded));
 	const store = new DesiredStateStore(() => file, () => true);
 	const started: string[] = [];
+	const stopped: string[] = [];
 	const logs: Array<{ level: string; obj: object; msg: string }> = [];
 	const log = (level: string) => (obj: object, msg: string) => { logs.push({ level, obj, msg }); };
 	const deps: RecoveryDeps = {
@@ -40,6 +41,7 @@ async function harness(
 				NetworkSettings: { Networks: { [c.mode ?? 'privos-ws-ws-1-apps']: { NetworkID: c.endpoint ?? 'net-1' } } },
 			};
 		},
+		stop: async (id) => { stopped.push(id); },
 		start: async (id) => {
 			if (opts.startFails?.includes(id)) throw new Error('boom');
 			started.push(id);
@@ -48,7 +50,7 @@ async function harness(
 		isBound: (replicaId) => opts.bound?.includes(replicaId) ?? false,
 		log: { info: log('info'), warn: log('warn'), error: log('error') },
 	};
-	return { deps, store, started, logs, file };
+	return { deps, store, started, stopped, logs, file };
 }
 
 const NEW = { bootId: 'boot-old' };
@@ -220,5 +222,31 @@ test('a missing network is recreated and the stale endpoint reconnected', async 
 		assert.deepEqual(intact, []);
 	} finally {
 		mutable.FLEET_MODE = previous;
+	}
+});
+
+test('a stop that lands during start stops the container again and leaves the record stopped', async (t) => {
+	for (const during of ['start', 'networkRepair'] as const) {
+		const h = await harness(t, {
+			recorded: { ...NEW, containers: { a: 'running' } },
+			containers: { a: {} },
+		});
+		const stopRecord = () => h.store.mark('a', 'stopped');
+		if (during === 'start') {
+			const start = h.deps.start;
+			h.deps.start = async (id) => { await start(id); await stopRecord(); };
+		} else {
+			h.deps.repairNetwork = async () => { await stopRecord(); return false; };
+		}
+		const summary = await recoverDesiredState(h.deps);
+		assert.equal(await h.store.get('a'), 'stopped');
+		if (during === 'start') {
+			assert.deepEqual(h.stopped, ['a']);
+			assert.equal(summary.skipped.stoppedDuringStart, 1);
+		} else {
+			// The stop landed before Docker was asked to start: the container is stopped again right after.
+			assert.deepEqual(h.stopped, ['a']);
+		}
+		assert.equal(summary.started, 0);
 	}
 });

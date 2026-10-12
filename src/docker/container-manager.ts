@@ -356,20 +356,30 @@ export class ContainerManager {
     }
 
     async startContainer(containerId: string): Promise<void> {
+        await this.startContainerWithoutRecord(containerId);
+        await desiredState.mark(containerId, 'running');
+    }
+
+    /** Docker start only. Boot recovery uses it so it cannot overwrite a `stopped` record written meanwhile. */
+    async startContainerWithoutRecord(containerId: string): Promise<void> {
         const container = this.docker.getContainer(containerId);
         try {
             await container.start();
         } catch (err: any) {
             if (err.statusCode !== 304) throw new Error(`Failed to start container ${containerId}: ${err.message}`);
-            // 304: already running — still the desired state.
+            // 304: already running
         }
-        await desiredState.mark(containerId, 'running');
     }
 
     async stopContainer(containerId: string, timeout = 10): Promise<void> {
         // Recorded before Docker is asked: if the agent dies between the two, a reboot
         // must not bring back a container someone just stopped on purpose.
         await desiredState.mark(containerId, 'stopped');
+        await this.stopContainerWithoutRecord(containerId, timeout);
+    }
+
+    /** Docker stop only (boot recovery re-stops a container the operator stopped while it was starting). */
+    async stopContainerWithoutRecord(containerId: string, timeout = 10): Promise<void> {
         const container = this.docker.getContainer(containerId);
         try {
             await container.stop({ t: timeout });

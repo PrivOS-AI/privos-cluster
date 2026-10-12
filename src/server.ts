@@ -189,7 +189,8 @@ async function main(): Promise<void> {
 						readBootId: readHostBootId,
 						listManaged: () => containerManager.listContainers({ label: ['privos.managed=true'] }, true),
 						inspect: (id) => containerManager.inspectContainer(id),
-						start: (id) => containerManager.startContainer(id),
+						start: (id) => containerManager.startContainerWithoutRecord(id),
+						stop: (id) => containerManager.stopContainerWithoutRecord(id),
 						repairNetwork: (id, name, workspaceId, endpointId) =>
 							networkManager.repairContainerNetwork(id, name, workspaceId, endpointId),
 						isBound: (replicaId) => mcpBrokerManager.isBound(replicaId),

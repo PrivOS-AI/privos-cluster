@@ -100,10 +100,56 @@ test('after the tmpfs folder is wiped the binding is restored from the store', a
 	await first.closeAll();
 	await fs.rm(env.brokerRoot, { recursive: true, force: true });
 
+	// No prepare(): after a boot the tmpfs replica folder does not exist at all.
 	const replacement = env.make();
-	await replacement.prepare(replicaId);
 	await replacement.restoreFinalizedV3(labels, 'docker-2');
 	assert.equal(replacement.isBound(replicaId), true);
+	assert.equal(await fs.readFile(env.legacyFile, 'utf8'), await fs.readFile(env.storeFile, 'utf8'));
+});
+
+test('provisioning registration keeps the finalized binding when only the store copy exists', async (t) => {
+	const env = await setup(t);
+	const first = env.make();
+	await first.prepare(replicaId);
+	await first.register(finalized);
+	await first.closeAll();
+	await fs.rm(env.brokerRoot, { recursive: true, force: true });
+
+	const replacement = env.make();
+	const { runtimeResourceInventoryHash: _unused, ...provisioning } = finalized;
+	await replacement.restoreOrRegisterProvisioningV3({ ...provisioning, runtimeResourceInventoryHash: undefined }, labels);
+	assert.equal(replacement.isBound(replicaId), true);
+	// A provisioning socket would not have rewritten the legacy copy from the store.
+	assert.equal(await fs.readFile(env.legacyFile, 'utf8'), await fs.readFile(env.storeFile, 'utf8'));
+});
+
+test('an ENOENT from a later step is not mistaken for a missing binding', async (t) => {
+	const env = await setup(t);
+	const first = env.make();
+	await first.prepare(replicaId);
+	await first.register(finalized);
+	await first.closeAll();
+	const replacement = env.make();
+	(replacement as any).register = async () => { throw Object.assign(new Error('late'), { code: 'ENOENT' }); };
+	const { runtimeResourceInventoryHash: _unused, ...provisioning } = finalized;
+	await assert.rejects(
+		replacement.restoreOrRegisterProvisioningV3({ ...provisioning, runtimeResourceInventoryHash: undefined }, labels),
+		/late/,
+	);
+	assert.equal(replacement.isBound(replicaId), false);
+});
+
+test('a legacy binding owned by another user is refused', async (t) => {
+	const env = await setup(t);
+	const seed = new McpBrokerManager(env.brokerRoot, {} as NodeIdentity, async () => ({}));
+	await seed.prepare(replicaId);
+	await seed.register(finalized);
+	await seed.closeAll();
+	const real = process.getuid!;
+	process.getuid = () => real.call(process) + 1;
+	t.after(() => { process.getuid = real; });
+	await assert.rejects(env.make().restoreFinalizedV3(labels, 'docker-1'), /persisted_mcp_v3_broker_binding_unsafe/);
+	await assert.rejects(fs.stat(env.storeFile));
 });
 
 test('a legacy-only binding migrates into the store and the legacy copy is kept', async (t) => {

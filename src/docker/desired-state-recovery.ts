@@ -12,7 +12,10 @@ export interface RecoveryDeps {
 	readBootId: () => Promise<string>;
 	listManaged: () => Promise<Array<{ Id: string; State?: string }>>;
 	inspect: (dockerId: string) => Promise<any>;
+	/** Docker start that does not touch the desired-state record. */
 	start: (dockerId: string) => Promise<void>;
+	/** Docker stop that does not touch the desired-state record. */
+	stop: (dockerId: string) => Promise<void>;
 	repairNetwork: (
 		dockerId: string,
 		networkName: string,
@@ -126,6 +129,13 @@ async function recoverOne(deps: RecoveryDeps, id: string): Promise<string> {
 		}
 	}
 	await deps.start(id);
+	// A stop may have landed between the re-read above and the start: the record says
+	// stopped, so honour it by stopping the container again (the record stays stopped).
+	if ((await deps.store.get(id)) === 'stopped') {
+		deps.log.warn({ dockerId: id }, 'container was stopped while recovery started it; stopping it again');
+		await deps.stop(id);
+		return 'stoppedDuringStart';
+	}
 	return 'started';
 }
 
