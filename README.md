@@ -137,6 +137,16 @@ workspace claim does not match the container label. Each workspace is attached
 to `privos-ws-{workspaceId}-apps`; the agent container is connected for native
 proxying, while app containers never share a network across workspaces.
 
+With `FLEET_MODE` off (self-hosted and BYO clusters) the agent serves a single
+tenant: containers carry no workspace label, so workspace checks on lookups and
+on `apps/*` routes are skipped by design. With `FLEET_MODE` on, a container
+lookup without a workspace scope is refused. `CLUSTER_OPERATOR_ROUTES` (default
+`off`) registers the operator `files` and `terminal` routes only when set to
+`on`; in fleet mode the terminal is refused even then, and file paths are
+confined to `/app`. Deploy requests may not set environment names in the
+reserved `PRIVOS_*` namespace (the platform injects those itself), and
+`CORS_ORIGIN=*` never sends credentials (fleet mode refuses it).
+
 ## Branching
 
 Environment-gated hardening shared by development and multi-tenancy lands on
