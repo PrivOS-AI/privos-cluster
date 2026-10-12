@@ -83,6 +83,14 @@ export class NetworkManager {
             if (err.statusCode === 404) return false;
             throw err;
         }
+        // Docker lists only RUNNING containers under a network. A stopped managed
+        // container still references it through NetworkMode and needs it back at
+        // its next start (e.g. after a host reboot), so it keeps the network alive.
+        const referencing = await this.docker.listContainers({
+            all: true,
+            filters: { label: ['privos.managed=true'] },
+        });
+        if (referencing.some((container: any) => container.HostConfig?.NetworkMode === networkName)) return false;
         const attached = Object.values(info.Containers ?? {}) as Array<{ Name?: string }>;
         const nonAgent = attached.filter((container) => container.Name !== config.FLEET_AGENT_CONTAINER);
         if (nonAgent.length > 0) return false;

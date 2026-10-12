@@ -26,9 +26,14 @@ type FakeNetwork = {
     removeError?: { statusCode: number };
 };
 
-function fakeDocker(networks: Record<string, FakeNetwork>, summaries: Array<{ Name: string; Created?: string }> = []) {
+function fakeDocker(
+    networks: Record<string, FakeNetwork>,
+    summaries: Array<{ Name: string; Created?: string }> = [],
+    containers: Array<{ HostConfig: { NetworkMode: string } }> = [],
+) {
     return {
         listNetworks: async () => summaries,
+        listContainers: async () => containers,
         getNetwork: (name: string) => ({
             inspect: async () => {
                 const network = networks[name];
@@ -136,4 +141,25 @@ test('the garbage collector is inert outside fleet mode', async () => {
     assert.equal(await manager.removeWorkspaceNetworkIfUnused('ws-1'), false);
     assert.deepEqual(await manager.sweepUnusedWorkspaceNetworks(0), []);
     assert.equal(networks['privos-ws-ws-1-apps']!.removed, false);
+});
+
+test('a network referenced by a stopped managed container is kept', async () => {
+    await withFleetMode(async () => {
+        const old = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+        const networks: Record<string, FakeNetwork> = {
+            'privos-ws-ws-stopped-apps': { containers: {}, removed: false, disconnected: [] },
+            'privos-ws-ws-free-apps': { containers: {}, removed: false, disconnected: [] },
+        };
+        const manager = new NetworkManager(fakeDocker(
+            networks,
+            [
+                { Name: 'privos-ws-ws-stopped-apps', Created: old },
+                { Name: 'privos-ws-ws-free-apps', Created: old },
+            ],
+            [{ HostConfig: { NetworkMode: 'privos-ws-ws-stopped-apps' } }],
+        ));
+        assert.deepEqual(await manager.sweepUnusedWorkspaceNetworks(60 * 60 * 1000), ['privos-ws-ws-free-apps']);
+        assert.equal(networks['privos-ws-ws-stopped-apps']!.removed, false);
+        assert.equal(await manager.removeWorkspaceNetworkIfUnused('ws-stopped'), false);
+    });
 });
