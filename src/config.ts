@@ -61,6 +61,8 @@ const ConfigSchema = z.object({
 	MCP_BROKER_ROOT: z.string().startsWith('/').default('/run/privos/mcp-broker'),
 	/** Durable (non-tmpfs) home of finalized v3 broker bindings; fleet mode only. */
 	MCP_BROKER_STATE_ROOT: z.string().startsWith('/').default('/var/lib/privos/mcp-broker-state'),
+	/** Fleet-mode record of which managed containers should be running; read once after a host reboot. */
+	AGENT_DESIRED_STATE_PATH: z.string().startsWith('/').default('/var/lib/privos/agent-desired-state.json'),
 	APP_CLUSTER_MCP_INSTALL_V3: z.enum(['on', 'off']).default('off'),
 
 	HEALTH_CHECK_INTERVAL_MS: z.coerce.number().int().positive().default(30_000),
