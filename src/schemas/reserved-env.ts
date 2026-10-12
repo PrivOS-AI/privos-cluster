@@ -14,3 +14,7 @@ export const RESERVED_AGENT_BOT_ENV_NAMES = ['PRIVOS_AGENT_BOT_CREDENTIAL', 'PRI
 const reservedAgentBotEnvNames: ReadonlySet<string> = new Set(RESERVED_AGENT_BOT_ENV_NAMES);
 
 export const isAllowedReservedEnvName = (name: string): boolean => reservedAgentBotEnvNames.has(name);
+
+/** True for a PRIVOS_* name that a caller-supplied env map may not carry. */
+export const isRefusedEnvName = (name: string): boolean =>
+	name.toUpperCase().startsWith('PRIVOS_') && !isAllowedReservedEnvName(name);

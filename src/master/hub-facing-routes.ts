@@ -182,8 +182,9 @@ export function hubFacingRoutes(deps: {
 			mode: 'native',
 		}));
 		fastify.get(`${root}/cluster/subdomain-check`, { preHandler: authenticate }, async (req) => {
-			const value = (req.query as { value?: string }).value;
-			if (!value) return { available: false };
+			const parsed = z.string().min(1).max(63).safeParse((req.query as { value?: unknown }).value);
+			if (!parsed.success) return { available: false };
+			const value = parsed.data;
 			// Scoped to the caller's own workspace (D): the shared D10 namespace
 			// check reports a label the caller ALREADY holds as available, so a
 			// workspace re-checking its own current label never sees it "taken".

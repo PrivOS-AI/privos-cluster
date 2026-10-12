@@ -1,7 +1,8 @@
 # syntax=docker/dockerfile:1
 
 # Stage 1: Builder — pure JS/TS build, no native module toolchain needed.
-FROM node:20-alpine AS builder
+# Base pinned to the multi-arch index digest (amd64 + arm64); bump it deliberately.
+FROM node:20-alpine@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb8363f609372293 AS builder
 WORKDIR /app
 
 COPY package*.json ./
@@ -12,7 +13,7 @@ COPY src ./src
 RUN npm run build && npm prune --omit=dev
 
 # Stage 2: Runner — minimal, with dumb-init for proper signal handling
-FROM node:20-alpine AS runner
+FROM node:20-alpine@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb8363f609372293 AS runner
 RUN apk add --no-cache dumb-init
 WORKDIR /app
 
