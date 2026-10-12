@@ -73,13 +73,12 @@ export async function buildFastifyServer(): Promise<FastifyInstance> {
 
 	// CORS (frontend dev server origin). Skipped if explicitly disabled.
 	if (config.CORS_ORIGIN) {
-		const origins =
-			config.CORS_ORIGIN === '*'
-				? true
-				: config.CORS_ORIGIN.split(',').map((o) => o.trim()).filter(Boolean);
+		const anyOrigin = config.CORS_ORIGIN === '*';
+		const origins = anyOrigin ? true : config.CORS_ORIGIN.split(',').map((o) => o.trim()).filter(Boolean);
 		await fastify.register(cors, {
 			origin: origins,
-			credentials: true,
+			// A wildcard origin must never be paired with credentialed requests.
+			credentials: !anyOrigin,
 			methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
 			allowedHeaders: ['Content-Type', 'Authorization'],
 		});
