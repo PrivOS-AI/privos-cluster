@@ -613,7 +613,7 @@ export function hubFacingRoutes(deps: {
 			});
 			const hubIdentity = await deps.mcpSecurity.publicInfo(workspaceId(req));
 			if (!hubIdentity) return reply.code(409).send({ error: 'hub_identity_not_enrolled' });
-			const { app, inventory } = await withCorrelationId(
+			const { app, inventory, securityProfile: profile } = await withCorrelationId(
 				deps.deployment.deployMcpV3(
 					workspaceId(req),
 					grant,
@@ -634,7 +634,8 @@ export function hubFacingRoutes(deps: {
 				clusterAppId: app.appId,
 				runtimeInstallationId: grant.runtimeInstallationId,
 				...(installPublicUrl ? { publicUrl: installPublicUrl } : {}),
-				securityProfile: deps.deployment.appliedSecurityProfile(app.listingId),
+				// What the container actually runs (agent-reported); omitted when an agent did not report it.
+				...(profile !== undefined ? { securityProfile: profile } : {}),
 				runtimeInventoryAttestation: {
 					compact: attestation.compact,
 					artifactHash: attestation.artifactHash,
@@ -804,7 +805,7 @@ export function hubFacingRoutes(deps: {
 				runtimeInstallationId,
 				configEpoch: command.configEpoch,
 				...(reconfigurePublicUrl ? { publicUrl: reconfigurePublicUrl } : {}),
-				securityProfile: deps.deployment.appliedSecurityProfile(applied.app.listingId),
+				...(applied.securityProfile !== undefined ? { securityProfile: applied.securityProfile } : {}),
 				acknowledgement: {
 					compact: acknowledgement.compact,
 					artifactHash: acknowledgement.artifactHash,
@@ -1041,7 +1042,7 @@ export function hubFacingRoutes(deps: {
 				runtimeInstallationId,
 				revision: command.revision,
 				...(upgradePublicUrl ? { publicUrl: upgradePublicUrl } : {}),
-				securityProfile: deps.deployment.appliedSecurityProfile(applied.app.listingId),
+				...(applied.securityProfile !== undefined ? { securityProfile: applied.securityProfile } : {}),
 				acknowledgement: {
 					compact: acknowledgement.compact,
 					artifactHash: acknowledgement.artifactHash,

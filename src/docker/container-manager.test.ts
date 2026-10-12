@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import { test } from 'node:test';
 
 import { ContainerManager, buildContainerLabels, type CreateContainerConfig } from './container-manager.js';
@@ -67,6 +68,9 @@ test('browser-sandbox adds the inline seccomp profile and the higher pid limit',
 	assert.ok(hc.SecurityOpt[1].startsWith('seccomp={'));
 	const profile = JSON.parse(hc.SecurityOpt[1].slice('seccomp='.length));
 	assert.equal(profile.defaultAction, 'SCMP_ACT_ERRNO');
+	// The inline profile is exactly the vendored file, not a lossy copy of it.
+	const vendored = JSON.parse(fs.readFileSync(new URL('./seccomp/browser-sandbox.json', import.meta.url), 'utf8'));
+	assert.deepEqual(profile, vendored);
 	assert.ok(!hc.SecurityOpt[1].includes('\n'), 'profile is minified');
 	// Everything else stays hardened.
 	assert.deepEqual(hc.CapDrop, ['ALL']);

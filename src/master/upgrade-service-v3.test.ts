@@ -370,13 +370,30 @@ test('security profile: upgrade forward and revert bodies carry the same resolve
 	assert.equal(unlisted.agentCalls[0]!.body.securityProfile, null);
 });
 
-test('security profile: the response profile mirrors what was sent to the agent', () => {
-	const on = fixture(runningApp(), undefined, {
-		securityProfileAllowlist: new Map([['listing-1', 'browser-sandbox' as const]]),
-		emitSecurityProfile: true,
+test('security profile: the result reports what the agents say they run, not what the master intended', async () => {
+	const ha = runningApp({
+		availabilityTier: 'ha',
+		replicas: [
+			{ replicaId: 'replica-1', nodeId: 'node-1', containerId: 'container-1', state: 'running' },
+			{ replicaId: 'replica-2', nodeId: 'node-2', containerId: 'container-2', state: 'running' },
+		],
 	});
-	assert.equal(on.service.appliedSecurityProfile('listing-1'), 'browser-sandbox');
-	assert.equal(on.service.appliedSecurityProfile('listing-2'), null);
-	const off = fixture(runningApp(), undefined, { securityProfileAllowlist: new Map([['listing-1', 'browser-sandbox' as const]]) });
-	assert.equal(off.service.appliedSecurityProfile('listing-1'), null);
+	const reply = (profiles: Record<string, unknown>) => (path: string) => ({
+		status: 200,
+		body: { swapStrategy: 'STOP_THEN_CREATE', ...profiles[path.split('/')[4]!] as object },
+	});
+	// Intent is "none" (emit off), the agents say browser-sandbox: the report follows the agents.
+	const agree = fixture(ha, reply({
+		'container-1': { securityProfile: 'browser-sandbox' }, 'container-2': { securityProfile: 'browser-sandbox' },
+	}));
+	assert.equal((await agree.service.upgradeMcpV3('workspace-1', command())).securityProfile, 'browser-sandbox');
+	const none = fixture(ha, reply({ 'container-1': { securityProfile: null }, 'container-2': { securityProfile: null } }));
+	assert.equal((await none.service.upgradeMcpV3('workspace-1', command())).securityProfile, null);
+	const split = fixture(ha, reply({ 'container-1': { securityProfile: 'browser-sandbox' }, 'container-2': { securityProfile: null } }));
+	assert.equal((await split.service.upgradeMcpV3('workspace-1', command())).securityProfile, null);
+	// An older agent sends no field: unknown, so the key stays undefined and the route omits it.
+	const older = fixture(ha, reply({}));
+	assert.equal((await older.service.upgradeMcpV3('workspace-1', command())).securityProfile, undefined);
+	const partial = fixture(ha, reply({ 'container-1': { securityProfile: 'browser-sandbox' } }));
+	assert.equal((await partial.service.upgradeMcpV3('workspace-1', command())).securityProfile, undefined);
 });
