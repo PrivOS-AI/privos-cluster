@@ -37,7 +37,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
         with:
-          node-version: 24
+          node-version: 24.22.1
           registry-url: https://registry.npmjs.org
       # Trusted publishing needs npm >= 11.5.1; ensure it regardless of the bundled version.
       - run: npm install -g npm@latest

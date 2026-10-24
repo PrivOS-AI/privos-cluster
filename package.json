@@ -1,6 +1,6 @@
 {
   "name": "@privos_ai/app-cluster",
-  "version": "0.1.6",
+  "version": "0.2.0",
   "description": "Standalone Docker container management microservice for Privos MCP apps",
   "type": "module",
   "license": "SEE LICENSE IN LICENSE",
@@ -9,7 +9,7 @@
     "url": "git+https://github.com/PrivOS-AI/privos-cluster.git"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22.23.4"
   },
   "bin": {
     "privos-app-cluster": "./dist/cli/privos-app-cluster.js"
