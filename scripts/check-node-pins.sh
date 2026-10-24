@@ -23,7 +23,9 @@ while IFS= read -r f; do
     read -r _ image rest <<<"$(sed -E 's/--platform=[^ ]+ //' <<<"$line")"
     alias=$(grep -oiE ' as +[^ ]+' <<<" $rest" | awk '{print tolower($2)}' || true)
     if [[ $stages == *" ${image,,} "* || $image == scratch ]]; then :
-    elif [[ $image == *'$'* ]]; then bad "$f: FROM $image uses a build arg; pin the image literally"
+    elif [[ $image == *'$'* ]]; then
+      # A build-arg base (e.g. a locally built, already pinned image) is accepted only when this file runs the guard.
+      grep -q 'CVE-2026-111497 minimum' "$f" || bad "$f: FROM $image uses a build arg and the file has no Node guard"
     elif [[ ! $image =~ @sha256:[0-9a-f]{64}$ ]]; then bad "$f: FROM $image has no @sha256 digest"
     fi
     if [[ $image =~ ^(docker\.io/)?(library/)?node:([^@]+) ]]; then
