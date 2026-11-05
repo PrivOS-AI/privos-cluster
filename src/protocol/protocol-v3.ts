@@ -457,6 +457,10 @@ const DispatchActor = z.object({
 	subject: z.string().min(1),
 	username: z.string().optional(),
 	roomId: z.string().optional(),
+	// Set for a call made by another app's server, only for a target that declares the capability.
+	// Display and attribution for the app, like the fields above.
+	callerApp: z.string().min(1).optional(),
+	crossRoom: z.literal(true).optional(),
 }).strict();
 
 const DispatchCommonShape = {
