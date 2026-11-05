@@ -472,6 +472,16 @@ test('an optional actor claim is accepted, ignored by affinity, and never requir
 		{ subject: 'user-1' },
 	);
 
+	// A call from another app's server carries who called and, from outside the room, crossRoom.
+	assert.deepEqual(
+		parseDispatchAssertionPayloadV3({
+			...common,
+			...roomBinding,
+			actor: { subject: 'bot-1', roomId: 'room-1', callerApp: 'ai.privos.vibe-flow', crossRoom: true },
+		}).actor,
+		{ subject: 'bot-1', roomId: 'room-1', callerApp: 'ai.privos.vibe-flow', crossRoom: true },
+	);
+
 	// Strictness is the property that makes the claim safe to add: the actor is a
 	// well-typed optional key, not a passthrough for anything a signer feels like.
 	for (const malformed of [
@@ -480,6 +490,9 @@ test('an optional actor claim is accepted, ignored by affinity, and never requir
 		{ subject: 42 },
 		{ subject: 'user-1', username: 7 },
 		{ subject: 'user-1', unexpected: 'x' },
+		{ subject: 'user-1', callerApp: '' },
+		{ subject: 'user-1', callerApp: 7 },
+		{ subject: 'user-1', crossRoom: false },
 		'user-1',
 		null,
 	]) {
