@@ -2,7 +2,7 @@
 
 # Stage 1: Builder — pure JS/TS build, no native module toolchain needed.
 # Base pinned to the multi-arch index digest (amd64 + arm64); bump it deliberately.
-FROM node:22.23.4-alpine3.23@sha256:6abbcf5dd6b231da109bcde1181db1d92bf78015ae1a9514d9807c1f857869db AS builder
+FROM node:22.23.4-alpine3.23@sha256:2cfe8c19bd3df0192ad5dfd2e13e86567743ffa1eb614e750a706891f19606af AS builder
 WORKDIR /app
 
 COPY package*.json ./
@@ -13,7 +13,7 @@ COPY src ./src
 RUN npm run build && npm prune --omit=dev
 
 # Stage 2: Runner — minimal, with dumb-init for proper signal handling
-FROM node:22.23.4-alpine3.23@sha256:6abbcf5dd6b231da109bcde1181db1d92bf78015ae1a9514d9807c1f857869db AS runner
+FROM node:22.23.4-alpine3.23@sha256:2cfe8c19bd3df0192ad5dfd2e13e86567743ffa1eb614e750a706891f19606af AS runner
 RUN apk add --no-cache dumb-init
 # CVE-2026-111497: fail the build on an unpatched Node. Compare the Node version, not process.versions.brotli
 # (22.23.4 still reports brotli 1.1.0 because the fix was cherry-picked).
