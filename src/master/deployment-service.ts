@@ -51,6 +51,13 @@ export function consolidateReportedSecurityProfile(
 	return null;
 }
 
+/**
+ * An upgrade redeploy waits on the agent until the new container is healthy, which
+ * routinely takes longer than the 30 s default (Content Hub: ~31 s). The Hub waits
+ * 120 s for the whole upgrade, so this stays well under it.
+ */
+const MCP_V3_REDEPLOY_TIMEOUT_MS = 90_000;
+
 const DeploySchema = z.object({
 	appId: z.string().min(1).max(128).optional(),
 	listingId: z.string().min(1).max(128),
@@ -1327,17 +1334,28 @@ export class DeploymentService {
 			const succeeded: Array<{ replica: AppReplica; node: MasterNode; swapStrategy: 'ROLLING' | 'STOP_THEN_CREATE' }> = [];
 			const forwardResponses: unknown[] = [];
 			let failedReplicaRecovered: boolean | undefined;
+			let outcomeUnknown: { replica: AppReplica; node: MasterNode } | undefined;
 			let persistenceFailed = false;
 			try {
 				for (const replica of app.replicas) {
 					const node = nodes.find((candidate) => candidate.nodeId === replica.nodeId)!;
-					const response = await this.deps.agentClient.request(
-						node,
-						workspaceId,
-						'POST',
-						`/api/v1/apps/${replica.containerId}/redeploy`,
-						redeployBody(node, replica, command.targetImageDigest, command.targetManifestDigest),
-					);
+					let response;
+					try {
+						response = await this.deps.agentClient.request(
+							node,
+							workspaceId,
+							'POST',
+							`/api/v1/apps/${replica.containerId}/redeploy`,
+							redeployBody(node, replica, command.targetImageDigest, command.targetManifestDigest),
+							MCP_V3_REDEPLOY_TIMEOUT_MS,
+						);
+					} catch (error) {
+						// No answer (timeout, dropped connection) is NOT "nothing
+						// happened": the agent may have finished the swap after we
+						// stopped waiting. Treat the replica as touched and revert it.
+						outcomeUnknown = { replica, node };
+						throw error;
+					}
 					if (response.status >= 300) {
 						const body = response.body as { recovered?: unknown } | undefined;
 						failedReplicaRecovered = typeof body?.recovered === 'boolean' ? body.recovered : undefined;
@@ -1413,7 +1431,8 @@ export class DeploymentService {
 				// Revert every replica that already swapped forward, through the
 				// IDENTICAL redeploy primitive, targeting the named previous digest.
 				let allReverted = true;
-				for (const { replica, node } of succeeded) {
+				for (const { replica, node } of outcomeUnknown ? [...succeeded, outcomeUnknown] : succeeded) {
+					let reverted = false;
 					try {
 						const revertResponse = await this.deps.agentClient.request(
 							node,
@@ -1421,13 +1440,21 @@ export class DeploymentService {
 							'POST',
 							`/api/v1/apps/${replica.containerId}/redeploy`,
 							redeployBody(node, replica, command.previousImageDigest, command.previousManifestDigest),
+							MCP_V3_REDEPLOY_TIMEOUT_MS,
 						);
-						if (revertResponse.status >= 300) allReverted = false;
+						reverted = revertResponse.status < 300;
 					} catch {
-						allReverted = false;
+						reverted = false;
 					}
+					if (!reverted) allReverted = false;
+					if (replica === outcomeUnknown?.replica) failedReplicaRecovered = reverted;
 				}
-				throw Object.assign(error instanceof Error ? error : new Error(String(error)), {
+				// A fresh Error, never the thrown one: a fetch timeout is a
+				// DOMException whose `code` is getter-only, so assigning onto it
+				// threw a TypeError that escaped with no code, and the route then
+				// signed REFUSED ("nothing touched") for a container it had swapped.
+				const cause = error instanceof Error ? error : new Error(String(error));
+				throw Object.assign(new Error(cause.message, { cause }), {
 					code: persistenceFailed ? 'MCP_V3_UPGRADE_PERSISTENCE_FAILED' : 'MCP_V3_UPGRADE_SWAP_FAILED',
 					// True only when every touched replica is CONFIRMED back on the
 					// previous image. A persistence failure means every replica in

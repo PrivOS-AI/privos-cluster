@@ -21,6 +21,8 @@ export interface AgentResponse {
  */
 export const FLEET_SCOPED_WORKSPACE_ID = '__fleet__';
 
+export const DEFAULT_AGENT_TIMEOUT_MS = 30_000;
+
 export class AgentClient {
 	constructor(private readonly cipher: KeyCipher) {}
 
@@ -30,8 +32,9 @@ export class AgentClient {
 		method: string,
 		path: string,
 		body?: unknown,
+		timeoutMs: number = DEFAULT_AGENT_TIMEOUT_MS,
 	): Promise<AgentResponse> {
-		return this.send(node, workspaceId, method, path, body);
+		return this.send(node, workspaceId, method, path, body, 'apps-master', timeoutMs);
 	}
 
 	/** Node-scoped, not workspace-scoped — see `FLEET_SCOPED_WORKSPACE_ID`. Used only by the host-table publisher. */
@@ -46,6 +49,7 @@ export class AgentClient {
 		path: string,
 		body: unknown,
 		sub: string = 'apps-master',
+		timeoutMs: number = DEFAULT_AGENT_TIMEOUT_MS,
 	): Promise<AgentResponse> {
 		const fleetKey = this.cipher.decrypt(node.encryptedFleetKey);
 		const token = jwt.sign(
@@ -65,7 +69,7 @@ export class AgentClient {
 				...(body === undefined ? {} : { 'content-type': 'application/json' }),
 			},
 			body: body === undefined ? undefined : JSON.stringify(body),
-			signal: AbortSignal.timeout(30_000),
+			signal: AbortSignal.timeout(timeoutMs),
 		});
 		const contentType = response.headers.get('content-type') ?? '';
 		const responseBody = contentType.includes('application/json')
