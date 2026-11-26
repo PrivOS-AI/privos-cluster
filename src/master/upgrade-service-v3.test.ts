@@ -112,7 +112,7 @@ function fixture(
 		capacity: { memoryMb: 4096, cpus: 4, diskBytes: 10_000_000_000 }, status: 'ACTIVE',
 		keyId: 'key-2', encryptedFleetKey: 'encrypted-2', createdAt: new Date(), updatedAt: new Date(),
 	}];
-	const agentCalls: Array<{ path: string; body: any }> = [];
+	const agentCalls: Array<{ path: string; body: any; timeoutMs?: number }> = [];
 	const service = new DeploymentService({
 		repositories: {
 			apps: {
@@ -135,8 +135,8 @@ function fixture(
 			nodes: { find: () => ({ toArray: async () => structuredClone(nodes) }) },
 		} as any,
 		agentClient: {
-			request: async (_node: MasterNode, _ws: string, _method: string, path: string, body: any) => {
-				agentCalls.push({ path, body });
+			request: async (_node: MasterNode, _ws: string, _method: string, path: string, body: any, timeoutMs?: number) => {
+				agentCalls.push({ path, body, timeoutMs });
 				return agentResponses?.(path) ?? { status: 200, body: { swapStrategy: 'STOP_THEN_CREATE' } };
 			},
 		} as any,
@@ -294,6 +294,42 @@ test('a swap failure reports rolledBack only when the agent confirms it recovere
 	await assert.rejects(
 		unconfirmed.service.upgradeMcpV3('workspace-1', command()),
 		(error: unknown) => (error as any).rolledBack === false,
+	);
+});
+
+test('a forward redeploy that times out counts as touched: tagged SWAP_FAILED and reverted to the previous digest', async () => {
+	let forwardSeen = false;
+	const state = fixture(runningApp(), (path) => {
+		if (path === '/api/v1/apps/container-1/redeploy' && !forwardSeen) {
+			forwardSeen = true;
+			// What fetch throws when AbortSignal.timeout fires: `code` is a getter-only accessor.
+			throw new DOMException('The operation was aborted due to timeout', 'TimeoutError');
+		}
+		return { status: 200, body: { swapStrategy: 'STOP_THEN_CREATE' } };
+	});
+	await assert.rejects(
+		state.service.upgradeMcpV3('workspace-1', command()),
+		(error: unknown) =>
+			(error as any).code === 'MCP_V3_UPGRADE_SWAP_FAILED' &&
+			(error as any).rolledBack === true &&
+			(error as any).cause instanceof DOMException,
+	);
+	assert.deepEqual(state.agentCalls.map((call) => call.path), [
+		'/api/v1/apps/container-1/redeploy', // forward, no answer
+		'/api/v1/apps/container-1/redeploy', // revert, back to previous
+	]);
+	assert.equal(state.agentCalls[1]!.body.digest, `sha256:${'e'.repeat(64)}`);
+	assert.ok(state.agentCalls.every((call) => call.timeoutMs === 90_000), 'upgrade redeploys outlive the 30 s default');
+	assert.equal(state.apps[0]!.mcpAppliedRevision ?? 0, 0, 'no revision was ever applied');
+});
+
+test('a timed-out forward redeploy whose revert also fails reports FAILED, never rolled back', async () => {
+	const state = fixture(runningApp(), () => {
+		throw new DOMException('The operation was aborted due to timeout', 'TimeoutError');
+	});
+	await assert.rejects(
+		state.service.upgradeMcpV3('workspace-1', command()),
+		(error: unknown) => (error as any).code === 'MCP_V3_UPGRADE_SWAP_FAILED' && (error as any).rolledBack === false,
 	);
 });
 
