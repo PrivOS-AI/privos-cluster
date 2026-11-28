@@ -132,7 +132,7 @@ test('v3 dispatch verifies parent/child affinity before Cluster selects a live H
 		agentClient: {
 			request: async (_node: { nodeId: string }, _workspaceId: string, method: string, path: string, body?: unknown) => {
 				agentCalls.push(`${method} ${path}`);
-				if (path.endsWith('/status')) {
+				if (path.includes('/status')) {
 					return path.includes('container-1')
 						? { status: 200, body: { state: 'running', healthStatus: 'unhealthy' } }
 						: { status: 200, body: { state: 'running', healthStatus: 'healthy' } };
@@ -171,9 +171,69 @@ test('v3 dispatch verifies parent/child affinity before Cluster selects a live H
 	assert.equal(verifierInput.expected.replicaId, undefined);
 	assert.equal(verifierInput.authorization.authorizationBindingId, 'binding-1');
 	assert.deepEqual(agentCalls, [
-		'GET /api/v1/apps/container-1/status',
-		'GET /api/v1/apps/container-2/status',
+		'GET /api/v1/apps/container-1/status?light=1',
+		'GET /api/v1/apps/container-2/status?light=1',
 		'POST /api/v1/apps/container-2/dispatch',
+	]);
+});
+
+test('v3 dispatch still succeeds against an older agent that ignores light and answers the full status', async (t) => {
+	const fastify = Fastify();
+	t.after(() => fastify.close());
+	const agentCalls: string[] = [];
+	const app = {
+		appId: 'cluster-app-1', workspaceId: 'workspace-1', kind: 'mcp-v3', state: 'RUNNING',
+		mcpInventoryAttestationEstablishedAt: new Date(), mcpDeploymentId: 'deployment-1',
+		mcpGenerationId: 'generation-1', mcpGenerationNumber: 1, mcpRuntimeInstallationId: 'runtime-1',
+		manifestDigest: `sha256:${'f'.repeat(64)}`, mcpApprovalReceiptHash: 'b'.repeat(43),
+		mcpAuthorizationEpoch: 7, resourceManifestHash: 'r'.repeat(43),
+		runtimeResourceInventoryHash: 'i'.repeat(43), mcpAppId: 'mcp-app-1',
+		replicas: [{ replicaId: '11111111-1111-4111-8111-111111111111', nodeId: 'node-1', containerId: 'container-1', state: 'running' }],
+	};
+	await fastify.register(hubFacingRoutes({
+		auth: { verify: async (workspaceId: string) => ({ workspaceId }) } as any,
+		deployment: {} as any,
+		lifecycle: {} as any,
+		repositories: {
+			apps: { findOne: async () => app },
+			nodes: { find: () => ({ toArray: async () => [{ nodeId: 'node-1', status: 'ACTIVE' }] }) },
+		} as any,
+		agentClient: {
+			request: async (_node: unknown, _workspaceId: string, method: string, path: string) => {
+				agentCalls.push(`${method} ${path}`);
+				// An agent without light mode ignores the query and answers today's full body.
+				return path.includes('/status')
+					? { status: 200, body: { state: 'running', cpuPercent: 3, memoryUsageMb: 80, memoryLimitMb: 256, memoryPercent: 31, uptime: 600, restarts: 0, healthStatus: 'healthy' } }
+					: { status: 200, body: { ok: true } };
+			},
+		} as any,
+		baseDomain: 'apps.example.com',
+		mcpSecurity: { consumeDispatchAssertionV3: async () => ({}) } as any,
+		mcpV2Enabled: false,
+		mcpV3Enabled: true,
+		mcpReconfigureEnabled: true,
+		mcpUpgradeEnabled: true,
+		clusterMasterIdentity: {} as any,
+		mcpReleaseAuthorityJwks: [],
+	}));
+	await fastify.ready();
+	const response = await fastify.inject({
+		method: 'POST',
+		url: '/w/workspace-1/api/v1/apps/cluster-app-1/dispatch',
+		headers: { authorization: 'Bearer test' },
+		payload: {
+			assertion: 'signed',
+			rpc: { jsonrpc: '2.0', method: 'tools/call', id: 1 },
+			authorizationContext: 'room',
+			runtimeInstallationId: 'runtime-1',
+			authorizationBindingId: 'binding-1',
+		},
+	});
+	assert.equal(response.statusCode, 200);
+	assert.deepEqual(response.json(), { ok: true });
+	assert.deepEqual(agentCalls, [
+		'GET /api/v1/apps/container-1/status?light=1',
+		'POST /api/v1/apps/container-1/dispatch',
 	]);
 });
 
