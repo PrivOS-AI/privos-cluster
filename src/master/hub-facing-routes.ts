@@ -314,7 +314,7 @@ export function hubFacingRoutes(deps: {
 							candidate.node,
 							app.workspaceId,
 							'GET',
-							`/api/v1/apps/${candidate.replica.containerId}/status`,
+							`/api/v1/apps/${candidate.replica.containerId}/status?light=1`,
 						);
 						const status = response.body as { state?: unknown; healthStatus?: unknown };
 						return response.status < 300 && status.state === 'running' && status.healthStatus !== 'unhealthy'
