@@ -396,6 +396,16 @@ const appsHandler: FastifyPluginAsync = async (fastify) => {
                 return reply.code(404).send({ error: 'not found' });
             }
 
+            // `?light=1` (the master's pre-dispatch probe) skips the 1-2 s `docker stats`
+            // sample and the inspect; older agents ignore the key and answer the full body.
+            if ((req.query as { light?: unknown } | undefined)?.light === '1') {
+                return reply.send({
+                    state: container.state,
+                    healthStatus: container.healthCheck.status,
+                    restarts: container.healthCheck.restartCount,
+                });
+            }
+
             let stats: { cpuPercent: number; memoryUsageMb: number; memoryLimitMb: number; memoryPercent: number } | null = null;
             let uptime: number | null = null;
 
